@@ -39,7 +39,7 @@ echo "[setup] pip install -e sam3"
 (cd "$SAM3_DIR" && pip install -e .)
 
 echo "[setup] extra deps used by analyze_days.py"
-pip install numpy pillow matplotlib
+pip install setuptools numpy pillow matplotlib
 
 echo "[setup] smoke test"
 python - <<'PY'
