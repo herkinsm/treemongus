@@ -12,7 +12,7 @@ ENV_NAME="sam3"
 SAM3_DIR="$HOME/sam3"
 
 echo "[setup] loading miniconda3 module"
-module load miniconda3
+module load miniconda3/24.1.2-py310
 
 # Create env if missing
 if ! conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then

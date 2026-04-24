@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-module load miniconda3
+module load miniconda3/24.1.2-py310
 source activate sam3
 
 # --- paths ---------------------------------------------------------------
