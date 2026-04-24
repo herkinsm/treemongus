@@ -153,9 +153,9 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
         torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
 
-    sam3_root = os.path.join(os.path.dirname(sam3.__file__), "..")
-    bpe_path = os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz")
-    model = build_sam3_image_model(bpe_path=bpe_path)
+    # Let SAM 3 resolve its own BPE vocab via pkg_resources — the file ships
+    # inside the package at sam3/assets/, not the repo's top-level assets/.
+    model = build_sam3_image_model()
     processor = Sam3Processor(model, confidence_threshold=args.threshold)
 
     csv_path = out_dir / "results.csv"
