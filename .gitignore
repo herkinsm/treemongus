@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Analysis outputs (kept out of git — they're large and regenerable)
+sam3_out/
+results/
+*.npz
+*.png
+*.jpg
+*.jpeg
+*.bmp
+
+# But keep small docs/figures if you ever add them intentionally
+!docs/**/*.png
+!docs/**/*.jpg
