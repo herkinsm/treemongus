@@ -38,11 +38,19 @@ fi
 echo "[setup] pip install -e sam3"
 (cd "$SAM3_DIR" && pip install -e .)
 
-echo "[setup] extra deps used by analyze_days.py"
-# setuptools<81: SAM 3 still imports pkg_resources (dropped in setuptools 81).
-# einops: sam3/sam/rope.py imports it unconditionally but pyproject.toml only
-#         lists it under the `notebooks` extras — packaging bug upstream.
-pip install "setuptools<81" einops numpy pillow matplotlib
+echo "[setup] extra deps used by analyze_days.py and SAM 3 init chain"
+# SAM 3's __init__.py drags through its training data pipeline, so even
+# inference-only use needs deps that SAM 3 lists only in [dev]/[notebooks]
+# extras — a packaging bug upstream. Install them explicitly.
+#   setuptools<81 : SAM 3 imports pkg_resources (removed in setuptools 81)
+#   einops        : sam3/sam/rope.py
+#   pycocotools   : sam3/train/data/coco_json_loaders.py
+#   decord        : sam3 video data loaders
+#   opencv-python : various sam3 image utils
+#   hydra-core/omegaconf : sam3 configs
+#   scipy         : distance/geometry utilities
+pip install "setuptools<81" einops pycocotools decord opencv-python \
+            hydra-core omegaconf scipy numpy pillow matplotlib
 
 echo "[setup] smoke test"
 python - <<'PY'
