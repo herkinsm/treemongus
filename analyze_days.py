@@ -110,7 +110,11 @@ def to_np(x):
     if x is None:
         return None
     if torch.is_tensor(x):
-        return x.detach().cpu().numpy()
+        t = x.detach().cpu()
+        # numpy has no bfloat16/float16 — upcast to float32 before .numpy().
+        if t.dtype in (torch.bfloat16, torch.float16):
+            t = t.float()
+        return t.numpy()
     return np.asarray(x)
 
 
