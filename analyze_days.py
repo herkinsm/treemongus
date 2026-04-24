@@ -118,6 +118,62 @@ def to_np(x):
     return np.asarray(x)
 
 
+# ---------------------------------------------------------------------------
+# Depth handling. Thresholds mirror sprayer_pipeline/config.py:
+#   CANOPY_DEPTH_MIN_MM = 600, CANOPY_DEPTH_MAX_MM = 3000
+# Depth .txt files are ASCII uint16 mm, stored 480 rows x 50 cols for a
+# 640x480 RGB frame (horizontally decimated ~12.8x). 0 means invalid.
+# ---------------------------------------------------------------------------
+def depth_path_for(img_path: Path) -> Path:
+    """Given .../<session>/RGB/<stem>-RGB[-BP].<ext>, return the matching
+    .../<session>/depth/<stem>-Depth.txt."""
+    session_dir = img_path.parent.parent  # drop RGB/
+    stem = img_path.stem
+    for suffix in ("-RGB-BP", "-RGB-bp", "-RGB", "-rgb"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return session_dir / "depth" / f"{stem}-Depth.txt"
+
+
+def load_depth_mm(depth_path: Path, target_hw: tuple[int, int]) -> np.ndarray | None:
+    """Load an ASCII depth .txt and return uint16 mm upsampled to target (H, W).
+    Returns None if the file is missing or malformed."""
+    if not depth_path.is_file():
+        return None
+    try:
+        d = np.loadtxt(depth_path, dtype=np.int32)
+    except Exception:
+        return None
+    if d.ndim != 2 or d.size == 0:
+        return None
+    H, W = target_hw
+    if d.shape != (H, W):
+        # Bilinear upsample via PIL in float32 mode.
+        pim = Image.fromarray(d.astype(np.float32), mode="F").resize((W, H), Image.BILINEAR)
+        d = np.asarray(pim)
+    d = np.clip(d, 0, 65535).astype(np.uint16)
+    return d
+
+
+def near_frac_per_mask(masks_np: np.ndarray, depth_mm: np.ndarray,
+                        min_mm: int, max_mm: int) -> list[float]:
+    """For each mask, fraction of its pixels whose depth is in [min_mm, max_mm].
+    NaN for empty masks."""
+    near = (depth_mm >= min_mm) & (depth_mm <= max_mm)
+    out: list[float] = []
+    for m in masks_np:
+        mb = m.astype(bool)
+        if mb.ndim == 3:
+            mb = mb.any(axis=0)
+        total = int(mb.sum())
+        if total == 0:
+            out.append(float("nan"))
+            continue
+        out.append(float((mb & near).sum()) / float(total))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=r"C:\Users\matth\OneDrive\Desktop\Postdoc\Image\All2023")
@@ -135,6 +191,17 @@ def main():
     ap.add_argument("--save-masks", action="store_true")
     ap.add_argument("--save-overlays", action="store_true")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # Depth-based background filter (matches sprayer_pipeline/config.py).
+    ap.add_argument("--depth", action="store_true",
+                    help="Load matched depth .txt files and annotate each detection "
+                         "with its near-field fraction in the [min,max] mm band.")
+    ap.add_argument("--depth-min-mm", type=int, default=600,
+                    help="Lower bound of canopy depth band (default 600; sprayer_pipeline).")
+    ap.add_argument("--depth-max-mm", type=int, default=3000,
+                    help="Upper bound of canopy depth band (default 3000; sprayer_pipeline).")
+    ap.add_argument("--depth-near-frac", type=float, default=0.5,
+                    help="Count a detection as near-field if >= this fraction of its "
+                         "mask pixels lie inside the depth band (default 0.5).")
     args = ap.parse_args()
 
     sample = None if args.sample_per_session == 0 else args.sample_per_session
@@ -164,7 +231,8 @@ def main():
 
     csv_path = out_dir / "results.csv"
     fieldnames = ["day", "category", "session", "image", "prompt",
-                  "n_detections", "mean_score", "max_score", "elapsed_s"]
+                  "n_detections", "mean_score", "max_score", "elapsed_s",
+                  "n_near", "near_frac_mean", "near_frac_max"]
     f = open(csv_path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(f, fieldnames=fieldnames)
     writer.writeheader()
@@ -183,6 +251,12 @@ def main():
             try:
                 img = Image.open(img_path).convert("RGB")
                 state = processor.set_image(img)  # encode once
+
+                # Optional depth load (once per image, reused across prompts).
+                depth_mm = None
+                if args.depth:
+                    depth_mm = load_depth_mm(depth_path_for(img_path), (img.height, img.width))
+
                 for prompt in prompts:
                     t0 = time.time()
                     processor.reset_all_prompts(state)
@@ -194,6 +268,21 @@ def main():
                     n = 0 if masks_np is None else len(masks_np)
                     mean_s = float(np.mean(scores_np)) if scores_np is not None and len(scores_np) else 0.0
                     max_s = float(np.max(scores_np)) if scores_np is not None and len(scores_np) else 0.0
+
+                    # Depth-based near-field stats (skipped when --depth off or file missing).
+                    n_near: int | str = ""
+                    near_mean: float | str = ""
+                    near_max: float | str = ""
+                    if args.depth and depth_mm is not None and n > 0:
+                        fracs = near_frac_per_mask(
+                            masks_np, depth_mm, args.depth_min_mm, args.depth_max_mm
+                        )
+                        fracs_arr = np.asarray(fracs, dtype=float)
+                        valid = fracs_arr[~np.isnan(fracs_arr)]
+                        if valid.size:
+                            n_near = int((valid >= args.depth_near_frac).sum())
+                            near_mean = round(float(valid.mean()), 4)
+                            near_max = round(float(valid.max()), 4)
 
                     slug = prompt_slugs[prompt]
                     if args.save_masks and n > 0:
@@ -216,6 +305,9 @@ def main():
                         "mean_score": round(mean_s, 4),
                         "max_score": round(max_s, 4),
                         "elapsed_s": round(time.time() - t0, 3),
+                        "n_near": n_near,
+                        "near_frac_mean": near_mean,
+                        "near_frac_max": near_max,
                     })
                 total_imgs += 1
                 if total_imgs % 10 == 0:
