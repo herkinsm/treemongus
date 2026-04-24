@@ -39,7 +39,9 @@ echo "[setup] pip install -e sam3"
 (cd "$SAM3_DIR" && pip install -e .)
 
 echo "[setup] extra deps used by analyze_days.py"
-pip install setuptools numpy pillow matplotlib
+# SAM 3 still imports pkg_resources, which was dropped from setuptools 81.
+# Pin to <81 until upstream migrates to importlib.metadata.
+pip install "setuptools<81" numpy pillow matplotlib
 
 echo "[setup] smoke test"
 python - <<'PY'
