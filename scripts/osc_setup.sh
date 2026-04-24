@@ -39,9 +39,10 @@ echo "[setup] pip install -e sam3"
 (cd "$SAM3_DIR" && pip install -e .)
 
 echo "[setup] extra deps used by analyze_days.py"
-# SAM 3 still imports pkg_resources, which was dropped from setuptools 81.
-# Pin to <81 until upstream migrates to importlib.metadata.
-pip install "setuptools<81" numpy pillow matplotlib
+# setuptools<81: SAM 3 still imports pkg_resources (dropped in setuptools 81).
+# einops: sam3/sam/rope.py imports it unconditionally but pyproject.toml only
+#         lists it under the `notebooks` extras — packaging bug upstream.
+pip install "setuptools<81" einops numpy pillow matplotlib
 
 echo "[setup] smoke test"
 python - <<'PY'
