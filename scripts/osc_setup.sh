@@ -39,18 +39,25 @@ echo "[setup] pip install -e sam3"
 (cd "$SAM3_DIR" && pip install -e .)
 
 echo "[setup] extra deps used by analyze_days.py and SAM 3 init chain"
-# SAM 3's __init__.py drags through its training data pipeline, so even
+# SAM 3's __init__.py drags through its training + video pipelines, so even
 # inference-only use needs deps that SAM 3 lists only in [dev]/[notebooks]
-# extras — a packaging bug upstream. Install them explicitly.
-#   setuptools<81 : SAM 3 imports pkg_resources (removed in setuptools 81)
-#   einops        : sam3/sam/rope.py
-#   pycocotools   : sam3/train/data/coco_json_loaders.py
-#   decord        : sam3 video data loaders
-#   opencv-python : various sam3 image utils
-#   hydra-core/omegaconf : sam3 configs
-#   scipy         : distance/geometry utilities
-pip install "setuptools<81" einops pycocotools decord opencv-python \
-            hydra-core omegaconf scipy numpy pillow matplotlib
+# extras or doesn't declare at all — a packaging bug upstream. Pin numpy<2
+# because SAM 3 declares numpy<2 and scipy 1.17 otherwise upgrades it.
+pip install \
+    "setuptools<81" \
+    "numpy<2" \
+    einops \
+    pycocotools \
+    decord \
+    opencv-python \
+    hydra-core omegaconf \
+    scipy \
+    psutil \
+    fairscale \
+    fvcore \
+    submitit \
+    tabulate \
+    pillow matplotlib
 
 echo "[setup] smoke test"
 python - <<'PY'
