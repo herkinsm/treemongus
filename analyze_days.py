@@ -772,6 +772,7 @@ def flower_quality_keep(masks_np: np.ndarray,
                          blossom_pink_v_min: int = 100,
                          max_bbox_area_px: int = 0,
                          min_mask_density: float = 0.0,
+                         sam3_boxes: np.ndarray | None = None,
                          ) -> tuple[np.ndarray, dict, list[int]]:
     """Boolean keep-array + per-rejection diagnostics + per-mask area, mirroring
     the gates in sprayer_pipeline/flower_detector.py:
@@ -814,10 +815,20 @@ def flower_quality_keep(masks_np: np.ndarray,
             keep[i] = False; diag["min_cluster_px"] += 1; continue
         if area > max_area:
             keep[i] = False; diag["max_cluster_px"] += 1; continue
-        if max_bbox_area_px > 0 and bw * bh > max_bbox_area_px:
+        # bbox checks: prefer SAM 3's predicted box (what's drawn in the
+        # overlay) over the contour-of-largest-blob bbox, because SAM 3
+        # sometimes predicts a huge box around a sparse-mask detection
+        # and the contour bbox of the largest blob is small + misleading.
+        if sam3_boxes is not None and i < len(sam3_boxes):
+            sx1, sy1, sx2, sy2 = sam3_boxes[i]
+            sbw = max(0.0, float(sx2) - float(sx1))
+            sbh = max(0.0, float(sy2) - float(sy1))
+        else:
+            sbw, sbh = float(bw), float(bh)
+        if max_bbox_area_px > 0 and sbw * sbh > max_bbox_area_px:
             keep[i] = False; diag["max_bbox_area"] += 1; continue
-        if min_mask_density > 0 and bw > 0 and bh > 0:
-            density = float(area) / float(bw * bh)
+        if min_mask_density > 0 and sbw > 0 and sbh > 0:
+            density = float(area) / (sbw * sbh)
             if density < min_mask_density:
                 keep[i] = False; diag["low_density"] += 1; continue
         if cy < y_min:
@@ -1550,6 +1561,7 @@ def main():
                             min_blossom_color_frac=args.flower_min_blossom_color_frac,
                             max_bbox_area_px=args.flower_max_bbox_area_px,
                             min_mask_density=args.flower_min_mask_density,
+                            sam3_boxes=boxes_np,
                         )
                         # Roll up rejections per (session, prompt).
                         rt_key = (day, category, session, prompt)
