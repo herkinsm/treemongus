@@ -758,7 +758,19 @@ def flower_quality_keep(masks_np: np.ndarray,
                          rgb_arr: np.ndarray | None = None,
                          reject_yellow: bool = False,
                          yellow_h_lo: int = 15, yellow_h_hi: int = 45,
-                         yellow_s_min: int = 80) -> tuple[np.ndarray, dict, list[int]]:
+                         yellow_s_min: int = 80,
+                         require_blossom_color: bool = False,
+                         min_blossom_color_frac: float = 0.30,
+                         blossom_white_s_max: int = 50,
+                         blossom_white_v_min: int = 150,
+                         blossom_pink_h_lo: int = 0,
+                         blossom_pink_h_hi: int = 30,
+                         blossom_pink_h_lo2: int = 150,
+                         blossom_pink_h_hi2: int = 179,
+                         blossom_pink_s_lo: int = 10,
+                         blossom_pink_s_hi: int = 100,
+                         blossom_pink_v_min: int = 100,
+                         ) -> tuple[np.ndarray, dict, list[int]]:
     """Boolean keep-array + per-rejection diagnostics + per-mask area, mirroring
     the gates in sprayer_pipeline/flower_detector.py:
       - cluster area in [min_area, max_area]                  (min_cluster_px / max_cluster_px)
@@ -774,8 +786,24 @@ def flower_quality_keep(masks_np: np.ndarray,
     diag = {"min_cluster_px": 0, "max_cluster_px": 0,
             "top_row": 0, "ground_row": 0,
             "edge_margin": 0, "circularity": 0, "solidity": 0,
-            "yellow_color": 0}
+            "yellow_color": 0, "non_blossom_color": 0}
     areas: list[int] = []
+
+    # Pre-compute the "could be apple blossom" pixel mask once per frame
+    # (white OR pink in HSV — ports the bloom-stage gates from
+    # flower_detector.py as a POSITIVE color check).
+    blossom_pixel_mask = None
+    if require_blossom_color and rgb_arr is not None:
+        import cv2
+        hsv = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2HSV)
+        H_ch, S_ch, V_ch = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        white = (S_ch <= blossom_white_s_max) & (V_ch >= blossom_white_v_min)
+        in_pink_hue = (((H_ch >= blossom_pink_h_lo) & (H_ch <= blossom_pink_h_hi))
+                       | ((H_ch >= blossom_pink_h_lo2) & (H_ch <= blossom_pink_h_hi2)))
+        pink = (in_pink_hue
+                & (S_ch >= blossom_pink_s_lo) & (S_ch <= blossom_pink_s_hi)
+                & (V_ch >= blossom_pink_v_min))
+        blossom_pixel_mask = white | pink
     for i, m in enumerate(masks_np):
         circ, sol, area, bx, by, bw, bh, cy = _mask_shape_stats(m)
         areas.append(area)
@@ -800,6 +828,17 @@ def flower_quality_keep(masks_np: np.ndarray,
             h, s, _ = _mask_mean_hsv(rgb_arr, m)
             if yellow_h_lo <= h <= yellow_h_hi and s >= yellow_s_min:
                 keep[i] = False; diag["yellow_color"] += 1; continue
+        if require_blossom_color and blossom_pixel_mask is not None:
+            mb = np.asarray(m).astype(bool)
+            if mb.ndim == 3:
+                mb = mb.any(axis=0)
+            total = int(mb.sum())
+            if total > 0:
+                frac_blossom = float((mb & blossom_pixel_mask).sum()) / float(total)
+                if frac_blossom < min_blossom_color_frac:
+                    keep[i] = False
+                    diag["non_blossom_color"] += 1
+                    continue
     return keep, diag, areas
 
 
@@ -1070,6 +1109,23 @@ def main():
                     help="Minimum mean saturation for a detection to be classified "
                          "yellow (0-255; default 80; below this it's near-white "
                          "and treated as a possible apple blossom).")
+    # Positive blossom-color check: require >= N% of mask pixels to look
+    # white OR pink per the bloom-stage HSV gates in flower_detector.py.
+    ap.add_argument("--flower-require-blossom-color", action="store_true",
+                    help="Require detected flower masks to overlap apple-blossom "
+                         "colored pixels (white OR pink in HSV). Cuts SAM 3 "
+                         "false positives on bark / lit leaves / signs.")
+    ap.add_argument("--flower-min-blossom-color-frac", type=float, default=0.30,
+                    help="Minimum fraction of mask pixels that must be blossom-"
+                         "colored for the mask to survive (default 0.30).")
+    # Multi-prompt union for flowers — run multiple flower-related prompts
+    # and NMS-merge their detections under a single canonical 'flower' label.
+    # Trades cost for recall: each prompt catches blossoms the others miss.
+    ap.add_argument("--flower-multi-prompts", nargs="+", default=None,
+                    help="Replace the flower prompt with this list and NMS-merge "
+                         "the detections. Example: "
+                         "--flower-multi-prompts flower blossom 'white flower'. "
+                         "Default None = single-prompt mode.")
     # Cluster splitting via marker-controlled watershed (true per-blossom
     # segmentation, not the area/200 density estimate).
     ap.add_argument("--split-clusters", action="store_true",
@@ -1223,16 +1279,76 @@ def main():
             try:
                 img = Image.open(img_path).convert("RGB")
 
+                # Determine the actual prompt list passed to SAM 3. If the
+                # user enabled --flower-multi-prompts, we substitute those
+                # for the canonical flower prompt and merge the results
+                # back under the canonical name post-inference.
+                canonical_flower = next(
+                    (p for p in prompts if "flower" in p.lower() or "blossom" in p.lower()),
+                    None,
+                )
+                if args.flower_multi_prompts and canonical_flower is not None:
+                    sam3_prompts = []
+                    for p in prompts:
+                        if p == canonical_flower:
+                            sam3_prompts.extend(args.flower_multi_prompts)
+                        else:
+                            sam3_prompts.append(p)
+                    # Deduplicate while preserving order.
+                    seen = set(); ordered = []
+                    for p in sam3_prompts:
+                        if p not in seen:
+                            seen.add(p); ordered.append(p)
+                    sam3_prompts = ordered
+                else:
+                    sam3_prompts = prompts
+
                 # Run SAM 3 (single-frame OR tiled inference depending on
                 # --tile-grid). Returns per-prompt detections in full-frame
                 # coordinates, with per-tile NMS-merging when tiling is on.
                 infer = infer_per_prompt(
-                    processor, img, prompts,
+                    processor, img, sam3_prompts,
                     tile_rows=int(args.tile_grid[0]),
                     tile_cols=int(args.tile_grid[1]),
                     tile_overlap=args.tile_overlap,
                     tile_nms_iou=args.tile_nms_iou,
                 )
+
+                # Multi-prompt union: concatenate detections from each
+                # alternate flower prompt and NMS-merge under the canonical
+                # flower key, then drop the alternates so the downstream
+                # loop sees one "flower" entry instead of N.
+                if args.flower_multi_prompts and canonical_flower is not None:
+                    all_masks: list[np.ndarray] = []
+                    all_boxes: list[np.ndarray] = []
+                    all_scores: list[np.ndarray] = []
+                    total_elapsed = 0.0
+                    for p in args.flower_multi_prompts:
+                        if p in infer:
+                            r = infer[p]
+                            total_elapsed += float(r.get("elapsed_s", 0.0))
+                            if r["masks"] is not None and len(r["masks"]) > 0:
+                                all_masks.append(r["masks"])
+                                all_boxes.append(r["boxes"])
+                                all_scores.append(r["scores"])
+                            if p != canonical_flower:
+                                del infer[p]
+                    if all_masks:
+                        cat_m = np.concatenate(all_masks, axis=0)
+                        cat_b = np.concatenate(all_boxes, axis=0)
+                        cat_s = np.concatenate(all_scores, axis=0)
+                        keep_idx = nms_indices(cat_b, cat_s, args.tile_nms_iou)
+                        infer[canonical_flower] = {
+                            "masks": cat_m[keep_idx] if keep_idx else cat_m[:0],
+                            "boxes": cat_b[keep_idx] if keep_idx else cat_b[:0],
+                            "scores": cat_s[keep_idx] if keep_idx else cat_s[:0],
+                            "elapsed_s": total_elapsed,
+                        }
+                    else:
+                        infer[canonical_flower] = {
+                            "masks": None, "boxes": None,
+                            "scores": None, "elapsed_s": total_elapsed,
+                        }
 
                 # Optional depth load (once per image, reused across prompts).
                 depth_mm = None
@@ -1407,6 +1523,8 @@ def main():
                             yellow_h_lo=args.flower_yellow_hue_min,
                             yellow_h_hi=args.flower_yellow_hue_max,
                             yellow_s_min=args.flower_yellow_sat_min,
+                            require_blossom_color=args.flower_require_blossom_color,
+                            min_blossom_color_frac=args.flower_min_blossom_color_frac,
                         )
                         # Roll up rejections per (session, prompt).
                         rt_key = (day, category, session, prompt)
@@ -1642,7 +1760,7 @@ def main():
                       "min_cluster_px", "max_cluster_px",
                       "top_row", "ground_row",
                       "edge_margin", "circularity", "solidity",
-                      "yellow_color"]
+                      "yellow_color", "non_blossom_color"]
         with open(rej_path, "w", newline="", encoding="utf-8") as rf:
             rw = csv.DictWriter(rf, fieldnames=rej_fields)
             rw.writeheader()
