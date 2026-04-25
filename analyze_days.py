@@ -231,12 +231,19 @@ def main():
     processor = Sam3Processor(model, confidence_threshold=args.threshold)
 
     csv_path = out_dir / "results.csv"
+    # n_detections is the post-filter count (after --depth), n_raw is always
+    # the SAM 3 raw count. near_frac_* describe the kept detections.
     fieldnames = ["day", "category", "session", "image", "prompt",
-                  "n_detections", "mean_score", "max_score", "elapsed_s",
-                  "n_near", "near_frac_mean", "near_frac_max"]
+                  "n_detections", "n_raw", "mean_score", "max_score", "elapsed_s",
+                  "near_frac_mean", "near_frac_max"]
     f = open(csv_path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(f, fieldnames=fieldnames)
     writer.writeheader()
+
+    # Accumulator for the per-image wide-format CSV: image_path -> {
+    #   "day": str, "category": str, "session": str,
+    #   "counts": {prompt: n_detections, ...}}
+    image_aggregates: dict[str, dict] = {}
 
     total_imgs = 0
     start = time.time()
@@ -271,24 +278,37 @@ def main():
                     if masks_np is not None and masks_np.ndim == 4 and masks_np.shape[1] == 1:
                         masks_np = masks_np.squeeze(1)
 
-                    n = 0 if masks_np is None else len(masks_np)
+                    n_raw = 0 if masks_np is None else len(masks_np)
+                    n = n_raw
                     mean_s = float(np.mean(scores_np)) if scores_np is not None and len(scores_np) else 0.0
                     max_s = float(np.max(scores_np)) if scores_np is not None and len(scores_np) else 0.0
 
-                    # Depth-based near-field stats (skipped when --depth off or file missing).
-                    n_near: int | str = ""
+                    # Depth-based near-field filter. When --depth is on, we
+                    # actively drop detections whose mask doesn't sit inside
+                    # the canopy band (background trees, far ground, etc.).
                     near_mean: float | str = ""
                     near_max: float | str = ""
-                    if args.depth and depth_mm is not None and n > 0:
+                    if args.depth and depth_mm is not None and n_raw > 0:
                         fracs = near_frac_per_mask(
                             masks_np, depth_mm, args.depth_min_mm, args.depth_max_mm
                         )
                         fracs_arr = np.asarray(fracs, dtype=float)
-                        valid = fracs_arr[~np.isnan(fracs_arr)]
-                        if valid.size:
-                            n_near = int((valid >= args.depth_near_frac).sum())
-                            near_mean = round(float(valid.mean()), 4)
-                            near_max = round(float(valid.max()), 4)
+                        keep = ~np.isnan(fracs_arr) & (fracs_arr >= args.depth_near_frac)
+                        if not keep.all():
+                            masks_np = masks_np[keep]
+                            if scores_np is not None:
+                                scores_np = scores_np[keep]
+                            if boxes_np is not None:
+                                boxes_np = boxes_np[keep]
+                            n = int(keep.sum())
+                            mean_s = (float(np.mean(scores_np))
+                                      if scores_np is not None and len(scores_np) else 0.0)
+                            max_s = (float(np.max(scores_np))
+                                     if scores_np is not None and len(scores_np) else 0.0)
+                        kept_fracs = fracs_arr[keep]
+                        if kept_fracs.size:
+                            near_mean = round(float(kept_fracs.mean()), 4)
+                            near_max = round(float(kept_fracs.max()), 4)
 
                     slug = prompt_slugs[prompt]
                     if args.save_masks and n > 0:
@@ -308,13 +328,21 @@ def main():
                         "day": day, "category": category, "session": session,
                         "image": str(img_path), "prompt": prompt,
                         "n_detections": n,
+                        "n_raw": n_raw,
                         "mean_score": round(mean_s, 4),
                         "max_score": round(max_s, 4),
                         "elapsed_s": round(time.time() - t0, 3),
-                        "n_near": n_near,
                         "near_frac_mean": near_mean,
                         "near_frac_max": near_max,
                     })
+
+                    # Per-image aggregator for wide CSV.
+                    img_key = str(img_path)
+                    agg = image_aggregates.setdefault(img_key, {
+                        "day": day, "category": category, "session": session,
+                        "counts": {},
+                    })
+                    agg["counts"][prompt] = n
                 total_imgs += 1
                 if total_imgs % 10 == 0:
                     f.flush()
@@ -328,6 +356,32 @@ def main():
 
     dt = time.time() - start
     print(f"[done] {total_imgs} images × {len(prompts)} prompts in {dt:.1f}s -> {csv_path}")
+
+    # ---------- wide CSV: one row per image, columns per prompt ----------
+    flower_prompts = [p for p in prompts if "flower" in p.lower()]
+    wide_path = out_dir / "results_wide.csv"
+    wide_fields = ["day", "category", "session", "image"]
+    wide_fields += [f"n_{prompt_slugs[p]}" for p in prompts]
+    if flower_prompts:
+        wide_fields.append("n_flowers_total")
+    with open(wide_path, "w", newline="", encoding="utf-8") as wf:
+        ww = csv.DictWriter(wf, fieldnames=wide_fields)
+        ww.writeheader()
+        for img_key, agg in image_aggregates.items():
+            row = {
+                "day": agg["day"],
+                "category": agg["category"],
+                "session": agg["session"],
+                "image": img_key,
+            }
+            for p in prompts:
+                row[f"n_{prompt_slugs[p]}"] = agg["counts"].get(p, 0)
+            if flower_prompts:
+                row["n_flowers_total"] = sum(
+                    agg["counts"].get(p, 0) for p in flower_prompts
+                )
+            ww.writerow(row)
+    print(f"[done] wide summary -> {wide_path}")
 
 
 if __name__ == "__main__":
