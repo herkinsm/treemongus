@@ -54,10 +54,15 @@ def sample_indices(n: int, k: int | None) -> list[int]:
 
 def find_images(root: Path, only_rgb_folders: bool = True,
                 sample_per_session: int | None = None,
-                frame_range: tuple[int, int] | None = None):
+                frame_range: tuple[int, int] | None = None,
+                require_all_modalities: bool = False):
     """Yield (day, category, session, image_path) tuples.
-    If frame_range is given, take consecutive imgs[start:end] from each session.
-    Otherwise fall back to evenly-spaced sampling."""
+
+    When require_all_modalities is True, the per-session image list is FIRST
+    filtered down to frames that have matching depth / IR / PRGB sibling
+    files, and THEN frame_range / sample_per_session is applied. This way
+    --frame-range 50 80 means "the 50th-80th *complete* frame" rather than
+    "the 50th-80th raw frame, of which some may get skipped later"."""
     root = Path(root)
     for day_dir in sorted(root.glob("2023 day *")):
         inner = day_dir / day_dir.name
@@ -75,6 +80,31 @@ def find_images(root: Path, only_rgb_folders: bool = True,
                     imgs = sorted(p for p in sd.iterdir() if p.suffix.lower() in IMAGE_EXTS)
                     if not imgs:
                         continue
+                    if require_all_modalities:
+                        n_total = len(imgs)
+                        miss_d = miss_i = miss_p = 0
+                        kept: list[Path] = []
+                        for p in imgs:
+                            ok_d = depth_path_for(p).is_file()
+                            ok_i = ir_path_for(p).is_file()
+                            ok_p = prgb_path_for(p).is_file()
+                            if ok_d and ok_i and ok_p:
+                                kept.append(p)
+                            else:
+                                if not ok_d:
+                                    miss_d += 1
+                                if not ok_i:
+                                    miss_i += 1
+                                if not ok_p:
+                                    miss_p += 1
+                        imgs = kept
+                        if len(imgs) < n_total:
+                            print(f"[scan] {session_dir.name}: "
+                                  f"{len(imgs)}/{n_total} complete frames "
+                                  f"(missing depth={miss_d} IR={miss_i} PRGB={miss_p})",
+                                  file=sys.stderr)
+                        if not imgs:
+                            continue
                     if frame_range is not None:
                         a, b = frame_range
                         a = max(0, a)
@@ -995,8 +1025,6 @@ def main():
               f"--sample-per-session 0 for dense tracking.", file=sys.stderr)
 
     total_imgs = 0
-    skipped_modalities = 0
-    skipped_breakdown: dict[str, int] = {"depth": 0, "IR": 0, "PRGB": 0}
     start = time.time()
     try:
         for day, category, session, img_path in find_images(
@@ -1004,24 +1032,10 @@ def main():
             only_rgb_folders=not args.all_folders,
             sample_per_session=sample,
             frame_range=tuple(args.frame_range) if args.frame_range else None,
+            require_all_modalities=args.require_all_modalities,
         ):
             if args.max_images is not None and total_imgs >= args.max_images:
                 break
-
-            # Strict cross-modality alignment: skip frames missing any sibling.
-            if args.require_all_modalities:
-                missing = []
-                if not depth_path_for(img_path).is_file():
-                    missing.append("depth")
-                if not ir_path_for(img_path).is_file():
-                    missing.append("IR")
-                if not prgb_path_for(img_path).is_file():
-                    missing.append("PRGB")
-                if missing:
-                    skipped_modalities += 1
-                    for k in missing:
-                        skipped_breakdown[k] += 1
-                    continue
 
             # Detect session change → flush trackers for the previous session
             # and start fresh ones for the new session.
@@ -1368,9 +1382,6 @@ def main():
 
     dt = time.time() - start
     print(f"[done] {total_imgs} images × {len(prompts)} prompts in {dt:.1f}s -> {csv_path}")
-    if args.require_all_modalities and skipped_modalities:
-        print(f"[done] skipped {skipped_modalities} frames missing modality files: "
-              f"{skipped_breakdown}")
 
     # ---------- wide CSV: one row per image, columns per prompt ----------
     flower_prompts = [p for p in prompts if ("flower" in p.lower() or "blossom" in p.lower())]
