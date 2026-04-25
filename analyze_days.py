@@ -175,9 +175,10 @@ def to_np(x):
 # ---------------------------------------------------------------------------
 def depth_path_for(img_path: Path) -> Path:
     """Given .../<session>/RGB/<stem>-RGB[-BP].<ext>, return the matching
-    .../<session>/depth/<stem>-Depth.<bmp|txt>. Prefers .bmp (16-bit grayscale
-    uint16 mm — the format tree_mask.py expects) over the legacy ASCII .txt
-    decimation. Falls back to .txt if .bmp doesn't exist."""
+    .../<session>/depth/<stem>-Depth.<txt|bmp>. The user's VB capture code
+    saves BOTH a .txt (raw mm, what bridge_server.py:1474 reads) and a .bmp
+    (3-channel uint8 colormap, for human inspection only). We must prefer
+    the .txt — the .bmp doesn't carry mm values."""
     session_dir = img_path.parent.parent  # drop RGB/
     stem = img_path.stem
     base = stem
@@ -185,10 +186,10 @@ def depth_path_for(img_path: Path) -> Path:
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
-    bmp = session_dir / "depth" / f"{base}-Depth.bmp"
-    if bmp.is_file():
-        return bmp
-    return session_dir / "depth" / f"{base}-Depth.txt"
+    txt = session_dir / "depth" / f"{base}-Depth.txt"
+    if txt.is_file():
+        return txt
+    return session_dir / "depth" / f"{base}-Depth.bmp"
 
 
 def prgb_path_for(img_path: Path) -> Path:
@@ -280,28 +281,37 @@ def roi_overlap_per_mask(masks_np: np.ndarray, roi: np.ndarray) -> list[float]:
     return out
 
 
+_warned_bad_depth_bmps: set[str] = set()
+
+
 def load_depth_mm(depth_path: Path, target_hw: tuple[int, int]) -> np.ndarray | None:
     """Load a depth file and return uint16 mm upsampled to target (H, W).
-    Supports two formats:
-      - .bmp / .png : 16-bit (or 8-bit) single-channel image, values = depth mm
-      - .txt        : ASCII space-separated ints, values = depth mm
-    Returns None if the file is missing or malformed."""
+    Supported:
+      - .txt : ASCII (what the user's bridge_server.py reads)
+      - .bmp / .png : 16-bit single-channel raw mm
+    Rejects 3-channel uint8 BMPs — those are the colormap *visualization* the
+    VB capture code writes for human inspection, not raw mm depth. A warning
+    is printed once per session-folder so the user notices."""
     if not depth_path.is_file():
         return None
     suffix = depth_path.suffix.lower()
     try:
         if suffix == ".txt":
-            d = np.loadtxt(depth_path, dtype=np.int32)
+            d = np.loadtxt(depth_path, dtype=np.float32)
         else:
             import cv2
-            # IMREAD_UNCHANGED preserves the original bit depth (uint16 for
-            # the modern depth captures; uint8 if it's an 8-bit normalized
-            # visualization, which we'll clip-cast to uint16 below).
             d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
             if d is None:
                 return None
-            if d.ndim == 3:  # 3-channel encoding: take the first channel
-                d = d[..., 0]
+            if d.ndim == 3 or d.dtype == np.uint8:
+                key = str(depth_path.parent)
+                if key not in _warned_bad_depth_bmps:
+                    _warned_bad_depth_bmps.add(key)
+                    print(f"[warn] depth at {key} is {d.shape} {d.dtype} — looks "
+                          f"like the colormap visualization, not raw mm. Upload "
+                          f"the matching .txt files (raw mm) instead.",
+                          file=sys.stderr)
+                return None
             d = d.astype(np.int32)
     except Exception:
         return None
@@ -309,7 +319,6 @@ def load_depth_mm(depth_path: Path, target_hw: tuple[int, int]) -> np.ndarray | 
         return None
     H, W = target_hw
     if d.shape != (H, W):
-        # Bilinear upsample via PIL in float32 mode.
         pim = Image.fromarray(d.astype(np.float32), mode="F").resize((W, H), Image.BILINEAR)
         d = np.asarray(pim)
     d = np.clip(d, 0, 65535).astype(np.uint16)
