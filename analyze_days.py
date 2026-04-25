@@ -169,6 +169,19 @@ def prgb_path_for(img_path: Path) -> Path:
     return session_dir / "PRGB" / f"{base}-RGB-PP.bmp"
 
 
+def ir_path_for(img_path: Path) -> Path:
+    """Given .../<session>/RGB/<stem>-RGB-BP.<ext>, return
+    .../<session>/IR/<stem>-IR.bmp."""
+    session_dir = img_path.parent.parent
+    stem = img_path.stem
+    base = stem
+    for suffix in ("-RGB-BP", "-RGB-bp", "-RGB", "-rgb"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return session_dir / "IR" / f"{base}-IR.bmp"
+
+
 def extract_roi_mask(prgb_path: Path, target_hw: tuple[int, int],
                       red_r_min: int = 180, red_gb_max: int = 80,
                       min_box_area_px: int = 200,
@@ -695,6 +708,10 @@ def main():
     ap.add_argument("--max-images", type=int, default=None)
     ap.add_argument("--all-folders", action="store_true",
                     help="Search every leaf folder, not just RGB/.")
+    ap.add_argument("--require-all-modalities", action="store_true",
+                    help="Skip any frame whose timestamp doesn't have matching "
+                         "files in all four folders (RGB, depth, IR, PRGB). "
+                         "Guarantees strict cross-modality alignment for the run.")
     ap.add_argument("--save-masks", action="store_true")
     ap.add_argument("--save-overlays", action="store_true")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -956,6 +973,8 @@ def main():
               f"--sample-per-session 0 for dense tracking.", file=sys.stderr)
 
     total_imgs = 0
+    skipped_modalities = 0
+    skipped_breakdown: dict[str, int] = {"depth": 0, "IR": 0, "PRGB": 0}
     start = time.time()
     try:
         for day, category, session, img_path in find_images(
@@ -966,6 +985,22 @@ def main():
         ):
             if args.max_images is not None and total_imgs >= args.max_images:
                 break
+
+            # Strict cross-modality alignment: skip frames missing any sibling.
+            if args.require_all_modalities:
+                missing = []
+                if not depth_path_for(img_path).is_file():
+                    missing.append("depth")
+                if not ir_path_for(img_path).is_file():
+                    missing.append("IR")
+                if not prgb_path_for(img_path).is_file():
+                    missing.append("PRGB")
+                if missing:
+                    skipped_modalities += 1
+                    for k in missing:
+                        skipped_breakdown[k] += 1
+                    continue
+
             # Detect session change → flush trackers for the previous session
             # and start fresh ones for the new session.
             session_key = (day, category, session)
@@ -1311,6 +1346,9 @@ def main():
 
     dt = time.time() - start
     print(f"[done] {total_imgs} images × {len(prompts)} prompts in {dt:.1f}s -> {csv_path}")
+    if args.require_all_modalities and skipped_modalities:
+        print(f"[done] skipped {skipped_modalities} frames missing modality files: "
+              f"{skipped_breakdown}")
 
     # ---------- wide CSV: one row per image, columns per prompt ----------
     flower_prompts = [p for p in prompts if ("flower" in p.lower() or "blossom" in p.lower())]
