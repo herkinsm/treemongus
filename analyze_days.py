@@ -630,6 +630,29 @@ def canopy_overlap_per_mask(masks_np: np.ndarray, canopy: np.ndarray) -> list[fl
     return out
 
 
+def local_depth_std(mask, depth_mm: np.ndarray, window_size: int = 30) -> float:
+    """Std-dev of valid depth pixels in a `window_size`-radius square around
+    the mask's centroid. Low values mean the surrounding region sits on a
+    smooth plane (orchard floor); high values mean a 3D-structured region
+    (canopy with branches at varied depths).
+    Returns 0.0 if too few valid pixels to compute."""
+    mb = np.asarray(mask).astype(bool)
+    if mb.ndim == 3:
+        mb = mb.any(axis=0)
+    if mb.sum() == 0:
+        return 0.0
+    ys, xs = np.nonzero(mb)
+    cy = int(ys.mean()); cx = int(xs.mean())
+    H, W = depth_mm.shape
+    y0 = max(0, cy - window_size); y1 = min(H, cy + window_size + 1)
+    x0 = max(0, cx - window_size); x1 = min(W, cx + window_size + 1)
+    window = depth_mm[y0:y1, x0:x1]
+    valid = window[window > 0]
+    if valid.size < 20:
+        return 0.0
+    return float(np.std(valid.astype(np.float64)))
+
+
 def mask_depth_geom(mask, depth_mm: np.ndarray) -> tuple[float, float, float]:
     """For a single mask, return (depth_spread_mm, row_depth_corr, mean_depth_mm)
     using only valid (depth > 0) pixels.
@@ -1080,6 +1103,17 @@ def main():
                          "camera shows depth increasing linearly with image-y, "
                          "giving |r| close to 1 (default 0.80; matches "
                          "CANOPY_MAX_DEPTH_ROW_CORRELATION). Set >=1.0 to disable.")
+    ap.add_argument("--flower-min-local-depth-std-mm", type=float, default=0.0,
+                    help="Reject a flower mask whose surrounding depth region "
+                         "(30 px window around the centroid) has std-dev below "
+                         "this many mm. Smooth depth around a detection means "
+                         "it sits on the orchard floor plane; canopy blossoms "
+                         "are surrounded by branches at varied depths and have "
+                         "much higher local depth std. Try 120-150 mm. "
+                         "Default 0 = disabled. Independent of y-position.")
+    ap.add_argument("--flower-local-depth-window-px", type=int, default=30,
+                    help="Half-width in pixels of the depth-std window around "
+                         "the mask centroid (default 30, so a 61x61 px window).")
     # Per-tree ROI restriction via PRGB images (red bounding boxes).
     ap.add_argument("--prgb", action="store_true",
                     help="Restrict detections to within the per-tree ROIs drawn as "
@@ -1577,11 +1611,19 @@ def main():
                     # correlation. Applies to ALL prompts. Catches ground/floor
                     # patches that survived the canopy mask (because their depth
                     # was inside the band).
+                    is_flower_for_depth_check = ("flower" in prompt.lower()
+                                                  or "blossom" in prompt.lower())
+                    apply_local_depth = (
+                        is_flower_for_depth_check
+                        and args.flower_min_local_depth_std_mm > 0
+                    )
                     if (depth_mm is not None and n > 0
                             and (args.mask_min_depth_spread_mm > 0
-                                 or args.mask_max_depth_row_corr < 1.0)):
+                                 or args.mask_max_depth_row_corr < 1.0
+                                 or apply_local_depth)):
                         keep = np.ones(n, dtype=bool)
-                        diag_g = {"depth_spread": 0, "depth_row_corr": 0}
+                        diag_g = {"depth_spread": 0, "depth_row_corr": 0,
+                                  "on_smooth_plane": 0}
                         for i, m in enumerate(masks_np):
                             spread, corr, _ = mask_depth_geom(m, depth_mm)
                             if (args.mask_min_depth_spread_mm > 0
@@ -1593,6 +1635,16 @@ def main():
                                     and corr > args.mask_max_depth_row_corr):
                                 keep[i] = False
                                 diag_g["depth_row_corr"] += 1
+                                continue
+                            if apply_local_depth:
+                                lstd = local_depth_std(
+                                    m, depth_mm,
+                                    window_size=args.flower_local_depth_window_px,
+                                )
+                                if lstd > 0 and lstd < args.flower_min_local_depth_std_mm:
+                                    keep[i] = False
+                                    diag_g["on_smooth_plane"] += 1
+                                    continue
                         rt_key = (day, category, session, prompt)
                         rt = rejection_totals.setdefault(rt_key, {})
                         for k, v in diag_g.items():
@@ -1938,7 +1990,7 @@ def main():
         rej_fields = ["day", "category", "session", "prompt",
                       "prgb_roi",
                       "tree_mask",
-                      "depth_spread", "depth_row_corr",
+                      "depth_spread", "depth_row_corr", "on_smooth_plane",
                       "min_cluster_px", "max_cluster_px",
                       "max_bbox_area", "low_density",
                       "top_row", "ground_row",
