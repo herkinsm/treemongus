@@ -1092,6 +1092,16 @@ def main():
                          "horizontal extent. Use with --tile-grid 5 2 to mirror the "
                          "sprayer pipeline's 2-column x 5-row = 10-zone canopy "
                          "discretization.")
+    ap.add_argument("--prgb-extend-horizontal", action="store_true",
+                    help="Stretch the ROI mask horizontally to span the full image "
+                         "width, preserving its vertical extent. Combine with "
+                         "--prgb-extend-vertical for a full-frame ROI.")
+    ap.add_argument("--prgb-pad-px", nargs=2, type=int, default=[0, 0],
+                    metavar=("PAD_X", "PAD_Y"),
+                    help="Add fixed padding on each side of the ROI bounding box "
+                         "(in pixels). E.g. --prgb-pad-px 100 0 expands the ROI "
+                         "100 px left and right (good for capturing full canopy "
+                         "width when the PRGB box only marks the trunk).")
     # Tile-based inference for higher recall on small objects (blossoms).
     ap.add_argument("--tile-grid", nargs=2, type=int, default=[1, 1],
                     metavar=("ROWS", "COLS"),
@@ -1382,12 +1392,25 @@ def main():
                         red_gb_max=args.prgb_red_gb_max,
                         dilate_px=args.prgb_dilate_px,
                     )
-                    if args.prgb_extend_vertical and roi_mask_img is not None:
+                    if roi_mask_img is not None and (
+                            args.prgb_extend_vertical or args.prgb_extend_horizontal
+                            or any(p > 0 for p in args.prgb_pad_px)):
                         bb = roi_bounding_box(roi_mask_img)
                         if bb is not None:
-                            rx, _, rw, _ = bb
+                            rx, ry, rw, rh = bb
+                            pad_x, pad_y = args.prgb_pad_px
+                            # Apply optional fixed horizontal/vertical padding.
+                            rx = max(0, rx - pad_x)
+                            rw = min(img.width - rx, rw + 2 * pad_x)
+                            ry = max(0, ry - pad_y)
+                            rh = min(img.height - ry, rh + 2 * pad_y)
+                            # Optional full-axis stretches.
+                            if args.prgb_extend_vertical:
+                                ry, rh = 0, img.height
+                            if args.prgb_extend_horizontal:
+                                rx, rw = 0, img.width
                             new_mask = np.zeros_like(roi_mask_img)
-                            new_mask[:, rx:rx + rw] = True
+                            new_mask[ry:ry + rh, rx:rx + rw] = True
                             roi_mask_img = new_mask
                 tile_region = None
                 if args.tile_within_roi and roi_mask_img is not None:
