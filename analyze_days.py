@@ -32,7 +32,7 @@ DEFAULT_PROMPTS = [
     "apple",
     "branch",
     "trunk",
-    "flower",
+    "apple blossom",
     "leaf",
     "fruitlet",
 ]
@@ -183,6 +183,33 @@ def near_frac_per_mask(masks_np: np.ndarray, depth_mm: np.ndarray,
     return out
 
 
+def flower_quality_keep(masks_np: np.ndarray,
+                         min_area: int, max_area: int,
+                         y_min: int, y_max: int) -> np.ndarray:
+    """Boolean keep-array for flower-style detections, modeled on
+    sprayer_pipeline/flower_detector.py:
+    - reject masks whose pixel count is outside [min_area, max_area]
+    - reject masks whose centroid y is outside [y_min, y_max]
+      (top 100 rows = waxy leaf glints; bottom rows > 400 = ground/grass)."""
+    keep = np.ones(len(masks_np), dtype=bool)
+    for i, m in enumerate(masks_np):
+        mb = m.astype(bool)
+        if mb.ndim == 3:
+            mb = mb.any(axis=0)
+        area = int(mb.sum())
+        if area < min_area or area > max_area:
+            keep[i] = False
+            continue
+        ys, _ = np.nonzero(mb)
+        if ys.size == 0:
+            keep[i] = False
+            continue
+        cy = float(ys.mean())
+        if cy < y_min or cy > y_max:
+            keep[i] = False
+    return keep
+
+
 # ---------------------------------------------------------------------------
 # Cross-frame instance tracker (greedy IoU). One per (session, prompt). Each
 # persistent track == one physical object (flower / apple / etc.). A track
@@ -312,6 +339,23 @@ def main():
                     help="Subset of --prompts to actually track. Defaults to all "
                          "flower-named prompts (so apples/leaves/etc. are detected per "
                          "frame but not deduped across frames).")
+    # Domain-specific quality filter for flower/blossom prompts (mirrors
+    # sprayer_pipeline/flower_detector.py constants: clusters 10-400 px, top
+    # 100 rows = leaf glint, rows > 400 = grass/ground).
+    ap.add_argument("--flower-min-area-px", type=int, default=10,
+                    help="Drop flower detections smaller than this many pixels (default 10).")
+    ap.add_argument("--flower-max-area-px", type=int, default=2000,
+                    help="Drop flower detections larger than this many pixels "
+                         "(default 2000; classical detector uses 400 for clusters but "
+                         "SAM 3 may merge multiple clusters into one detection).")
+    ap.add_argument("--flower-y-min", type=int, default=100,
+                    help="Drop flower detections whose mask centroid is above row Y "
+                         "(default 100; rejects waxy leaf-glint band at the top of the "
+                         "frame). Set to 0 to disable.")
+    ap.add_argument("--flower-y-max", type=int, default=400,
+                    help="Drop flower detections whose mask centroid is below row Y "
+                         "(default 400; rejects ground/grass band at the bottom of the "
+                         "frame). Set to image height (e.g. 480) to disable.")
     args = ap.parse_args()
 
     sample = None if args.sample_per_session == 0 else args.sample_per_session
@@ -327,7 +371,7 @@ def main():
             print(f"[warn] --track-prompts entries not in --prompts (ignored): {unknown}",
                   file=sys.stderr)
     else:
-        tracked_prompts = [p for p in prompts if "flower" in p.lower()]
+        tracked_prompts = [p for p in prompts if ("flower" in p.lower() or "blossom" in p.lower())]
     tracked_set = set(tracked_prompts)
     if args.track:
         print(f"[init] tracking prompts: {tracked_prompts}")
@@ -478,8 +522,31 @@ def main():
                             near_mean = round(float(kept_fracs.mean()), 4)
                             near_max = round(float(kept_fracs.max()), 4)
 
-                    # Tracker step (after depth filter, so we only track real
-                    # near-field objects). Only runs for prompts in tracked_set.
+                    # Domain-specific flower quality filter: reject masks outside
+                    # the [min_area, max_area] range or whose centroid is in the
+                    # leaf-glint top band or grass/ground bottom band.
+                    is_flower_prompt = ("flower" in prompt.lower()
+                                        or "blossom" in prompt.lower())
+                    if is_flower_prompt and n > 0:
+                        keep = flower_quality_keep(
+                            masks_np,
+                            args.flower_min_area_px, args.flower_max_area_px,
+                            args.flower_y_min, args.flower_y_max,
+                        )
+                        if not keep.all():
+                            masks_np = masks_np[keep]
+                            if scores_np is not None:
+                                scores_np = scores_np[keep]
+                            if boxes_np is not None:
+                                boxes_np = boxes_np[keep]
+                            n = int(keep.sum())
+                            mean_s = (float(np.mean(scores_np))
+                                      if scores_np is not None and len(scores_np) else 0.0)
+                            max_s = (float(np.max(scores_np))
+                                     if scores_np is not None and len(scores_np) else 0.0)
+
+                    # Tracker step (after depth + flower-quality filters, so we
+                    # only track real near-field, properly-sized flowers).
                     track_ids: list[int] = []
                     if (args.track and prompt in tracked_set
                             and current_trackers and n > 0 and boxes_np is not None):
@@ -547,7 +614,7 @@ def main():
     print(f"[done] {total_imgs} images × {len(prompts)} prompts in {dt:.1f}s -> {csv_path}")
 
     # ---------- wide CSV: one row per image, columns per prompt ----------
-    flower_prompts = [p for p in prompts if "flower" in p.lower()]
+    flower_prompts = [p for p in prompts if ("flower" in p.lower() or "blossom" in p.lower())]
     wide_path = out_dir / "results_wide.csv"
     wide_fields = ["day", "category", "session", "image"]
     wide_fields += [f"n_{prompt_slugs[p]}" for p in prompts]
@@ -576,7 +643,7 @@ def main():
     if args.track and track_summaries:
         # Only the prompts we actually tracked appear here.
         prompt_to_slug = prompt_slugs
-        tracked_flower_prompts = [p for p in tracked_prompts if "flower" in p.lower()]
+        tracked_flower_prompts = [p for p in tracked_prompts if ("flower" in p.lower() or "blossom" in p.lower())]
         ts_path = out_dir / "tracks_summary.csv"
         ts_fields = ["day", "category", "session"]
         ts_fields += [f"n_unique_{prompt_to_slug[p]}" for p in tracked_prompts]
