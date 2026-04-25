@@ -284,6 +284,103 @@ def canopy_overlap_per_mask(masks_np: np.ndarray, canopy: np.ndarray) -> list[fl
     return out
 
 
+def split_cluster_mask(mask: np.ndarray, rgb_arr: np.ndarray,
+                        min_blossom_area_px: int = 30,
+                        min_marker_distance_px: int = 5,
+                        intensity_weight: float = 5.0,
+                        edge_weight: float = 0.5,
+                        use_otsu: bool = True) -> list[np.ndarray]:
+    """Split a cluster mask into per-blossom sub-masks using marker-controlled
+    watershed segmentation, fusing four cues:
+
+      - Distance transform of the mask              (geometric centers)
+      - V-channel intensity within the mask          (optical petal centers)
+      - OTSU on V to gate weak intensity peaks       (only bright pixels qualify)
+      - Sobel gradient as watershed barriers         (petal-petal boundaries)
+
+    Returns a list of (H, W) bool masks (one per blossom). If the cluster only
+    yields one valid marker, returns the input mask unchanged in a 1-element
+    list."""
+    import cv2
+
+    mb = np.asarray(mask).astype(bool)
+    if mb.ndim == 3:
+        mb = mb.any(axis=0)
+    if mb.sum() < 2 * min_blossom_area_px:
+        return [mb]
+
+    # Crop to bbox for speed.
+    ys, xs = np.nonzero(mb)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = mb[y0:y1, x0:x1]
+    sub_rgb = rgb_arr[y0:y1, x0:x1]
+    H_s, W_s = sub.shape
+
+    # Distance transform — peaks are geometric blossom centers.
+    dist = cv2.distanceTransform(sub.astype(np.uint8), cv2.DIST_L2, 3)
+    if dist.max() < min_marker_distance_px / 2:
+        return [mb]
+
+    # V channel inside the mask.
+    hsv = cv2.cvtColor(sub_rgb, cv2.COLOR_RGB2HSV)
+    v = hsv[..., 2].astype(np.float32) / 255.0
+    v_in = np.where(sub, v, 0.0)
+
+    # Optional OTSU gate: only allow markers where V passes the OTSU threshold.
+    bright_gate = np.ones_like(sub, dtype=bool)
+    if use_otsu and sub.sum() > 50:
+        v_u8 = (v_in * 255).astype(np.uint8)
+        # OTSU only on the masked region — pixels outside mask should not bias it.
+        masked_vals = v_u8[sub]
+        if masked_vals.size > 0:
+            otsu_val, _ = cv2.threshold(masked_vals, 0, 255,
+                                         cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            bright_gate = v_u8 >= int(otsu_val)
+
+    # Marker score = distance * (1 + intensity_weight * V), gated by bright_gate.
+    score = dist * (1.0 + intensity_weight * v_in) * bright_gate.astype(np.float32)
+
+    # Local maxima inside the mask, separated by min_marker_distance_px.
+    k = 2 * min_marker_distance_px + 1
+    dilated = cv2.dilate(score, np.ones((k, k), np.float32))
+    local_max = (score == dilated) & (score > 0) & sub
+
+    # Convert peaks to integer markers.
+    n_labels, markers = cv2.connectedComponents(local_max.astype(np.uint8))
+    if n_labels <= 2:  # 0 = background, 1 = single peak → no split needed
+        return [mb]
+
+    # Sobel edges → watershed barriers.
+    gx = cv2.Sobel(v, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(v, cv2.CV_32F, 0, 1, ksize=3)
+    edge = np.sqrt(gx * gx + gy * gy)
+
+    # Topographic input: peaks become valleys (negate score), edges raise barriers.
+    topo = -score + edge_weight * edge
+    if topo.max() > topo.min():
+        topo = (topo - topo.min()) / (topo.max() - topo.min())
+    topo_u8 = (topo * 255).astype(np.uint8)
+    topo_bgr = cv2.cvtColor(topo_u8, cv2.COLOR_GRAY2BGR)
+
+    # OpenCV watershed needs int32 markers, mask area gets non-zero seeds; outside mask stays 0.
+    ws_markers = markers.astype(np.int32).copy()
+    ws_markers[~sub] = 0  # only flood within the cluster mask
+    cv2.watershed(topo_bgr, ws_markers)
+
+    # Extract per-marker sub-masks back into full-frame coords.
+    out: list[np.ndarray] = []
+    for label_id in range(1, n_labels):
+        sub_label = (ws_markers == label_id) & sub
+        if int(sub_label.sum()) < min_blossom_area_px:
+            continue
+        full = np.zeros_like(mb, dtype=bool)
+        full[y0:y1, x0:x1] = sub_label
+        out.append(full)
+
+    return out if out else [mb]
+
+
 def _mask_mean_hsv(rgb_arr: np.ndarray, m) -> tuple[float, float, float]:
     """Mean (H, S, V) over masked pixels of an RGB image. OpenCV convention:
     H is 0-179, S and V are 0-255. Returns (0,0,0) for empty masks."""
@@ -594,6 +691,21 @@ def main():
                     help="Minimum mean saturation for a detection to be classified "
                          "yellow (0-255; default 80; below this it's near-white "
                          "and treated as a possible apple blossom).")
+    # Cluster splitting via marker-controlled watershed (true per-blossom
+    # segmentation, not the area/200 density estimate).
+    ap.add_argument("--split-clusters", action="store_true",
+                    help="For each surviving flower mask larger than 2x "
+                         "area_per_flower, run marker-controlled watershed "
+                         "segmentation (distance transform + intensity peaks + "
+                         "OTSU gate + Sobel edge barriers) to split clusters into "
+                         "individual blossom masks. Each sub-mask becomes its own "
+                         "detection (own bbox, own track).")
+    ap.add_argument("--split-min-blossom-area-px", type=int, default=30,
+                    help="Drop a watershed sub-mask smaller than this (default 30 px; "
+                         "rejects watershed slivers).")
+    ap.add_argument("--split-min-marker-distance-px", type=int, default=5,
+                    help="Minimum pixel separation between two blossom-center "
+                         "markers before they get merged (default 5).")
     args = ap.parse_args()
 
     sample = None if args.sample_per_session == 0 else args.sample_per_session
@@ -855,6 +967,60 @@ def main():
                             max_s = (float(np.max(scores_np))
                                      if scores_np is not None and len(scores_np) else 0.0)
                         kept_areas = [a for a, k in zip(areas_in, keep) if k]
+
+                    # Optional: split each cluster mask into per-blossom masks
+                    # via marker-controlled watershed. Each sub-mask becomes a
+                    # standalone detection so the tracker can ID individual
+                    # blossoms across frames.
+                    if args.split_clusters and is_flower_prompt and n > 0:
+                        rgb_arr_for_split = (rgb_arr if 'rgb_arr' in dir()
+                                             else np.asarray(img))
+                        thr = 2 * args.flower_area_per_flower_px
+                        new_masks: list[np.ndarray] = []
+                        new_scores: list[float] = []
+                        new_boxes: list[list[float]] = []
+                        new_areas: list[int] = []
+                        for idx, m in enumerate(masks_np):
+                            mb = m.astype(bool)
+                            if mb.ndim == 3:
+                                mb = mb.any(axis=0)
+                            cluster_area = int(mb.sum())
+                            if cluster_area < thr:
+                                new_masks.append(m)
+                                if scores_np is not None:
+                                    new_scores.append(float(scores_np[idx]))
+                                if boxes_np is not None:
+                                    new_boxes.append(list(boxes_np[idx]))
+                                new_areas.append(cluster_area)
+                                continue
+                            subs = split_cluster_mask(
+                                m, rgb_arr_for_split,
+                                min_blossom_area_px=args.split_min_blossom_area_px,
+                                min_marker_distance_px=args.split_min_marker_distance_px,
+                            )
+                            for sub in subs:
+                                new_masks.append(sub.astype(masks_np.dtype))
+                                if scores_np is not None:
+                                    new_scores.append(float(scores_np[idx]))
+                                ys2, xs2 = np.nonzero(sub)
+                                if ys2.size:
+                                    new_boxes.append([float(xs2.min()), float(ys2.min()),
+                                                       float(xs2.max()), float(ys2.max())])
+                                else:
+                                    new_boxes.append([0.0, 0.0, 0.0, 0.0])
+                                new_areas.append(int(sub.sum()))
+                        if new_masks:
+                            masks_np = np.stack(new_masks, axis=0)
+                            scores_np = (np.asarray(new_scores, dtype=np.float32)
+                                         if scores_np is not None else None)
+                            boxes_np = (np.asarray(new_boxes, dtype=np.float32)
+                                        if boxes_np is not None else None)
+                            kept_areas = new_areas
+                            n = len(new_masks)
+                            mean_s = (float(np.mean(scores_np))
+                                      if scores_np is not None and len(scores_np) else 0.0)
+                            max_s = (float(np.max(scores_np))
+                                     if scores_np is not None and len(scores_np) else 0.0)
 
                     # Density-based individual flower estimate per cluster.
                     if is_flower_prompt and kept_areas:
