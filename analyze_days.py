@@ -284,6 +284,36 @@ def canopy_overlap_per_mask(masks_np: np.ndarray, canopy: np.ndarray) -> list[fl
     return out
 
 
+def mask_depth_geom(mask, depth_mm: np.ndarray) -> tuple[float, float, float]:
+    """For a single mask, return (depth_spread_mm, row_depth_corr, mean_depth_mm)
+    using only valid (depth > 0) pixels.
+
+    spread = max - min depth within mask; ports CANOPY_MIN_DEPTH_SPREAD_MM.
+    row_depth_corr = Pearson r between image-y and depth — high positive
+        correlation (depth increases with y) is the signature of orchard
+        floor at a typical camera tilt; ports CANOPY_MAX_DEPTH_ROW_CORRELATION.
+    Returns (0.0, 0.0, 0.0) when too few valid pixels to compute statistics."""
+    mb = np.asarray(mask).astype(bool)
+    if mb.ndim == 3:
+        mb = mb.any(axis=0)
+    if mb.sum() < 10:
+        return 0.0, 0.0, 0.0
+    ys, _ = np.nonzero(mb)
+    d_in = depth_mm[mb]
+    valid = d_in > 0
+    if valid.sum() < 10:
+        return 0.0, 0.0, 0.0
+    ys = ys[valid].astype(np.float64)
+    d = d_in[valid].astype(np.float64)
+    spread = float(d.max() - d.min())
+    yvar, dvar = ys.var(), d.var()
+    if yvar < 1e-9 or dvar < 1e-9:
+        return spread, 0.0, float(d.mean())
+    corr = float(((ys - ys.mean()) * (d - d.mean())).mean()
+                  / np.sqrt(yvar * dvar))
+    return spread, corr, float(d.mean())
+
+
 def split_cluster_mask(mask: np.ndarray, rgb_arr: np.ndarray,
                         min_blossom_area_px: int = 30,
                         min_marker_distance_px: int = 5,
@@ -626,6 +656,21 @@ def main():
                          "fraction of the frame width — long horizontal canopy bands "
                          "are usually ground/grass at a tilt (default 0 = disabled; "
                          "try 0.5 if grass is bleeding through).")
+    # Per-detection ground-rejection gates from tree_mask.py: depth-spread
+    # rejects flat-depth detections (artifacts / distant fragments) and the
+    # row-depth correlation gate kills tilted ground (depth ramping with image-y).
+    ap.add_argument("--mask-min-depth-spread-mm", type=int, default=30,
+                    help="Reject a SAM 3 mask whose internal depth-spread "
+                         "(max-min of valid depths inside the mask) is less than "
+                         "this many mm — flat-depth detections are usually ground "
+                         "patches or stereo artifacts (default 30; "
+                         "matches CANOPY_MIN_DEPTH_SPREAD_MM). Set 0 to disable.")
+    ap.add_argument("--mask-max-depth-row-corr", type=float, default=0.80,
+                    help="Reject a mask whose internal pearson_r(image_y, depth) "
+                         "is above this threshold — ground tilted away from the "
+                         "camera shows depth increasing linearly with image-y, "
+                         "giving |r| close to 1 (default 0.80; matches "
+                         "CANOPY_MAX_DEPTH_ROW_CORRELATION). Set >=1.0 to disable.")
     # Cross-frame instance tracking (per-session IoU tracker).
     ap.add_argument("--track", action="store_true",
                     help="Track detections across frames within each session via IoU "
@@ -900,6 +945,42 @@ def main():
                         if kept_fracs.size:
                             near_mean = round(float(kept_fracs.mean()), 4)
                             near_max = round(float(kept_fracs.max()), 4)
+
+                    # Per-detection ground rejection: depth-spread + row-depth
+                    # correlation. Applies to ALL prompts. Catches ground/floor
+                    # patches that survived the canopy mask (because their depth
+                    # was inside the band).
+                    if (depth_mm is not None and n > 0
+                            and (args.mask_min_depth_spread_mm > 0
+                                 or args.mask_max_depth_row_corr < 1.0)):
+                        keep = np.ones(n, dtype=bool)
+                        diag_g = {"depth_spread": 0, "depth_row_corr": 0}
+                        for i, m in enumerate(masks_np):
+                            spread, corr, _ = mask_depth_geom(m, depth_mm)
+                            if (args.mask_min_depth_spread_mm > 0
+                                    and spread < args.mask_min_depth_spread_mm):
+                                keep[i] = False
+                                diag_g["depth_spread"] += 1
+                                continue
+                            if (args.mask_max_depth_row_corr < 1.0
+                                    and corr > args.mask_max_depth_row_corr):
+                                keep[i] = False
+                                diag_g["depth_row_corr"] += 1
+                        rt_key = (day, category, session, prompt)
+                        rt = rejection_totals.setdefault(rt_key, {})
+                        for k, v in diag_g.items():
+                            rt[k] = rt.get(k, 0) + v
+                        if not keep.all():
+                            masks_np = masks_np[keep]
+                            if scores_np is not None:
+                                scores_np = scores_np[keep]
+                            if boxes_np is not None:
+                                boxes_np = boxes_np[keep]
+                            n = int(keep.sum())
+                            mean_s = (float(np.mean(scores_np))
+                                      if scores_np is not None and len(scores_np) else 0.0)
+                            max_s = (float(np.max(scores_np))
+                                     if scores_np is not None and len(scores_np) else 0.0)
 
                     # Tree-mask canopy filter (applies to ALL prompts — every
                     # category benefits from rejecting ground/sky/bg).
@@ -1178,6 +1259,7 @@ def main():
         rej_path = out_dir / "rejections.csv"
         rej_fields = ["day", "category", "session", "prompt",
                       "tree_mask",
+                      "depth_spread", "depth_row_corr",
                       "min_cluster_px", "max_cluster_px",
                       "top_row", "ground_row",
                       "edge_margin", "circularity", "solidity",
