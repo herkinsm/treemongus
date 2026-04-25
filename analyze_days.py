@@ -183,6 +183,61 @@ def near_frac_per_mask(masks_np: np.ndarray, depth_mm: np.ndarray,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Tight port of sprayer_pipeline/tree_mask.py canopy mask. Mirrors:
+#   - 3x3 median blur on depth (line 153)
+#   - foreground depth band [CANOPY_DEPTH_MIN_MM, CANOPY_DEPTH_MAX_MM]
+#   - row-banded ground filter:
+#       above ROW_GROUND_START (=280)            : full [min, max] band
+#       row-3 band [280, ROW_LOWER_BAND_START=385]: cap at centre + 500 mm
+#       row-4 band [385, H)                      : cap at centre + 100 mm
+#     where centre = median canopy depth in the upper centre strip [100, 300].
+# Skips depth-spread / row-depth correlation / sky filters (option 2).
+# ---------------------------------------------------------------------------
+def compute_canopy_mask(depth_mm: np.ndarray,
+                         min_mm: int = 600, max_mm: int = 3000,
+                         row_ground_start: int = 280,
+                         row_lower_band_start: int = 385,
+                         ground_band_mm: int = 100,
+                         ground_band_mm_row3: int = 500) -> np.ndarray:
+    """Return a (H, W) bool canopy mask. True == canopy, False == ground/sky/bg."""
+    import cv2
+    H, W = depth_mm.shape
+    d = cv2.medianBlur(depth_mm.astype(np.uint16), 3).astype(np.int32)
+
+    # Median depth of the upper centre strip — frame's canopy reference depth.
+    upper_band = (d >= min_mm) & (d <= max_mm)
+    cs_top, cs_bot = min(100, H), min(300, H)
+    valid = d[cs_top:cs_bot][upper_band[cs_top:cs_bot]]
+    centre = int(np.median(valid)) if valid.size else (min_mm + max_mm) // 2
+
+    # Per-row max depth allowed for canopy.
+    row_max = np.full(H, max_mm, dtype=np.int32)
+    if row_ground_start < H:
+        r3_end = min(row_lower_band_start, H)
+        row_max[row_ground_start:r3_end] = min(centre + ground_band_mm_row3, max_mm)
+    if row_lower_band_start < H:
+        row_max[row_lower_band_start:H] = min(centre + ground_band_mm, max_mm)
+
+    canopy = (d >= min_mm) & (d <= row_max[:, None])
+    return canopy.astype(bool)
+
+
+def canopy_overlap_per_mask(masks_np: np.ndarray, canopy: np.ndarray) -> list[float]:
+    """Fraction of each mask's pixels that lie inside the canopy mask. NaN for empty."""
+    out: list[float] = []
+    for m in masks_np:
+        mb = m.astype(bool)
+        if mb.ndim == 3:
+            mb = mb.any(axis=0)
+        total = int(mb.sum())
+        if total == 0:
+            out.append(float("nan"))
+            continue
+        out.append(float((mb & canopy).sum()) / float(total))
+    return out
+
+
 def _mask_shape_stats(m) -> tuple[float, float, int, int, int, int, int, float]:
     """Return (circularity, solidity, area, bx, by, bw, bh, centroid_y)
     for a 2D-or-3D bool mask, using cv2 contour ops to mirror
@@ -374,6 +429,17 @@ def main():
     ap.add_argument("--depth-near-frac", type=float, default=0.5,
                     help="Count a detection as near-field if >= this fraction of its "
                          "mask pixels lie inside the depth band (default 0.5).")
+    # Tree-mask canopy filter (port of sprayer_pipeline/tree_mask.py).
+    ap.add_argument("--tree-mask", action="store_true",
+                    help="Apply a row-banded canopy mask derived from depth and reject "
+                         "SAM 3 detections that fall on ground/sky/background instead "
+                         "of canopy. Tight port of sprayer_pipeline/tree_mask.py: "
+                         "3x3 median blur on depth + depth band + row-banded ground "
+                         "filter (row 3 cap = centre + 500 mm, row 4 cap = centre + "
+                         "100 mm). Implies --depth.")
+    ap.add_argument("--tree-mask-min-overlap", type=float, default=0.5,
+                    help="Keep a detection only if >= this fraction of its mask pixels "
+                         "lie inside the canopy mask (default 0.5).")
     # Cross-frame instance tracking (per-session IoU tracker).
     ap.add_argument("--track", action="store_true",
                     help="Track detections across frames within each session via IoU "
@@ -464,14 +530,15 @@ def main():
     processor = Sam3Processor(model, confidence_threshold=args.threshold)
 
     csv_path = out_dir / "results.csv"
-    # n_detections is the post-filter count (after --depth + flower quality
-    # filter for flower prompts). n_raw is always SAM 3's raw count.
+    # n_detections is the post-filter count (after --depth + tree-mask + flower
+    # quality filter). n_raw is always SAM 3's raw count.
     # est_flowers is the density-based individual blossom estimate
     # (sum over kept detections of max(1, round(area / area_per_flower))).
     fieldnames = ["day", "category", "session", "image", "prompt",
                   "n_detections", "n_raw", "est_flowers",
                   "mean_score", "max_score", "elapsed_s",
-                  "near_frac_mean", "near_frac_max", "track_ids"]
+                  "near_frac_mean", "near_frac_max",
+                  "canopy_overlap_mean", "track_ids"]
     f = open(csv_path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(f, fieldnames=fieldnames)
     writer.writeheader()
@@ -559,8 +626,14 @@ def main():
 
                 # Optional depth load (once per image, reused across prompts).
                 depth_mm = None
-                if args.depth:
+                canopy_mask_img = None
+                if args.depth or args.tree_mask:
                     depth_mm = load_depth_mm(depth_path_for(img_path), (img.height, img.width))
+                if args.tree_mask and depth_mm is not None:
+                    canopy_mask_img = compute_canopy_mask(
+                        depth_mm,
+                        min_mm=args.depth_min_mm, max_mm=args.depth_max_mm,
+                    )
 
                 for prompt in prompts:
                     t0 = time.time()
@@ -606,6 +679,34 @@ def main():
                         if kept_fracs.size:
                             near_mean = round(float(kept_fracs.mean()), 4)
                             near_max = round(float(kept_fracs.max()), 4)
+
+                    # Tree-mask canopy filter (applies to ALL prompts — every
+                    # category benefits from rejecting ground/sky/bg).
+                    canopy_overlap_mean: float | str = ""
+                    if args.tree_mask and canopy_mask_img is not None and n > 0:
+                        overlaps = canopy_overlap_per_mask(masks_np, canopy_mask_img)
+                        ov_arr = np.asarray(overlaps, dtype=float)
+                        keep = ~np.isnan(ov_arr) & (ov_arr >= args.tree_mask_min_overlap)
+                        # Roll up tree-mask rejections per (session, prompt).
+                        rt_key = (day, category, session, prompt)
+                        rt = rejection_totals.setdefault(rt_key, {})
+                        rt["tree_mask"] = rt.get("tree_mask", 0) + int((~keep).sum())
+                        if not keep.all():
+                            masks_np = masks_np[keep]
+                            if scores_np is not None:
+                                scores_np = scores_np[keep]
+                            if boxes_np is not None:
+                                boxes_np = boxes_np[keep]
+                            n = int(keep.sum())
+                            mean_s = (float(np.mean(scores_np))
+                                      if scores_np is not None and len(scores_np) else 0.0)
+                            max_s = (float(np.max(scores_np))
+                                     if scores_np is not None and len(scores_np) else 0.0)
+                        kept_ov = ov_arr[keep]
+                        if kept_ov.size and not np.all(np.isnan(kept_ov)):
+                            canopy_overlap_mean = round(
+                                float(np.nanmean(kept_ov)), 4
+                            )
 
                     # Domain-specific flower quality filter: cluster size +
                     # centroid y + bbox edge margin + circularity + solidity,
@@ -691,6 +792,7 @@ def main():
                         "elapsed_s": round(time.time() - t0, 3),
                         "near_frac_mean": near_mean,
                         "near_frac_max": near_max,
+                        "canopy_overlap_mean": canopy_overlap_mean,
                         "track_ids": ";".join(str(t) for t in track_ids) if track_ids else "",
                     })
 
@@ -794,6 +896,7 @@ def main():
     if rejection_totals:
         rej_path = out_dir / "rejections.csv"
         rej_fields = ["day", "category", "session", "prompt",
+                      "tree_mask",
                       "min_cluster_px", "max_cluster_px",
                       "top_row", "ground_row",
                       "edge_margin", "circularity", "solidity"]
