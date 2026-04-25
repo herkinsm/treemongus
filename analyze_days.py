@@ -52,8 +52,12 @@ def sample_indices(n: int, k: int | None) -> list[int]:
     return sorted(set(np.linspace(0, n - 1, num=k).round().astype(int).tolist()))
 
 
-def find_images(root: Path, only_rgb_folders: bool = True, sample_per_session: int | None = None):
-    """Yield (day, category, session, image_path) tuples, evenly sampled per session."""
+def find_images(root: Path, only_rgb_folders: bool = True,
+                sample_per_session: int | None = None,
+                frame_range: tuple[int, int] | None = None):
+    """Yield (day, category, session, image_path) tuples.
+    If frame_range is given, take consecutive imgs[start:end] from each session.
+    Otherwise fall back to evenly-spaced sampling."""
     root = Path(root)
     for day_dir in sorted(root.glob("2023 day *")):
         inner = day_dir / day_dir.name
@@ -71,7 +75,13 @@ def find_images(root: Path, only_rgb_folders: bool = True, sample_per_session: i
                     imgs = sorted(p for p in sd.iterdir() if p.suffix.lower() in IMAGE_EXTS)
                     if not imgs:
                         continue
-                    idxs = sample_indices(len(imgs), sample_per_session)
+                    if frame_range is not None:
+                        a, b = frame_range
+                        a = max(0, a)
+                        b = min(len(imgs), b)
+                        idxs = list(range(a, b))
+                    else:
+                        idxs = sample_indices(len(imgs), sample_per_session)
                     for i in idxs:
                         yield day_dir.name, category_dir.name, session_dir.name, imgs[i]
 
@@ -412,6 +422,10 @@ def main():
     ap.add_argument("--sample-per-session", type=int, default=20,
                     help="How many evenly-spaced frames to analyze per session "
                          "(captures start/middle/end). Use 0 for all frames.")
+    ap.add_argument("--frame-range", nargs=2, type=int, metavar=("START", "END"),
+                    help="Process consecutive frames imgs[START:END] from each "
+                         "session instead of even sampling. Tracker-friendly "
+                         "subset. Overrides --sample-per-session when set.")
     ap.add_argument("--max-images", type=int, default=None)
     ap.add_argument("--all-folders", action="store_true",
                     help="Search every leaf folder, not just RGB/.")
@@ -606,6 +620,7 @@ def main():
             Path(args.root),
             only_rgb_folders=not args.all_folders,
             sample_per_session=sample,
+            frame_range=tuple(args.frame_range) if args.frame_range else None,
         ):
             if args.max_images is not None and total_imgs >= args.max_images:
                 break
