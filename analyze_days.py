@@ -1147,6 +1147,12 @@ def main():
                          "typically 1.5-3x better recall on small objects. "
                          "Requires --prgb. Falls back to whole-frame tiling on "
                          "frames where no ROI was extracted.")
+    ap.add_argument("--skip-no-roi", action="store_true",
+                    help="Skip frames where the PRGB image yielded no detectable "
+                         "ROI (no red boxes found). Stops --tile-within-roi from "
+                         "wasting inference on grass/sky/background when the "
+                         "sprayer wasn't targeting a tree. Logs skipped count "
+                         "at the end of the run.")
     # Cross-frame instance tracking (per-session IoU tracker).
     ap.add_argument("--track", action="store_true",
                     help="Track detections across frames within each session via IoU "
@@ -1370,6 +1376,7 @@ def main():
               f"--sample-per-session 0 for dense tracking.", file=sys.stderr)
 
     total_imgs = 0
+    skipped_no_roi = 0
     start = time.time()
     try:
         for day, category, session, img_path in find_images(
@@ -1428,6 +1435,12 @@ def main():
                             new_mask = np.zeros_like(roi_mask_img)
                             new_mask[ry:ry + rh, rx:rx + rw] = True
                             roi_mask_img = new_mask
+                # Skip frames without a usable ROI when the user explicitly
+                # asked for ROI-bounded analysis.
+                if args.skip_no_roi and args.prgb and roi_mask_img is None:
+                    skipped_no_roi += 1
+                    continue
+
                 tile_region = None
                 if args.tile_within_roi and roi_mask_img is not None:
                     tile_region = roi_bounding_box(roi_mask_img)
@@ -1845,6 +1858,8 @@ def main():
 
     dt = time.time() - start
     print(f"[done] {total_imgs} images × {len(prompts)} prompts in {dt:.1f}s -> {csv_path}")
+    if skipped_no_roi:
+        print(f"[done] skipped {skipped_no_roi} frames with no detectable PRGB ROI")
 
     # ---------- wide CSV: one row per image, columns per prompt ----------
     flower_prompts = [p for p in prompts if ("flower" in p.lower() or "blossom" in p.lower())]
