@@ -222,7 +222,8 @@ def ir_path_for(img_path: Path) -> Path:
 def extract_roi_mask(prgb_path: Path, target_hw: tuple[int, int],
                       red_r_min: int = 180, red_gb_max: int = 80,
                       min_box_area_px: int = 200,
-                      min_box_side_px: int = 25) -> np.ndarray | None:
+                      min_box_side_px: int = 25,
+                      dilate_px: int = 0) -> np.ndarray | None:
     """Build a binary ROI mask from a PRGB image whose red rectangles outline
     the per-tree zones drawn by the sprayer pipeline.
 
@@ -263,6 +264,10 @@ def extract_roi_mask(prgb_path: Path, target_hw: tuple[int, int],
         if w < min_box_side_px or h < min_box_side_px:
             continue
         roi[y:y + h, x:x + w] = True
+    if dilate_px > 0 and roi.any():
+        k = 2 * int(dilate_px) + 1
+        kernel = np.ones((k, k), np.uint8)
+        roi = cv2.dilate(roi.astype(np.uint8), kernel).astype(bool)
     return roi if roi.any() else None
 
 
@@ -842,6 +847,11 @@ def main():
     ap.add_argument("--prgb-red-gb-max", type=int, default=80,
                     help="Upper bound on G and B channels for red-box detection "
                          "(0-255; default 80).")
+    ap.add_argument("--prgb-dilate-px", type=int, default=0,
+                    help="Dilate the extracted ROI mask by N pixels before applying "
+                         "the overlap check. Useful when SAM 3's flower masks tend "
+                         "to spill past the red-box edges (default 0; try 20-40 if "
+                         "many real flowers near the box edges are rejected).")
     # Cross-frame instance tracking (per-session IoU tracker).
     ap.add_argument("--track", action="store_true",
                     help="Track detections across frames within each session via IoU "
@@ -1082,6 +1092,7 @@ def main():
                         (img.height, img.width),
                         red_r_min=args.prgb_red_r_min,
                         red_gb_max=args.prgb_red_gb_max,
+                        dilate_px=args.prgb_dilate_px,
                     )
 
                 for prompt in prompts:
