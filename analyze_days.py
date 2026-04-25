@@ -300,11 +300,29 @@ def main():
     ap.add_argument("--track-min-frames", type=int, default=2,
                     help="Only count a track as a 'unique instance' if seen in >= this "
                          "many frames (filters one-frame false positives).")
+    ap.add_argument("--track-prompts", nargs="+", default=None,
+                    help="Subset of --prompts to actually track. Defaults to all "
+                         "flower-named prompts (so apples/leaves/etc. are detected per "
+                         "frame but not deduped across frames).")
     args = ap.parse_args()
 
     sample = None if args.sample_per_session == 0 else args.sample_per_session
     prompts = list(args.prompts)
     prompt_slugs = {p: slugify(p) for p in prompts}
+
+    # Resolve which prompts the IoU tracker should run on. Default: any prompt
+    # whose text contains "flower". User can override with --track-prompts.
+    if args.track_prompts is not None:
+        tracked_prompts = [p for p in args.track_prompts if p in prompts]
+        unknown = [p for p in args.track_prompts if p not in prompts]
+        if unknown:
+            print(f"[warn] --track-prompts entries not in --prompts (ignored): {unknown}",
+                  file=sys.stderr)
+    else:
+        tracked_prompts = [p for p in prompts if "flower" in p.lower()]
+    tracked_set = set(tracked_prompts)
+    if args.track:
+        print(f"[init] tracking prompts: {tracked_prompts}")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -349,6 +367,8 @@ def main():
     track_details: list[dict] = []     # one per individual track
 
     def flush_session_trackers(session_key, trackers):
+        # trackers may not include every prompt (only tracked_set was created),
+        # which is fine — we just emit summaries for the prompts present.
         d, c, s = session_key
         for p, tr in trackers.items():
             track_summaries.append({
@@ -392,7 +412,7 @@ def main():
                 if current_session_key is not None:
                     flush_session_trackers(current_session_key, current_trackers)
                 current_trackers = {p: IoUTracker(args.track_iou, args.track_max_age)
-                                    for p in prompts}
+                                    for p in tracked_prompts}
                 current_session_key = session_key
 
             t_img = time.time()
@@ -451,9 +471,10 @@ def main():
                             near_max = round(float(kept_fracs.max()), 4)
 
                     # Tracker step (after depth filter, so we only track real
-                    # near-field objects). Returns one track_id per detection.
+                    # near-field objects). Only runs for prompts in tracked_set.
                     track_ids: list[int] = []
-                    if args.track and current_trackers and n > 0 and boxes_np is not None:
+                    if (args.track and prompt in tracked_set
+                            and current_trackers and n > 0 and boxes_np is not None):
                         track_ids = current_trackers[prompt].step(boxes_np, scores_np)
 
                     slug = prompt_slugs[prompt]
@@ -536,13 +557,13 @@ def main():
 
     # ---------- per-session unique tracks (instance dedup) ----------
     if args.track and track_summaries:
-        # Pivot: one row per session, one column per prompt's unique count,
-        # plus a combined n_unique_flowers_total across flower-named prompts.
+        # Only the prompts we actually tracked appear here.
         prompt_to_slug = prompt_slugs
+        tracked_flower_prompts = [p for p in tracked_prompts if "flower" in p.lower()]
         ts_path = out_dir / "tracks_summary.csv"
         ts_fields = ["day", "category", "session"]
-        ts_fields += [f"n_unique_{prompt_to_slug[p]}" for p in prompts]
-        if flower_prompts:
+        ts_fields += [f"n_unique_{prompt_to_slug[p]}" for p in tracked_prompts]
+        if tracked_flower_prompts:
             ts_fields.append("n_unique_flowers_total")
         # Group track_summaries by session.
         by_session: dict[tuple, dict] = {}
@@ -556,12 +577,13 @@ def main():
             tw = csv.DictWriter(tf, fieldnames=ts_fields)
             tw.writeheader()
             for key, row in by_session.items():
-                # Default to 0 for any missing prompt column.
-                for p in prompts:
+                # Default to 0 for any missing prompt column (only tracked prompts).
+                for p in tracked_prompts:
                     row.setdefault(f"n_unique_{prompt_to_slug[p]}", 0)
-                if flower_prompts:
+                if tracked_flower_prompts:
                     row["n_unique_flowers_total"] = sum(
-                        row.get(f"n_unique_{prompt_to_slug[p]}", 0) for p in flower_prompts
+                        row.get(f"n_unique_{prompt_to_slug[p]}", 0)
+                        for p in tracked_flower_prompts
                     )
                 tw.writerow(row)
         print(f"[done] per-session unique tracks -> {ts_path}")
