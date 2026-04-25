@@ -32,8 +32,7 @@ DEFAULT_PROMPTS = [
     "apple",
     "branch",
     "trunk",
-    "flower in full bloom",
-    "flower in partial bloom",
+    "flower",
     "leaf",
     "fruitlet",
 ]
@@ -265,7 +264,7 @@ def main():
     ap.add_argument("--out", default=r"C:\Users\matth\OneDrive\Desktop\Postdoc\Image\sam3_out")
     ap.add_argument("--prompts", nargs="+", default=DEFAULT_PROMPTS,
                     help="One or more text prompts. Default: apple, branch, trunk, "
-                         "flower in full bloom, flower in partial bloom, leaf, fruitlet.")
+                         "flower, leaf, fruitlet.")
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--sample-per-session", type=int, default=20,
                     help="How many evenly-spaced frames to analyze per session "
