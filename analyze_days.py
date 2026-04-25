@@ -770,6 +770,8 @@ def flower_quality_keep(masks_np: np.ndarray,
                          blossom_pink_s_lo: int = 10,
                          blossom_pink_s_hi: int = 100,
                          blossom_pink_v_min: int = 100,
+                         max_bbox_area_px: int = 0,
+                         min_mask_density: float = 0.0,
                          ) -> tuple[np.ndarray, dict, list[int]]:
     """Boolean keep-array + per-rejection diagnostics + per-mask area, mirroring
     the gates in sprayer_pipeline/flower_detector.py:
@@ -786,7 +788,8 @@ def flower_quality_keep(masks_np: np.ndarray,
     diag = {"min_cluster_px": 0, "max_cluster_px": 0,
             "top_row": 0, "ground_row": 0,
             "edge_margin": 0, "circularity": 0, "solidity": 0,
-            "yellow_color": 0, "non_blossom_color": 0}
+            "yellow_color": 0, "non_blossom_color": 0,
+            "max_bbox_area": 0, "low_density": 0}
     areas: list[int] = []
 
     # Pre-compute the "could be apple blossom" pixel mask once per frame
@@ -811,6 +814,12 @@ def flower_quality_keep(masks_np: np.ndarray,
             keep[i] = False; diag["min_cluster_px"] += 1; continue
         if area > max_area:
             keep[i] = False; diag["max_cluster_px"] += 1; continue
+        if max_bbox_area_px > 0 and bw * bh > max_bbox_area_px:
+            keep[i] = False; diag["max_bbox_area"] += 1; continue
+        if min_mask_density > 0 and bw > 0 and bh > 0:
+            density = float(area) / float(bw * bh)
+            if density < min_mask_density:
+                keep[i] = False; diag["low_density"] += 1; continue
         if cy < y_min:
             keep[i] = False; diag["top_row"] += 1; continue
         if cy > y_max:
@@ -1126,6 +1135,20 @@ def main():
                          "the detections. Example: "
                          "--flower-multi-prompts flower blossom 'white flower'. "
                          "Default None = single-prompt mode.")
+    # SAM 3 occasionally returns a sparse mask whose bounding box covers a
+    # whole branch but whose actual mask pixels are few (so it slips through
+    # max_cluster_px). These two gates target that failure mode directly.
+    ap.add_argument("--flower-max-bbox-area-px", type=int, default=10000,
+                    help="Reject a flower detection whose bounding-box area "
+                         "exceeds this many pixels. Catches SAM 3 mask outputs "
+                         "where mask_area is small but the bbox spans a whole "
+                         "branch (default 10000 = ~100x100 covers any plausible "
+                         "cluster). Set 0 to disable.")
+    ap.add_argument("--flower-min-mask-density", type=float, default=0.20,
+                    help="Reject a flower detection where mask_area / bbox_area "
+                         "is below this — sparse 'fingers across a branch' SAM 3 "
+                         "outputs have density <0.2; real clusters are >0.4 "
+                         "(default 0.20). Set 0 to disable.")
     # Cluster splitting via marker-controlled watershed (true per-blossom
     # segmentation, not the area/200 density estimate).
     ap.add_argument("--split-clusters", action="store_true",
@@ -1525,6 +1548,8 @@ def main():
                             yellow_s_min=args.flower_yellow_sat_min,
                             require_blossom_color=args.flower_require_blossom_color,
                             min_blossom_color_frac=args.flower_min_blossom_color_frac,
+                            max_bbox_area_px=args.flower_max_bbox_area_px,
+                            min_mask_density=args.flower_min_mask_density,
                         )
                         # Roll up rejections per (session, prompt).
                         rt_key = (day, category, session, prompt)
@@ -1758,6 +1783,7 @@ def main():
                       "tree_mask",
                       "depth_spread", "depth_row_corr",
                       "min_cluster_px", "max_cluster_px",
+                      "max_bbox_area", "low_density",
                       "top_row", "ground_row",
                       "edge_margin", "circularity", "solidity",
                       "yellow_color", "non_blossom_color"]
