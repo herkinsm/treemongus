@@ -183,31 +183,75 @@ def near_frac_per_mask(masks_np: np.ndarray, depth_mm: np.ndarray,
     return out
 
 
+def _mask_shape_stats(m) -> tuple[float, float, int, int, int, int, int, float]:
+    """Return (circularity, solidity, area, bx, by, bw, bh, centroid_y)
+    for a 2D-or-3D bool mask, using cv2 contour ops to mirror
+    sprayer_pipeline/flower_detector.py's circularity / solidity / bbox checks.
+    circ = 4*pi*area / perim^2 ; sol = area / hull_area."""
+    import cv2
+    mb = np.asarray(m).astype(bool)
+    if mb.ndim == 3:
+        mb = mb.any(axis=0)
+    area = int(mb.sum())
+    if area == 0:
+        return 0.0, 0.0, 0, 0, 0, 0, 0, 0.0
+    u8 = (mb.astype(np.uint8) * 255)
+    contours, _ = cv2.findContours(u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return 0.0, 0.0, area, 0, 0, 0, 0, 0.0
+    cnt = max(contours, key=cv2.contourArea)
+    perim = float(cv2.arcLength(cnt, True))
+    circ = (4.0 * np.pi * area / (perim * perim)) if perim > 0 else 0.0
+    hull = cv2.convexHull(cnt)
+    hull_area = float(cv2.contourArea(hull))
+    sol = (area / hull_area) if hull_area > 0 else 0.0
+    bx, by, bw, bh = (int(v) for v in cv2.boundingRect(cnt))
+    ys, _ = np.nonzero(mb)
+    cy = float(ys.mean()) if ys.size else 0.0
+    return circ, sol, area, bx, by, bw, bh, cy
+
+
 def flower_quality_keep(masks_np: np.ndarray,
                          min_area: int, max_area: int,
-                         y_min: int, y_max: int) -> np.ndarray:
-    """Boolean keep-array for flower-style detections, modeled on
-    sprayer_pipeline/flower_detector.py:
-    - reject masks whose pixel count is outside [min_area, max_area]
-    - reject masks whose centroid y is outside [y_min, y_max]
-      (top 100 rows = waxy leaf glints; bottom rows > 400 = ground/grass)."""
+                         y_min: int, y_max: int,
+                         min_circ: float, min_sol: float,
+                         edge_margin: int,
+                         img_h: int, img_w: int) -> tuple[np.ndarray, dict, list[int]]:
+    """Boolean keep-array + per-rejection diagnostics + per-mask area, mirroring
+    the gates in sprayer_pipeline/flower_detector.py:
+      - cluster area in [min_area, max_area]                  (min_cluster_px / max_cluster_px)
+      - centroid y in [y_min, y_max]                          (top_row / ground_row)
+      - bbox 15 px clear of every frame edge                  (edge_margin)
+      - circularity = 4*pi*A/P^2 >= 0.25                      (circularity)
+      - solidity   = A / hull_area >= 0.50                    (solidity)
+    Diagnostic dict counts how many masks fell to each gate.
+    Returns (keep, diag, areas_kept_in_order_of_input)."""
     keep = np.ones(len(masks_np), dtype=bool)
+    diag = {"min_cluster_px": 0, "max_cluster_px": 0,
+            "top_row": 0, "ground_row": 0,
+            "edge_margin": 0, "circularity": 0, "solidity": 0}
+    areas: list[int] = []
     for i, m in enumerate(masks_np):
-        mb = m.astype(bool)
-        if mb.ndim == 3:
-            mb = mb.any(axis=0)
-        area = int(mb.sum())
-        if area < min_area or area > max_area:
-            keep[i] = False
-            continue
-        ys, _ = np.nonzero(mb)
-        if ys.size == 0:
-            keep[i] = False
-            continue
-        cy = float(ys.mean())
-        if cy < y_min or cy > y_max:
-            keep[i] = False
-    return keep
+        circ, sol, area, bx, by, bw, bh, cy = _mask_shape_stats(m)
+        areas.append(area)
+        if area < min_area:
+            keep[i] = False; diag["min_cluster_px"] += 1; continue
+        if area > max_area:
+            keep[i] = False; diag["max_cluster_px"] += 1; continue
+        if cy < y_min:
+            keep[i] = False; diag["top_row"] += 1; continue
+        if cy > y_max:
+            keep[i] = False; diag["ground_row"] += 1; continue
+        if edge_margin > 0:
+            if (bx < edge_margin or by < edge_margin
+                    or (bx + bw) > (img_w - 1 - edge_margin)
+                    or (by + bh) > (img_h - 1 - edge_margin)):
+                keep[i] = False; diag["edge_margin"] += 1; continue
+        if circ < min_circ:
+            keep[i] = False; diag["circularity"] += 1; continue
+        if sol < min_sol:
+            keep[i] = False; diag["solidity"] += 1; continue
+    return keep, diag, areas
 
 
 # ---------------------------------------------------------------------------
@@ -235,8 +279,10 @@ class IoUTracker:
         union = area_a + area_b - inter
         return float(inter) / float(union) if union > 0 else 0.0
 
-    def step(self, boxes, scores) -> list[int]:
-        """Update with one frame's detections. Returns track_id per detection."""
+    def step(self, boxes, scores, areas=None) -> list[int]:
+        """Update with one frame's detections. Returns track_id per detection.
+        Optional `areas` updates each track's max_area, used downstream for the
+        density-based individual-flower count."""
         self.frame += 1
         if boxes is None or len(boxes) == 0:
             return []
@@ -270,18 +316,24 @@ class IoUTracker:
                 s = float(scores[best_d]) if scores is not None else 0.0
                 if s > t["max_score"]:
                     t["max_score"] = s
+                if areas is not None and best_d < len(areas):
+                    a = int(areas[best_d])
+                    if a > t.get("max_area", 0):
+                        t["max_area"] = a
 
         for d in range(n):
             if used[d]:
                 continue
             tid = self.next_id
             self.next_id += 1
+            a0 = int(areas[d]) if (areas is not None and d < len(areas)) else 0
             self.tracks[tid] = {
                 "bbox": tuple(float(x) for x in boxes[d]),
                 "first_frame": self.frame,
                 "last_frame": self.frame,
                 "n_frames": 1,
                 "max_score": float(scores[d]) if scores is not None else 0.0,
+                "max_area": a0,
             }
             det_to_tid[d] = tid
 
@@ -356,6 +408,20 @@ def main():
                     help="Drop flower detections whose mask centroid is below row Y "
                          "(default 400; rejects ground/grass band at the bottom of the "
                          "frame). Set to image height (e.g. 480) to disable.")
+    ap.add_argument("--flower-min-circularity", type=float, default=0.25,
+                    help="4*pi*A/P^2 floor; rejects ragged blobs (default 0.25, "
+                         "matches flower_detector.py).")
+    ap.add_argument("--flower-min-solidity", type=float, default=0.50,
+                    help="A/hull_area floor; rejects elongated/concave shapes (default "
+                         "0.50, matches flower_detector.py).")
+    ap.add_argument("--flower-edge-margin-px", type=int, default=15,
+                    help="Reject flower bboxes that come within this many pixels of "
+                         "any frame edge (default 15; D455 stereo edge artefacts).")
+    ap.add_argument("--flower-area-per-flower-px", type=int, default=200,
+                    help="Average pixels per individual blossom; used to estimate "
+                         "n_individual_flowers from cluster area as "
+                         "max(1, round(area / N)). Default 200 matches "
+                         "flower_detector.py's area_per_flower constant.")
     args = ap.parse_args()
 
     sample = None if args.sample_per_session == 0 else args.sample_per_session
@@ -398,10 +464,13 @@ def main():
     processor = Sam3Processor(model, confidence_threshold=args.threshold)
 
     csv_path = out_dir / "results.csv"
-    # n_detections is the post-filter count (after --depth), n_raw is always
-    # the SAM 3 raw count. near_frac_* describe the kept detections.
+    # n_detections is the post-filter count (after --depth + flower quality
+    # filter for flower prompts). n_raw is always SAM 3's raw count.
+    # est_flowers is the density-based individual blossom estimate
+    # (sum over kept detections of max(1, round(area / area_per_flower))).
     fieldnames = ["day", "category", "session", "image", "prompt",
-                  "n_detections", "n_raw", "mean_score", "max_score", "elapsed_s",
+                  "n_detections", "n_raw", "est_flowers",
+                  "mean_score", "max_score", "elapsed_s",
                   "near_frac_mean", "near_frac_max", "track_ids"]
     f = open(csv_path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -418,18 +487,32 @@ def main():
     track_summaries: list[dict] = []   # one per (session, prompt)
     track_details: list[dict] = []     # one per individual track
 
+    # Cumulative per-session rejection diagnostics for flower prompts.
+    rejection_totals: dict[tuple, dict] = {}
+
     def flush_session_trackers(session_key, trackers):
         # trackers may not include every prompt (only tracked_set was created),
         # which is fine — we just emit summaries for the prompts present.
         d, c, s = session_key
+        per = args.flower_area_per_flower_px
         for p, tr in trackers.items():
+            min_f = args.track_min_frames
+            kept = [t for t in tr.tracks.values() if t["n_frames"] >= min_f]
+            est_unique_flowers = sum(
+                max(1, round(t.get("max_area", 0) / per)) for t in kept
+            ) if (("flower" in p.lower()) or ("blossom" in p.lower())) else len(kept)
             track_summaries.append({
                 "day": d, "category": c, "session": s, "prompt": p,
-                "n_unique": tr.n_unique(min_frames=args.track_min_frames),
+                "n_unique": tr.n_unique(min_frames=min_f),
                 "n_unique_any": tr.n_unique(min_frames=1),
                 "n_tracks_total": len(tr.tracks),
+                "est_unique_flowers": est_unique_flowers,
             })
             for trk in tr.summary():
+                area = int(trk.get("max_area", 0))
+                est_flw = (max(1, round(area / per))
+                           if (("flower" in p.lower()) or ("blossom" in p.lower()))
+                           else 1)
                 track_details.append({
                     "day": d, "category": c, "session": s, "prompt": p,
                     "track_id": trk["track_id"],
@@ -437,6 +520,8 @@ def main():
                     "last_frame": trk["last_frame"],
                     "n_frames": trk["n_frames"],
                     "max_score": round(trk["max_score"], 4),
+                    "max_area_px": area,
+                    "est_flowers": est_flw,
                 })
 
     current_session_key = None
@@ -522,17 +607,26 @@ def main():
                             near_mean = round(float(kept_fracs.mean()), 4)
                             near_max = round(float(kept_fracs.max()), 4)
 
-                    # Domain-specific flower quality filter: reject masks outside
-                    # the [min_area, max_area] range or whose centroid is in the
-                    # leaf-glint top band or grass/ground bottom band.
+                    # Domain-specific flower quality filter: cluster size +
+                    # centroid y + bbox edge margin + circularity + solidity,
+                    # all matching constants from flower_detector.py.
                     is_flower_prompt = ("flower" in prompt.lower()
                                         or "blossom" in prompt.lower())
+                    kept_areas: list[int] = []
                     if is_flower_prompt and n > 0:
-                        keep = flower_quality_keep(
+                        keep, diag, areas_in = flower_quality_keep(
                             masks_np,
                             args.flower_min_area_px, args.flower_max_area_px,
                             args.flower_y_min, args.flower_y_max,
+                            args.flower_min_circularity, args.flower_min_solidity,
+                            args.flower_edge_margin_px,
+                            img.height, img.width,
                         )
+                        # Roll up rejections per (session, prompt).
+                        rt_key = (day, category, session, prompt)
+                        rt = rejection_totals.setdefault(rt_key, {k: 0 for k in diag})
+                        for k, v in diag.items():
+                            rt[k] = rt.get(k, 0) + v
                         if not keep.all():
                             masks_np = masks_np[keep]
                             if scores_np is not None:
@@ -544,13 +638,24 @@ def main():
                                       if scores_np is not None and len(scores_np) else 0.0)
                             max_s = (float(np.max(scores_np))
                                      if scores_np is not None and len(scores_np) else 0.0)
+                        kept_areas = [a for a, k in zip(areas_in, keep) if k]
+
+                    # Density-based individual flower estimate per cluster.
+                    if is_flower_prompt and kept_areas:
+                        per = args.flower_area_per_flower_px
+                        est_flowers = int(sum(max(1, round(a / per)) for a in kept_areas))
+                    else:
+                        est_flowers = n if not is_flower_prompt else 0
 
                     # Tracker step (after depth + flower-quality filters, so we
                     # only track real near-field, properly-sized flowers).
                     track_ids: list[int] = []
                     if (args.track and prompt in tracked_set
                             and current_trackers and n > 0 and boxes_np is not None):
-                        track_ids = current_trackers[prompt].step(boxes_np, scores_np)
+                        track_ids = current_trackers[prompt].step(
+                            boxes_np, scores_np,
+                            areas=kept_areas if is_flower_prompt else None,
+                        )
 
                     slug = prompt_slugs[prompt]
                     if args.save_masks and n > 0:
@@ -580,6 +685,7 @@ def main():
                         "image": str(img_path), "prompt": prompt,
                         "n_detections": n,
                         "n_raw": n_raw,
+                        "est_flowers": est_flowers,
                         "mean_score": round(mean_s, 4),
                         "max_score": round(max_s, 4),
                         "elapsed_s": round(time.time() - t0, 3),
@@ -675,13 +781,31 @@ def main():
         # Per-track diagnostics CSV.
         td_path = out_dir / "tracks_detail.csv"
         td_fields = ["day", "category", "session", "prompt", "track_id",
-                     "first_frame", "last_frame", "n_frames", "max_score"]
+                     "first_frame", "last_frame", "n_frames", "max_score",
+                     "max_area_px", "est_flowers"]
         with open(td_path, "w", newline="", encoding="utf-8") as df_:
             dw = csv.DictWriter(df_, fieldnames=td_fields)
             dw.writeheader()
             for r in track_details:
                 dw.writerow(r)
         print(f"[done] per-track detail -> {td_path}")
+
+    # ---------- per-(session, prompt) rejection diagnostics ----------
+    if rejection_totals:
+        rej_path = out_dir / "rejections.csv"
+        rej_fields = ["day", "category", "session", "prompt",
+                      "min_cluster_px", "max_cluster_px",
+                      "top_row", "ground_row",
+                      "edge_margin", "circularity", "solidity"]
+        with open(rej_path, "w", newline="", encoding="utf-8") as rf:
+            rw = csv.DictWriter(rf, fieldnames=rej_fields)
+            rw.writeheader()
+            for (d, c, s, p), counts in rejection_totals.items():
+                row = {"day": d, "category": c, "session": s, "prompt": p}
+                for k in rej_fields[4:]:
+                    row[k] = counts.get(k, 0)
+                rw.writerow(row)
+        print(f"[done] flower-quality rejections -> {rej_path}")
 
 
 if __name__ == "__main__":
