@@ -1729,12 +1729,16 @@ def main():
                         op = overlays_dir / slug / rel
                         op.parent.mkdir(parents=True, exist_ok=True)
                         # Optionally draw tile boundaries / ROI tint for debugging.
+                        # Pass `region=tile_region` so the drawn tiles match
+                        # what SAM 3 actually saw (especially under
+                        # --tile-within-roi where tiles span only the ROI bbox).
                         tile_rects_for_overlay = None
                         if args.show_tile_grid:
                             tile_rects_for_overlay = tile_coords_for(
                                 img.width, img.height,
                                 int(args.tile_grid[0]), int(args.tile_grid[1]),
                                 args.tile_overlap,
+                                region=tile_region,
                             )
                         roi_mask_for_overlay = (
                             roi_mask_img if args.show_roi else None
