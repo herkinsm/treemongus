@@ -209,19 +209,37 @@ def compute_canopy_mask(depth_mm: np.ndarray,
                          row_ground_start: int = 280,
                          row_lower_band_start: int = 385,
                          ground_band_mm: int = 100,
-                         ground_band_mm_row3: int = 500) -> np.ndarray:
-    """Return a (H, W) bool canopy mask. True == canopy, False == ground/sky/bg."""
+                         ground_band_mm_row3: int = 500,
+                         min_cc_area_px: int = 2000,
+                         max_row_width_frac: float = 0.0) -> np.ndarray:
+    """Return a (H, W) bool canopy mask. True == canopy, False == ground/sky/bg.
+
+    Pipeline:
+      1. 3x3 median blur on depth.
+      2. Foreground depth band [min_mm, max_mm].
+      3. Row-banded ground filter (above row 280: full band; row 3 [280,385):
+         centre + ground_band_mm_row3; row 4 [385,H): centre + ground_band_mm).
+      4. Morphological close (5x5) to merge gappy canopy fragments.
+      5. Connected-component size filter — drop CCs smaller than min_cc_area_px.
+         Trees are typically thousands of pixels; dandelion / ground-flower
+         patches are typically <1000 px. Default 2000 px keeps trees, removes
+         isolated ground islands.
+      6. Optional row-width filter — clear rows whose canopy spans > some
+         fraction of frame width (long horizontal canopy bands are usually
+         ground/grass at a tilt rather than a tree). Off by default
+         (max_row_width_frac=0).
+    """
     import cv2
     H, W = depth_mm.shape
     d = cv2.medianBlur(depth_mm.astype(np.uint16), 3).astype(np.int32)
 
-    # Median depth of the upper centre strip — frame's canopy reference depth.
+    # 1-2. Median depth of the upper centre strip — frame's canopy reference depth.
     upper_band = (d >= min_mm) & (d <= max_mm)
     cs_top, cs_bot = min(100, H), min(300, H)
     valid = d[cs_top:cs_bot][upper_band[cs_top:cs_bot]]
     centre = int(np.median(valid)) if valid.size else (min_mm + max_mm) // 2
 
-    # Per-row max depth allowed for canopy.
+    # 3. Per-row max depth allowed for canopy.
     row_max = np.full(H, max_mm, dtype=np.int32)
     if row_ground_start < H:
         r3_end = min(row_lower_band_start, H)
@@ -230,6 +248,24 @@ def compute_canopy_mask(depth_mm: np.ndarray,
         row_max[row_lower_band_start:H] = min(centre + ground_band_mm, max_mm)
 
     canopy = (d >= min_mm) & (d <= row_max[:, None])
+
+    # 4-5. Connected-component size filter (drop isolated ground-flower patches).
+    if min_cc_area_px > 0:
+        u8 = canopy.astype(np.uint8)
+        u8 = cv2.morphologyEx(u8, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        n_cc, labels, stats, _ = cv2.connectedComponentsWithStats(u8, connectivity=8)
+        keep_label = np.zeros(n_cc, dtype=bool)
+        for cc_id in range(1, n_cc):
+            if stats[cc_id, cv2.CC_STAT_AREA] >= min_cc_area_px:
+                keep_label[cc_id] = True
+        canopy = keep_label[labels] & canopy
+
+    # 6. Optional: clear rows that are mostly canopy width-wise (horizontal grass).
+    if max_row_width_frac > 0.0:
+        row_widths = canopy.sum(axis=1) / max(W, 1)
+        wide_rows = row_widths > max_row_width_frac
+        canopy[wide_rows, :] = False
+
     return canopy.astype(bool)
 
 
@@ -481,6 +517,18 @@ def main():
     ap.add_argument("--tree-mask-min-overlap", type=float, default=0.5,
                     help="Keep a detection only if >= this fraction of its mask pixels "
                          "lie inside the canopy mask (default 0.5).")
+    ap.add_argument("--canopy-min-cc-area-px", type=int, default=2000,
+                    help="Connected-component size filter inside compute_canopy_mask. "
+                         "Canopy regions smaller than this many pixels are dropped "
+                         "(default 2000). This is the gate that kills isolated "
+                         "ground-flower patches (dandelions / clover / etc.) — they "
+                         "form small in-band islands while real trees form large "
+                         "connected canopy regions. Set to 0 to disable.")
+    ap.add_argument("--canopy-max-row-width-frac", type=float, default=0.0,
+                    help="Clear any image row whose canopy mask covers more than this "
+                         "fraction of the frame width — long horizontal canopy bands "
+                         "are usually ground/grass at a tilt (default 0 = disabled; "
+                         "try 0.5 if grass is bleeding through).")
     # Cross-frame instance tracking (per-session IoU tracker).
     ap.add_argument("--track", action="store_true",
                     help="Track detections across frames within each session via IoU "
@@ -692,6 +740,8 @@ def main():
                     canopy_mask_img = compute_canopy_mask(
                         depth_mm,
                         min_mm=args.depth_min_mm, max_mm=args.depth_max_mm,
+                        min_cc_area_px=args.canopy_min_cc_area_px,
+                        max_row_width_frac=args.canopy_max_row_width_frac,
                     )
 
                 for prompt in prompts:
