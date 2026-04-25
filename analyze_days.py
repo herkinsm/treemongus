@@ -118,12 +118,18 @@ def find_images(root: Path, only_rgb_folders: bool = True,
 
 def make_overlay(img: Image.Image, masks: np.ndarray, boxes: np.ndarray | None,
                  title: str | None = None,
-                 track_ids: list[int] | None = None) -> Image.Image:
+                 track_ids: list[int] | None = None,
+                 tile_rects: list[tuple[int, int, int, int]] | None = None,
+                 roi_mask: np.ndarray | None = None) -> Image.Image:
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
 
     fig, ax = plt.subplots(figsize=(img.width / 100, img.height / 100), dpi=100)
     ax.imshow(img)
+    if roi_mask is not None and roi_mask.any():
+        roi_rgba = np.zeros((*roi_mask.shape, 4), dtype=np.float32)
+        roi_rgba[roi_mask] = [1.0, 1.0, 0.0, 0.10]  # faint yellow wash
+        ax.imshow(roi_rgba)
     if masks is not None and len(masks) > 0:
         rng = np.random.default_rng(0)
         for m in masks:
@@ -132,6 +138,11 @@ def make_overlay(img: Image.Image, masks: np.ndarray, boxes: np.ndarray | None,
             rgba = np.zeros((h, w, 4))
             rgba[m.astype(bool)] = color
             ax.imshow(rgba)
+    if tile_rects:
+        for (tx, ty, tw, th) in tile_rects:
+            ax.add_patch(Rectangle((tx, ty), tw, th, fill=False,
+                                    edgecolor="cyan", linewidth=1.0,
+                                    linestyle="--", alpha=0.7))
     if boxes is not None:
         for i, b in enumerate(boxes):
             x1, y1, x2, y2 = b
@@ -1064,6 +1075,13 @@ def main():
     ap.add_argument("--tile-nms-iou", type=float, default=0.5,
                     help="IoU threshold for de-duping detections that appear in "
                          "multiple tiles (default 0.5).")
+    ap.add_argument("--show-tile-grid", action="store_true",
+                    help="Draw cyan dashed rectangles on overlays showing the "
+                         "tile boundaries SAM 3 actually saw. Useful for "
+                         "diagnosing whether missed flowers fall at tile edges.")
+    ap.add_argument("--show-roi", action="store_true",
+                    help="Tint the PRGB ROI mask faint yellow on overlays so "
+                         "it's obvious which region is being kept by --prgb.")
     # Cross-frame instance tracking (per-session IoU tracker).
     ap.add_argument("--track", action="store_true",
                     help="Track detections across frames within each session via IoU "
@@ -1668,10 +1686,23 @@ def main():
                         rel = img_path.relative_to(args.root).with_suffix(".jpg")
                         op = overlays_dir / slug / rel
                         op.parent.mkdir(parents=True, exist_ok=True)
+                        # Optionally draw tile boundaries / ROI tint for debugging.
+                        tile_rects_for_overlay = None
+                        if args.show_tile_grid:
+                            tile_rects_for_overlay = tile_coords_for(
+                                img.width, img.height,
+                                int(args.tile_grid[0]), int(args.tile_grid[1]),
+                                args.tile_overlap,
+                            )
+                        roi_mask_for_overlay = (
+                            roi_mask_img if args.show_roi else None
+                        )
                         overlay = make_overlay(
                             img, masks_np, boxes_np,
                             title=f"{prompt} (n={n})",
                             track_ids=track_ids if track_ids else None,
+                            tile_rects=tile_rects_for_overlay,
+                            roi_mask=roi_mask_for_overlay,
                         )
                         overlay.save(op, quality=85)
 
