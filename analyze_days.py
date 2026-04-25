@@ -175,6 +175,90 @@ def near_frac_per_mask(masks_np: np.ndarray, depth_mm: np.ndarray,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Cross-frame instance tracker (greedy IoU). One per (session, prompt). Each
+# persistent track == one physical object (flower / apple / etc.). A track
+# that is observed for >= min_frames frames is counted as a "unique" instance.
+# ---------------------------------------------------------------------------
+class IoUTracker:
+    def __init__(self, iou_threshold: float = 0.3, max_age: int = 3):
+        self.iou_threshold = iou_threshold
+        self.max_age = max_age
+        self.tracks: dict[int, dict] = {}
+        self.next_id = 0
+        self.frame = 0
+
+    @staticmethod
+    def _iou(a, b) -> float:
+        x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        inter = (x2 - x1) * (y2 - y1)
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        union = area_a + area_b - inter
+        return float(inter) / float(union) if union > 0 else 0.0
+
+    def step(self, boxes, scores) -> list[int]:
+        """Update with one frame's detections. Returns track_id per detection."""
+        self.frame += 1
+        if boxes is None or len(boxes) == 0:
+            return []
+
+        # Active tracks = those last seen within max_age frames.
+        active = [(tid, t) for tid, t in self.tracks.items()
+                  if self.frame - t["last_frame"] <= self.max_age + 1]
+        # Match high-confidence tracks first (greedy, but priority-ordered).
+        active.sort(key=lambda x: -x[1]["max_score"])
+
+        n = len(boxes)
+        det_to_tid = [-1] * n
+        used = [False] * n
+
+        for tid, t in active:
+            best_iou = self.iou_threshold
+            best_d = -1
+            for d in range(n):
+                if used[d]:
+                    continue
+                iou = self._iou(t["bbox"], boxes[d])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_d = d
+            if best_d >= 0:
+                used[best_d] = True
+                det_to_tid[best_d] = tid
+                t["bbox"] = boxes[best_d]
+                t["last_frame"] = self.frame
+                t["n_frames"] += 1
+                s = float(scores[best_d]) if scores is not None else 0.0
+                if s > t["max_score"]:
+                    t["max_score"] = s
+
+        for d in range(n):
+            if used[d]:
+                continue
+            tid = self.next_id
+            self.next_id += 1
+            self.tracks[tid] = {
+                "bbox": tuple(float(x) for x in boxes[d]),
+                "first_frame": self.frame,
+                "last_frame": self.frame,
+                "n_frames": 1,
+                "max_score": float(scores[d]) if scores is not None else 0.0,
+            }
+            det_to_tid[d] = tid
+
+        return det_to_tid
+
+    def n_unique(self, min_frames: int = 1) -> int:
+        return sum(1 for t in self.tracks.values() if t["n_frames"] >= min_frames)
+
+    def summary(self) -> list[dict]:
+        return [{"track_id": tid, **t} for tid, t in self.tracks.items()]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=r"C:\Users\matth\OneDrive\Desktop\Postdoc\Image\All2023")
@@ -203,6 +287,19 @@ def main():
     ap.add_argument("--depth-near-frac", type=float, default=0.5,
                     help="Count a detection as near-field if >= this fraction of its "
                          "mask pixels lie inside the depth band (default 0.5).")
+    # Cross-frame instance tracking (per-session IoU tracker).
+    ap.add_argument("--track", action="store_true",
+                    help="Track detections across frames within each session via IoU "
+                         "matching, so a single physical flower/apple is counted once. "
+                         "REQUIRES dense temporal sampling — set --sample-per-session 0 "
+                         "(or a large value) so consecutive frames are processed.")
+    ap.add_argument("--track-iou", type=float, default=0.3,
+                    help="IoU threshold to associate a detection with an existing track.")
+    ap.add_argument("--track-max-age", type=int, default=3,
+                    help="A track lost for more than this many frames is closed.")
+    ap.add_argument("--track-min-frames", type=int, default=2,
+                    help="Only count a track as a 'unique instance' if seen in >= this "
+                         "many frames (filters one-frame false positives).")
     args = ap.parse_args()
 
     sample = None if args.sample_per_session == 0 else args.sample_per_session
@@ -235,7 +332,7 @@ def main():
     # the SAM 3 raw count. near_frac_* describe the kept detections.
     fieldnames = ["day", "category", "session", "image", "prompt",
                   "n_detections", "n_raw", "mean_score", "max_score", "elapsed_s",
-                  "near_frac_mean", "near_frac_max"]
+                  "near_frac_mean", "near_frac_max", "track_ids"]
     f = open(csv_path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(f, fieldnames=fieldnames)
     writer.writeheader()
@@ -244,6 +341,39 @@ def main():
     #   "day": str, "category": str, "session": str,
     #   "counts": {prompt: n_detections, ...}}
     image_aggregates: dict[str, dict] = {}
+
+    # Per-(session, prompt) IoU trackers. Keyed by session_key; each value is
+    # a dict {prompt: IoUTracker}. Trackers are flushed to track_summaries at
+    # session boundaries so memory stays bounded.
+    track_summaries: list[dict] = []   # one per (session, prompt)
+    track_details: list[dict] = []     # one per individual track
+
+    def flush_session_trackers(session_key, trackers):
+        d, c, s = session_key
+        for p, tr in trackers.items():
+            track_summaries.append({
+                "day": d, "category": c, "session": s, "prompt": p,
+                "n_unique": tr.n_unique(min_frames=args.track_min_frames),
+                "n_unique_any": tr.n_unique(min_frames=1),
+                "n_tracks_total": len(tr.tracks),
+            })
+            for trk in tr.summary():
+                track_details.append({
+                    "day": d, "category": c, "session": s, "prompt": p,
+                    "track_id": trk["track_id"],
+                    "first_frame": trk["first_frame"],
+                    "last_frame": trk["last_frame"],
+                    "n_frames": trk["n_frames"],
+                    "max_score": round(trk["max_score"], 4),
+                })
+
+    current_session_key = None
+    current_trackers: dict[str, IoUTracker] = {}
+
+    if args.track and (sample is not None and sample < 50):
+        print(f"[warn] --track with --sample-per-session {sample} produces "
+              f"too-sparse frames for IoU association; pass "
+              f"--sample-per-session 0 for dense tracking.", file=sys.stderr)
 
     total_imgs = 0
     start = time.time()
@@ -255,6 +385,16 @@ def main():
         ):
             if args.max_images is not None and total_imgs >= args.max_images:
                 break
+            # Detect session change → flush trackers for the previous session
+            # and start fresh ones for the new session.
+            session_key = (day, category, session)
+            if args.track and session_key != current_session_key:
+                if current_session_key is not None:
+                    flush_session_trackers(current_session_key, current_trackers)
+                current_trackers = {p: IoUTracker(args.track_iou, args.track_max_age)
+                                    for p in prompts}
+                current_session_key = session_key
+
             t_img = time.time()
             try:
                 img = Image.open(img_path).convert("RGB")
@@ -310,6 +450,12 @@ def main():
                             near_mean = round(float(kept_fracs.mean()), 4)
                             near_max = round(float(kept_fracs.max()), 4)
 
+                    # Tracker step (after depth filter, so we only track real
+                    # near-field objects). Returns one track_id per detection.
+                    track_ids: list[int] = []
+                    if args.track and current_trackers and n > 0 and boxes_np is not None:
+                        track_ids = current_trackers[prompt].step(boxes_np, scores_np)
+
                     slug = prompt_slugs[prompt]
                     if args.save_masks and n > 0:
                         rel = img_path.relative_to(args.root).with_suffix(".npz")
@@ -334,6 +480,7 @@ def main():
                         "elapsed_s": round(time.time() - t0, 3),
                         "near_frac_mean": near_mean,
                         "near_frac_max": near_max,
+                        "track_ids": ";".join(str(t) for t in track_ids) if track_ids else "",
                     })
 
                     # Per-image aggregator for wide CSV.
@@ -353,6 +500,10 @@ def main():
                 print(f"[ERR] {img_path}: {e}", file=sys.stderr)
     finally:
         f.close()
+
+    # Flush the final session's trackers.
+    if args.track and current_session_key is not None:
+        flush_session_trackers(current_session_key, current_trackers)
 
     dt = time.time() - start
     print(f"[done] {total_imgs} images × {len(prompts)} prompts in {dt:.1f}s -> {csv_path}")
@@ -382,6 +533,49 @@ def main():
                 )
             ww.writerow(row)
     print(f"[done] wide summary -> {wide_path}")
+
+    # ---------- per-session unique tracks (instance dedup) ----------
+    if args.track and track_summaries:
+        # Pivot: one row per session, one column per prompt's unique count,
+        # plus a combined n_unique_flowers_total across flower-named prompts.
+        prompt_to_slug = prompt_slugs
+        ts_path = out_dir / "tracks_summary.csv"
+        ts_fields = ["day", "category", "session"]
+        ts_fields += [f"n_unique_{prompt_to_slug[p]}" for p in prompts]
+        if flower_prompts:
+            ts_fields.append("n_unique_flowers_total")
+        # Group track_summaries by session.
+        by_session: dict[tuple, dict] = {}
+        for r in track_summaries:
+            key = (r["day"], r["category"], r["session"])
+            row = by_session.setdefault(key, {
+                "day": r["day"], "category": r["category"], "session": r["session"],
+            })
+            row[f"n_unique_{prompt_to_slug[r['prompt']]}"] = r["n_unique"]
+        with open(ts_path, "w", newline="", encoding="utf-8") as tf:
+            tw = csv.DictWriter(tf, fieldnames=ts_fields)
+            tw.writeheader()
+            for key, row in by_session.items():
+                # Default to 0 for any missing prompt column.
+                for p in prompts:
+                    row.setdefault(f"n_unique_{prompt_to_slug[p]}", 0)
+                if flower_prompts:
+                    row["n_unique_flowers_total"] = sum(
+                        row.get(f"n_unique_{prompt_to_slug[p]}", 0) for p in flower_prompts
+                    )
+                tw.writerow(row)
+        print(f"[done] per-session unique tracks -> {ts_path}")
+
+        # Per-track diagnostics CSV.
+        td_path = out_dir / "tracks_detail.csv"
+        td_fields = ["day", "category", "session", "prompt", "track_id",
+                     "first_frame", "last_frame", "n_frames", "max_score"]
+        with open(td_path, "w", newline="", encoding="utf-8") as df_:
+            dw = csv.DictWriter(df_, fieldnames=td_fields)
+            dw.writeheader()
+            for r in track_details:
+                dw.writerow(r)
+        print(f"[done] per-track detail -> {td_path}")
 
 
 if __name__ == "__main__":
