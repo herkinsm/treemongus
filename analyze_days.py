@@ -168,6 +168,145 @@ def to_np(x):
 
 
 # ---------------------------------------------------------------------------
+# Tile-based inference: chop the frame into overlapping tiles, run SAM 3 on
+# each tile, then NMS-merge the per-tile detections back to full-frame.
+# Helps recall on small objects (apple blossoms) because each blossom
+# occupies a larger fraction of what SAM 3 sees per pass.
+# ---------------------------------------------------------------------------
+def tile_coords_for(img_w: int, img_h: int, rows: int, cols: int,
+                     overlap_frac: float) -> list[tuple[int, int, int, int]]:
+    """Return a list of (x0, y0, w, h) tile rectangles covering the image
+    with the requested overlap. (1, 1) returns a single tile == full frame."""
+    if rows <= 1 and cols <= 1:
+        return [(0, 0, img_w, img_h)]
+    rows = max(rows, 1); cols = max(cols, 1)
+    base_w = img_w / cols
+    base_h = img_h / rows
+    pad_w = int(base_w * overlap_frac) // 2
+    pad_h = int(base_h * overlap_frac) // 2
+    tiles: list[tuple[int, int, int, int]] = []
+    for r in range(rows):
+        for c in range(cols):
+            x0 = max(0, int(c * base_w) - pad_w)
+            y0 = max(0, int(r * base_h) - pad_h)
+            x1 = min(img_w, int((c + 1) * base_w) + pad_w)
+            y1 = min(img_h, int((r + 1) * base_h) + pad_h)
+            if x1 - x0 > 0 and y1 - y0 > 0:
+                tiles.append((x0, y0, x1 - x0, y1 - y0))
+    return tiles
+
+
+def nms_indices(boxes: np.ndarray, scores: np.ndarray,
+                 iou_threshold: float) -> list[int]:
+    """Greedy NMS on bounding boxes. Returns kept indices, highest score first."""
+    if boxes is None or len(boxes) == 0:
+        return []
+    if iou_threshold >= 1.0:
+        return list(range(len(boxes)))
+    b = np.asarray(boxes, dtype=np.float32)
+    s = np.asarray(scores, dtype=np.float32)
+    order = np.argsort(-s)
+    keep: list[int] = []
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xa = np.maximum(b[i, 0], b[rest, 0])
+        ya = np.maximum(b[i, 1], b[rest, 1])
+        xb = np.minimum(b[i, 2], b[rest, 2])
+        yb = np.minimum(b[i, 3], b[rest, 3])
+        inter = np.maximum(0.0, xb - xa) * np.maximum(0.0, yb - ya)
+        ai = (b[i, 2] - b[i, 0]) * (b[i, 3] - b[i, 1])
+        ar = (b[rest, 2] - b[rest, 0]) * (b[rest, 3] - b[rest, 1])
+        union = ai + ar - inter
+        iou = np.where(union > 0, inter / union, 0.0)
+        order = rest[iou < iou_threshold]
+    return keep
+
+
+def infer_per_prompt(processor, img: Image.Image, prompts: list[str],
+                      tile_rows: int, tile_cols: int,
+                      tile_overlap: float, tile_nms_iou: float) -> dict[str, dict]:
+    """Run SAM 3 over the image. If tile_rows*tile_cols > 1, run on each
+    overlapping tile and NMS-merge results in full-frame coordinates.
+
+    Returns {prompt: {"masks": (N, H, W) bool|None,
+                       "boxes": (N, 4) float|None,
+                       "scores": (N,) float|None,
+                       "elapsed_s": float}}"""
+    img_w, img_h = img.width, img.height
+    tiles = tile_coords_for(img_w, img_h, tile_rows, tile_cols, tile_overlap)
+    use_tiling = len(tiles) > 1
+
+    # accum keeps tile-local masks (smaller arrays) until NMS picks survivors;
+    # only the kept masks get embedded into full-frame buffers, saving memory.
+    accum: dict[str, dict] = {p: {"masks": [], "boxes": [], "scores": [],
+                                    "tile": [], "elapsed_s": 0.0}
+                              for p in prompts}
+
+    for (tx, ty, tw, th) in tiles:
+        if use_tiling:
+            tile_img = img.crop((tx, ty, tx + tw, ty + th))
+        else:
+            tile_img = img
+        state = processor.set_image(tile_img)
+        for prompt in prompts:
+            t0 = time.time()
+            processor.reset_all_prompts(state)
+            o = processor.set_text_prompt(state=state, prompt=prompt)
+            m = to_np(o.get("masks"))
+            b = to_np(o.get("boxes"))
+            s = to_np(o.get("scores"))
+            accum[prompt]["elapsed_s"] += time.time() - t0
+            if m is None or len(m) == 0:
+                continue
+            if m.ndim == 4 and m.shape[1] == 1:
+                m = m.squeeze(1)
+            for i in range(len(m)):
+                accum[prompt]["masks"].append(m[i])  # tile-local
+                if b is not None:
+                    bx1, by1, bx2, by2 = b[i]
+                    accum[prompt]["boxes"].append(
+                        [float(bx1) + tx, float(by1) + ty,
+                         float(bx2) + tx, float(by2) + ty])
+                if s is not None:
+                    accum[prompt]["scores"].append(float(s[i]))
+                accum[prompt]["tile"].append((tx, ty, tw, th))
+
+    result: dict[str, dict] = {}
+    for prompt in prompts:
+        e = accum[prompt]["elapsed_s"]
+        if not accum[prompt]["masks"]:
+            result[prompt] = {"masks": None, "boxes": None,
+                              "scores": None, "elapsed_s": e}
+            continue
+        boxes_np = np.asarray(accum[prompt]["boxes"], dtype=np.float32)
+        scores_np = np.asarray(accum[prompt]["scores"], dtype=np.float32)
+        keep = (nms_indices(boxes_np, scores_np, tile_nms_iou)
+                if use_tiling else list(range(len(boxes_np))))
+        kept_masks: list[np.ndarray] = []
+        for k in keep:
+            tx, ty, tw, th = accum[prompt]["tile"][k]
+            tm = accum[prompt]["masks"][k]
+            full = np.zeros((img_h, img_w), dtype=tm.dtype)
+            h_a = min(th, tm.shape[0]); w_a = min(tw, tm.shape[1])
+            full[ty:ty + h_a, tx:tx + w_a] = tm[:h_a, :w_a]
+            kept_masks.append(full)
+        masks_np = (np.stack(kept_masks, axis=0)
+                    if kept_masks
+                    else np.zeros((0, img_h, img_w), dtype=bool))
+        result[prompt] = {
+            "masks": masks_np,
+            "boxes": boxes_np[keep] if keep else boxes_np[:0],
+            "scores": scores_np[keep] if keep else scores_np[:0],
+            "elapsed_s": e,
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Depth handling. Thresholds mirror sprayer_pipeline/config.py:
 #   CANOPY_DEPTH_MIN_MM = 600, CANOPY_DEPTH_MAX_MM = 3000
 # Depth .txt files are ASCII uint16 mm, stored 480 rows x 50 cols for a
@@ -852,6 +991,20 @@ def main():
                          "the overlap check. Useful when SAM 3's flower masks tend "
                          "to spill past the red-box edges (default 0; try 20-40 if "
                          "many real flowers near the box edges are rejected).")
+    # Tile-based inference for higher recall on small objects (blossoms).
+    ap.add_argument("--tile-grid", nargs=2, type=int, default=[1, 1],
+                    metavar=("ROWS", "COLS"),
+                    help="Run SAM 3 on a grid of overlapping crops, then NMS-merge "
+                         "the per-tile detections. (1, 1) = single-frame inference "
+                         "(default). (2, 2) = 4 tiles, ~4x slower but lifts recall "
+                         "on blossoms because each one occupies a larger fraction of "
+                         "the input. (3, 3) = 9 tiles, ~9x slower for further gains.")
+    ap.add_argument("--tile-overlap", type=float, default=0.2,
+                    help="Tile overlap fraction so detections at tile borders aren't "
+                         "lost (default 0.2 = 20%% overlap on each side).")
+    ap.add_argument("--tile-nms-iou", type=float, default=0.5,
+                    help="IoU threshold for de-duping detections that appear in "
+                         "multiple tiles (default 0.5).")
     # Cross-frame instance tracking (per-session IoU tracker).
     ap.add_argument("--track", action="store_true",
                     help="Track detections across frames within each session via IoU "
@@ -1069,7 +1222,17 @@ def main():
             t_img = time.time()
             try:
                 img = Image.open(img_path).convert("RGB")
-                state = processor.set_image(img)  # encode once
+
+                # Run SAM 3 (single-frame OR tiled inference depending on
+                # --tile-grid). Returns per-prompt detections in full-frame
+                # coordinates, with per-tile NMS-merging when tiling is on.
+                infer = infer_per_prompt(
+                    processor, img, prompts,
+                    tile_rows=int(args.tile_grid[0]),
+                    tile_cols=int(args.tile_grid[1]),
+                    tile_overlap=args.tile_overlap,
+                    tile_nms_iou=args.tile_nms_iou,
+                )
 
                 # Optional depth load (once per image, reused across prompts).
                 depth_mm = None
@@ -1097,16 +1260,11 @@ def main():
 
                 for prompt in prompts:
                     t0 = time.time()
-                    processor.reset_all_prompts(state)
-                    out = processor.set_text_prompt(state=state, prompt=prompt)
-                    masks_np = to_np(out.get("masks"))
-                    boxes_np = to_np(out.get("boxes"))
-                    scores_np = to_np(out.get("scores"))
-
-                    # SAM 3 returns masks as (N, 1, H, W); squeeze the channel
-                    # dim so every consumer below sees a clean (N, H, W).
-                    if masks_np is not None and masks_np.ndim == 4 and masks_np.shape[1] == 1:
-                        masks_np = masks_np.squeeze(1)
+                    masks_np = infer[prompt]["masks"]
+                    boxes_np = infer[prompt]["boxes"]
+                    scores_np = infer[prompt]["scores"]
+                    # elapsed_s reflects per-prompt SAM 3 work across all tiles.
+                    inf_elapsed = float(infer[prompt].get("elapsed_s", 0.0))
 
                     n_raw = 0 if masks_np is None else len(masks_np)
                     n = n_raw
@@ -1370,7 +1528,7 @@ def main():
                         "est_flowers": est_flowers,
                         "mean_score": round(mean_s, 4),
                         "max_score": round(max_s, 4),
-                        "elapsed_s": round(time.time() - t0, 3),
+                        "elapsed_s": round(inf_elapsed + (time.time() - t0), 3),
                         "near_frac_mean": near_mean,
                         "near_frac_max": near_max,
                         "canopy_overlap_mean": canopy_overlap_mean,
