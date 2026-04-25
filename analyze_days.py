@@ -145,14 +145,20 @@ def to_np(x):
 # ---------------------------------------------------------------------------
 def depth_path_for(img_path: Path) -> Path:
     """Given .../<session>/RGB/<stem>-RGB[-BP].<ext>, return the matching
-    .../<session>/depth/<stem>-Depth.txt."""
+    .../<session>/depth/<stem>-Depth.<bmp|txt>. Prefers .bmp (16-bit grayscale
+    uint16 mm — the format tree_mask.py expects) over the legacy ASCII .txt
+    decimation. Falls back to .txt if .bmp doesn't exist."""
     session_dir = img_path.parent.parent  # drop RGB/
     stem = img_path.stem
+    base = stem
     for suffix in ("-RGB-BP", "-RGB-bp", "-RGB", "-rgb"):
-        if stem.endswith(suffix):
-            stem = stem[: -len(suffix)]
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
             break
-    return session_dir / "depth" / f"{stem}-Depth.txt"
+    bmp = session_dir / "depth" / f"{base}-Depth.bmp"
+    if bmp.is_file():
+        return bmp
+    return session_dir / "depth" / f"{base}-Depth.txt"
 
 
 def prgb_path_for(img_path: Path) -> Path:
@@ -245,12 +251,28 @@ def roi_overlap_per_mask(masks_np: np.ndarray, roi: np.ndarray) -> list[float]:
 
 
 def load_depth_mm(depth_path: Path, target_hw: tuple[int, int]) -> np.ndarray | None:
-    """Load an ASCII depth .txt and return uint16 mm upsampled to target (H, W).
+    """Load a depth file and return uint16 mm upsampled to target (H, W).
+    Supports two formats:
+      - .bmp / .png : 16-bit (or 8-bit) single-channel image, values = depth mm
+      - .txt        : ASCII space-separated ints, values = depth mm
     Returns None if the file is missing or malformed."""
     if not depth_path.is_file():
         return None
+    suffix = depth_path.suffix.lower()
     try:
-        d = np.loadtxt(depth_path, dtype=np.int32)
+        if suffix == ".txt":
+            d = np.loadtxt(depth_path, dtype=np.int32)
+        else:
+            import cv2
+            # IMREAD_UNCHANGED preserves the original bit depth (uint16 for
+            # the modern depth captures; uint8 if it's an 8-bit normalized
+            # visualization, which we'll clip-cast to uint16 below).
+            d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+            if d is None:
+                return None
+            if d.ndim == 3:  # 3-channel encoding: take the first channel
+                d = d[..., 0]
+            d = d.astype(np.int32)
     except Exception:
         return None
     if d.ndim != 2 or d.size == 0:
