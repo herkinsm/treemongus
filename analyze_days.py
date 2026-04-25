@@ -265,6 +265,11 @@ def main():
                     boxes_np = to_np(out.get("boxes"))
                     scores_np = to_np(out.get("scores"))
 
+                    # SAM 3 returns masks as (N, 1, H, W); squeeze the channel
+                    # dim so every consumer below sees a clean (N, H, W).
+                    if masks_np is not None and masks_np.ndim == 4 and masks_np.shape[1] == 1:
+                        masks_np = masks_np.squeeze(1)
+
                     n = 0 if masks_np is None else len(masks_np)
                     mean_s = float(np.mean(scores_np)) if scores_np is not None and len(scores_np) else 0.0
                     max_s = float(np.max(scores_np)) if scores_np is not None and len(scores_np) else 0.0
