@@ -432,6 +432,7 @@ def extract_roi_mask(prgb_path: Path, target_hw: tuple[int, int],
         red_edge.astype(np.uint8), connectivity=8
     )
     roi = np.zeros(target_hw, dtype=bool)
+    kept_dims: list[tuple[int, int, int, int]] = []
     for cc_id in range(1, n_cc):
         x, y, w, h, area = stats[cc_id]
         if area < min_box_area_px:
@@ -439,6 +440,20 @@ def extract_roi_mask(prgb_path: Path, target_hw: tuple[int, int],
         if w < min_box_side_px or h < min_box_side_px:
             continue
         roi[y:y + h, x:x + w] = True
+        kept_dims.append((x, y, w, h))
+
+    # Log the actual PRGB box dimensions once per session-folder so the user
+    # can verify the ROI width matches what they expect.
+    session_key = str(prgb_path.parent)
+    if session_key not in _logged_prgb_dims and kept_dims:
+        _logged_prgb_dims.add(session_key)
+        for (x, y, w, h) in kept_dims:
+            dilated_w = w + 2 * dilate_px
+            dilated_h = h + 2 * dilate_px
+            print(f"[prgb] {prgb_path.parent.name}: red box {w}x{h} px at "
+                  f"({x},{y}); dilated ROI {dilated_w}x{dilated_h} "
+                  f"(--prgb-dilate-px {dilate_px})", file=sys.stderr)
+
     if dilate_px > 0 and roi.any():
         k = 2 * int(dilate_px) + 1
         kernel = np.ones((k, k), np.uint8)
@@ -462,6 +477,7 @@ def roi_overlap_per_mask(masks_np: np.ndarray, roi: np.ndarray) -> list[float]:
 
 
 _warned_bad_depth_bmps: set[str] = set()
+_logged_prgb_dims: set[str] = set()
 
 
 def load_depth_mm(depth_path: Path, target_hw: tuple[int, int]) -> np.ndarray | None:
