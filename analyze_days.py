@@ -248,6 +248,22 @@ def canopy_overlap_per_mask(masks_np: np.ndarray, canopy: np.ndarray) -> list[fl
     return out
 
 
+def _mask_mean_hsv(rgb_arr: np.ndarray, m) -> tuple[float, float, float]:
+    """Mean (H, S, V) over masked pixels of an RGB image. OpenCV convention:
+    H is 0-179, S and V are 0-255. Returns (0,0,0) for empty masks."""
+    import cv2
+    mb = np.asarray(m).astype(bool)
+    if mb.ndim == 3:
+        mb = mb.any(axis=0)
+    if mb.sum() == 0:
+        return 0.0, 0.0, 0.0
+    hsv = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2HSV)
+    h = float(hsv[..., 0][mb].mean())
+    s = float(hsv[..., 1][mb].mean())
+    v = float(hsv[..., 2][mb].mean())
+    return h, s, v
+
+
 def _mask_shape_stats(m) -> tuple[float, float, int, int, int, int, int, float]:
     """Return (circularity, solidity, area, bx, by, bw, bh, centroid_y)
     for a 2D-or-3D bool mask, using cv2 contour ops to mirror
@@ -281,7 +297,11 @@ def flower_quality_keep(masks_np: np.ndarray,
                          y_min: int, y_max: int,
                          min_circ: float, min_sol: float,
                          edge_margin: int,
-                         img_h: int, img_w: int) -> tuple[np.ndarray, dict, list[int]]:
+                         img_h: int, img_w: int,
+                         rgb_arr: np.ndarray | None = None,
+                         reject_yellow: bool = False,
+                         yellow_h_lo: int = 15, yellow_h_hi: int = 45,
+                         yellow_s_min: int = 80) -> tuple[np.ndarray, dict, list[int]]:
     """Boolean keep-array + per-rejection diagnostics + per-mask area, mirroring
     the gates in sprayer_pipeline/flower_detector.py:
       - cluster area in [min_area, max_area]                  (min_cluster_px / max_cluster_px)
@@ -289,12 +309,15 @@ def flower_quality_keep(masks_np: np.ndarray,
       - bbox 15 px clear of every frame edge                  (edge_margin)
       - circularity = 4*pi*A/P^2 >= 0.25                      (circularity)
       - solidity   = A / hull_area >= 0.50                    (solidity)
+      - mean H not in yellow range AND mean S < threshold     (yellow_color)
+        (rejects dandelions / yellow ground flowers; off unless reject_yellow)
     Diagnostic dict counts how many masks fell to each gate.
     Returns (keep, diag, areas_kept_in_order_of_input)."""
     keep = np.ones(len(masks_np), dtype=bool)
     diag = {"min_cluster_px": 0, "max_cluster_px": 0,
             "top_row": 0, "ground_row": 0,
-            "edge_margin": 0, "circularity": 0, "solidity": 0}
+            "edge_margin": 0, "circularity": 0, "solidity": 0,
+            "yellow_color": 0}
     areas: list[int] = []
     for i, m in enumerate(masks_np):
         circ, sol, area, bx, by, bw, bh, cy = _mask_shape_stats(m)
@@ -316,6 +339,10 @@ def flower_quality_keep(masks_np: np.ndarray,
             keep[i] = False; diag["circularity"] += 1; continue
         if sol < min_sol:
             keep[i] = False; diag["solidity"] += 1; continue
+        if reject_yellow and rgb_arr is not None:
+            h, s, _ = _mask_mean_hsv(rgb_arr, m)
+            if yellow_h_lo <= h <= yellow_h_hi and s >= yellow_s_min:
+                keep[i] = False; diag["yellow_color"] += 1; continue
     return keep, diag, areas
 
 
@@ -502,6 +529,23 @@ def main():
                          "n_individual_flowers from cluster area as "
                          "max(1, round(area / N)). Default 200 matches "
                          "flower_detector.py's area_per_flower constant.")
+    # Yellow-flower rejection (kills dandelions on the ground, which are bright
+    # yellow vs. apple blossoms which are white/pink). Mirrors the H/S logic
+    # from flower_detector.py.
+    ap.add_argument("--flower-reject-yellow", action="store_true", default=True,
+                    help="Reject flower detections whose mean HSV color is bright "
+                         "yellow (dandelions / ground-cover flowers). On by default.")
+    ap.add_argument("--no-flower-reject-yellow", action="store_false",
+                    dest="flower_reject_yellow",
+                    help="Disable the yellow-color rejection.")
+    ap.add_argument("--flower-yellow-hue-min", type=int, default=15,
+                    help="Lower bound of yellow hue in OpenCV HSV (0-179; default 15).")
+    ap.add_argument("--flower-yellow-hue-max", type=int, default=45,
+                    help="Upper bound of yellow hue in OpenCV HSV (0-179; default 45).")
+    ap.add_argument("--flower-yellow-sat-min", type=int, default=80,
+                    help="Minimum mean saturation for a detection to be classified "
+                         "yellow (0-255; default 80; below this it's near-white "
+                         "and treated as a possible apple blossom).")
     args = ap.parse_args()
 
     sample = None if args.sample_per_session == 0 else args.sample_per_session
@@ -730,6 +774,7 @@ def main():
                                         or "blossom" in prompt.lower())
                     kept_areas: list[int] = []
                     if is_flower_prompt and n > 0:
+                        rgb_arr = np.asarray(img)
                         keep, diag, areas_in = flower_quality_keep(
                             masks_np,
                             args.flower_min_area_px, args.flower_max_area_px,
@@ -737,6 +782,11 @@ def main():
                             args.flower_min_circularity, args.flower_min_solidity,
                             args.flower_edge_margin_px,
                             img.height, img.width,
+                            rgb_arr=rgb_arr,
+                            reject_yellow=args.flower_reject_yellow,
+                            yellow_h_lo=args.flower_yellow_hue_min,
+                            yellow_h_hi=args.flower_yellow_hue_max,
+                            yellow_s_min=args.flower_yellow_sat_min,
                         )
                         # Roll up rejections per (session, prompt).
                         rt_key = (day, category, session, prompt)
@@ -914,7 +964,8 @@ def main():
                       "tree_mask",
                       "min_cluster_px", "max_cluster_px",
                       "top_row", "ground_row",
-                      "edge_margin", "circularity", "solidity"]
+                      "edge_margin", "circularity", "solidity",
+                      "yellow_color"]
         with open(rej_path, "w", newline="", encoding="utf-8") as rf:
             rw = csv.DictWriter(rf, fieldnames=rej_fields)
             rw.writeheader()
