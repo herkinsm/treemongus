@@ -1086,6 +1086,12 @@ def main():
                          "the overlap check. Useful when SAM 3's flower masks tend "
                          "to spill past the red-box edges (default 0; try 20-40 if "
                          "many real flowers near the box edges are rejected).")
+    ap.add_argument("--prgb-extend-vertical", action="store_true",
+                    help="Stretch the ROI mask vertically to span the full image "
+                         "height (top to bottom of frame), preserving its original "
+                         "horizontal extent. Use with --tile-grid 5 2 to mirror the "
+                         "sprayer pipeline's 2-column x 5-row = 10-zone canopy "
+                         "discretization.")
     # Tile-based inference for higher recall on small objects (blossoms).
     ap.add_argument("--tile-grid", nargs=2, type=int, default=[1, 1],
                     metavar=("ROWS", "COLS"),
@@ -1376,6 +1382,13 @@ def main():
                         red_gb_max=args.prgb_red_gb_max,
                         dilate_px=args.prgb_dilate_px,
                     )
+                    if args.prgb_extend_vertical and roi_mask_img is not None:
+                        bb = roi_bounding_box(roi_mask_img)
+                        if bb is not None:
+                            rx, _, rw, _ = bb
+                            new_mask = np.zeros_like(roi_mask_img)
+                            new_mask[:, rx:rx + rw] = True
+                            roi_mask_img = new_mask
                 tile_region = None
                 if args.tile_within_roi and roi_mask_img is not None:
                     tile_region = roi_bounding_box(roi_mask_img)
