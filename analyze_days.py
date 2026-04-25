@@ -100,8 +100,9 @@ def make_overlay(img: Image.Image, masks: np.ndarray, boxes: np.ndarray | None,
         ax.set_title(title, fontsize=10)
     ax.axis("off")
     fig.canvas.draw()
-    w, h = fig.canvas.get_width_height()
-    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+    # matplotlib >=3.10 removed tostring_rgb(); use buffer_rgba() and drop A.
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    buf = rgba[..., :3].copy()
     plt.close(fig)
     return Image.fromarray(buf)
 
