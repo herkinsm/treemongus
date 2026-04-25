@@ -77,7 +77,8 @@ def find_images(root: Path, only_rgb_folders: bool = True, sample_per_session: i
 
 
 def make_overlay(img: Image.Image, masks: np.ndarray, boxes: np.ndarray | None,
-                 title: str | None = None) -> Image.Image:
+                 title: str | None = None,
+                 track_ids: list[int] | None = None) -> Image.Image:
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
 
@@ -92,9 +93,17 @@ def make_overlay(img: Image.Image, masks: np.ndarray, boxes: np.ndarray | None,
             rgba[m.astype(bool)] = color
             ax.imshow(rgba)
     if boxes is not None:
-        for b in boxes:
+        for i, b in enumerate(boxes):
             x1, y1, x2, y2 = b
-            ax.add_patch(Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor="lime", linewidth=1.5))
+            ax.add_patch(Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False,
+                                    edgecolor="lime", linewidth=1.5))
+            # Label each box with its track_id when available so the same
+            # physical flower keeps the same number across frames.
+            if track_ids is not None and i < len(track_ids) and track_ids[i] >= 0:
+                ax.text(x1 + 2, max(y1 - 4, 8), f"#{track_ids[i]}",
+                        color="lime", fontsize=9, fontweight="bold",
+                        bbox=dict(facecolor="black", alpha=0.5,
+                                  edgecolor="none", pad=1))
     if title:
         ax.set_title(title, fontsize=10)
     ax.axis("off")
@@ -483,11 +492,20 @@ def main():
                         mp.parent.mkdir(parents=True, exist_ok=True)
                         np.savez_compressed(mp, masks=masks_np.astype(bool),
                                             scores=scores_np, boxes=boxes_np)
-                    if args.save_overlays and n > 0:
+                    # Save overlays only for tracked prompts when --track is on
+                    # (so we get just flower JPGs instead of one per category).
+                    save_this_overlay = args.save_overlays and n > 0 and (
+                        not args.track or prompt in tracked_set
+                    )
+                    if save_this_overlay:
                         rel = img_path.relative_to(args.root).with_suffix(".jpg")
                         op = overlays_dir / slug / rel
                         op.parent.mkdir(parents=True, exist_ok=True)
-                        overlay = make_overlay(img, masks_np, boxes_np, title=f"{prompt} (n={n})")
+                        overlay = make_overlay(
+                            img, masks_np, boxes_np,
+                            title=f"{prompt} (n={n})",
+                            track_ids=track_ids if track_ids else None,
+                        )
                         overlay.save(op, quality=85)
 
                     writer.writerow({
