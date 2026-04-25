@@ -155,6 +155,82 @@ def depth_path_for(img_path: Path) -> Path:
     return session_dir / "depth" / f"{stem}-Depth.txt"
 
 
+def prgb_path_for(img_path: Path) -> Path:
+    """Given .../<session>/RGB/<stem>-RGB-BP.<ext>, return
+    .../<session>/PRGB/<stem>-RGB-PP.bmp (PRGB folder is a sibling of RGB,
+    files share the timestamp stem with the suffix swapped to -RGB-PP)."""
+    session_dir = img_path.parent.parent  # drop RGB/
+    stem = img_path.stem
+    base = stem
+    for suffix in ("-RGB-BP", "-RGB-bp", "-RGB", "-rgb"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return session_dir / "PRGB" / f"{base}-RGB-PP.bmp"
+
+
+def extract_roi_mask(prgb_path: Path, target_hw: tuple[int, int],
+                      red_r_min: int = 180, red_gb_max: int = 80,
+                      min_box_area_px: int = 200,
+                      min_box_side_px: int = 25) -> np.ndarray | None:
+    """Build a binary ROI mask from a PRGB image whose red rectangles outline
+    the per-tree zones drawn by the sprayer pipeline.
+
+    Returns (H, W) bool mask: True INSIDE any detected red rectangle,
+    False outside. Returns None if the PRGB file is missing/unreadable or
+    if no rectangles were detected.
+
+    Algorithm:
+      1. Threshold pixels where R >= red_r_min AND G,B <= red_gb_max
+         (the bright red used for the bounding boxes).
+      2. Connected-component analysis on the red-edge mask.
+      3. For each CC of sufficient pixel area and bbox side, fill that CC's
+         axis-aligned bounding rectangle into the ROI mask.
+    """
+    if not prgb_path.is_file():
+        return None
+    try:
+        prgb = np.asarray(Image.open(prgb_path).convert("RGB"))
+    except Exception:
+        return None
+    if prgb.shape[:2] != target_hw:
+        pim = Image.fromarray(prgb).resize((target_hw[1], target_hw[0]), Image.NEAREST)
+        prgb = np.asarray(pim)
+    r, g, b = prgb[..., 0], prgb[..., 1], prgb[..., 2]
+    red_edge = (r >= red_r_min) & (g <= red_gb_max) & (b <= red_gb_max)
+    if int(red_edge.sum()) < 20:
+        return None
+
+    import cv2
+    n_cc, _, stats, _ = cv2.connectedComponentsWithStats(
+        red_edge.astype(np.uint8), connectivity=8
+    )
+    roi = np.zeros(target_hw, dtype=bool)
+    for cc_id in range(1, n_cc):
+        x, y, w, h, area = stats[cc_id]
+        if area < min_box_area_px:
+            continue
+        if w < min_box_side_px or h < min_box_side_px:
+            continue
+        roi[y:y + h, x:x + w] = True
+    return roi if roi.any() else None
+
+
+def roi_overlap_per_mask(masks_np: np.ndarray, roi: np.ndarray) -> list[float]:
+    """Fraction of each mask's pixels that lie inside the ROI mask. NaN for empty."""
+    out: list[float] = []
+    for m in masks_np:
+        mb = m.astype(bool)
+        if mb.ndim == 3:
+            mb = mb.any(axis=0)
+        total = int(mb.sum())
+        if total == 0:
+            out.append(float("nan"))
+            continue
+        out.append(float((mb & roi).sum()) / float(total))
+    return out
+
+
 def load_depth_mm(depth_path: Path, target_hw: tuple[int, int]) -> np.ndarray | None:
     """Load an ASCII depth .txt and return uint16 mm upsampled to target (H, W).
     Returns None if the file is missing or malformed."""
@@ -671,6 +747,23 @@ def main():
                          "camera shows depth increasing linearly with image-y, "
                          "giving |r| close to 1 (default 0.80; matches "
                          "CANOPY_MAX_DEPTH_ROW_CORRELATION). Set >=1.0 to disable.")
+    # Per-tree ROI restriction via PRGB images (red bounding boxes).
+    ap.add_argument("--prgb", action="store_true",
+                    help="Restrict detections to within the per-tree ROIs drawn as "
+                         "red rectangles on PRGB images. Each session's PRGB folder "
+                         "(sibling of RGB, files named <stem>-RGB-PP.bmp) is parsed "
+                         "for red boxes per frame. Detections whose mask is mostly "
+                         "outside the boxes are rejected. Useful when SAM 3 catches "
+                         "background-row flowers that aren't the spray target.")
+    ap.add_argument("--prgb-min-overlap", type=float, default=0.5,
+                    help="Keep a detection only if >= this fraction of its mask "
+                         "pixels lie inside any red ROI (default 0.5).")
+    ap.add_argument("--prgb-red-r-min", type=int, default=180,
+                    help="Lower bound on the R channel for red-box detection "
+                         "(0-255; default 180).")
+    ap.add_argument("--prgb-red-gb-max", type=int, default=80,
+                    help="Upper bound on G and B channels for red-box detection "
+                         "(0-255; default 80).")
     # Cross-frame instance tracking (per-session IoU tracker).
     ap.add_argument("--track", action="store_true",
                     help="Track detections across frames within each session via IoU "
@@ -801,7 +894,7 @@ def main():
                   "n_detections", "n_raw", "est_flowers",
                   "mean_score", "max_score", "elapsed_s",
                   "near_frac_mean", "near_frac_max",
-                  "canopy_overlap_mean", "track_ids"]
+                  "canopy_overlap_mean", "roi_overlap_mean", "track_ids"]
     f = open(csv_path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(f, fieldnames=fieldnames)
     writer.writeheader()
@@ -901,6 +994,16 @@ def main():
                         max_row_width_frac=args.canopy_max_row_width_frac,
                     )
 
+                # Optional PRGB ROI mask — red rectangles per tree.
+                roi_mask_img = None
+                if args.prgb:
+                    roi_mask_img = extract_roi_mask(
+                        prgb_path_for(img_path),
+                        (img.height, img.width),
+                        red_r_min=args.prgb_red_r_min,
+                        red_gb_max=args.prgb_red_gb_max,
+                    )
+
                 for prompt in prompts:
                     t0 = time.time()
                     processor.reset_all_prompts(state)
@@ -981,6 +1084,31 @@ def main():
                                       if scores_np is not None and len(scores_np) else 0.0)
                             max_s = (float(np.max(scores_np))
                                      if scores_np is not None and len(scores_np) else 0.0)
+
+                    # PRGB ROI filter — restrict detections to inside the
+                    # per-tree red boxes. Applies to ALL prompts.
+                    roi_overlap_mean: float | str = ""
+                    if args.prgb and roi_mask_img is not None and n > 0:
+                        ovs = roi_overlap_per_mask(masks_np, roi_mask_img)
+                        ov_arr = np.asarray(ovs, dtype=float)
+                        keep = ~np.isnan(ov_arr) & (ov_arr >= args.prgb_min_overlap)
+                        rt_key = (day, category, session, prompt)
+                        rt = rejection_totals.setdefault(rt_key, {})
+                        rt["prgb_roi"] = rt.get("prgb_roi", 0) + int((~keep).sum())
+                        if not keep.all():
+                            masks_np = masks_np[keep]
+                            if scores_np is not None:
+                                scores_np = scores_np[keep]
+                            if boxes_np is not None:
+                                boxes_np = boxes_np[keep]
+                            n = int(keep.sum())
+                            mean_s = (float(np.mean(scores_np))
+                                      if scores_np is not None and len(scores_np) else 0.0)
+                            max_s = (float(np.max(scores_np))
+                                     if scores_np is not None and len(scores_np) else 0.0)
+                        kept_ov = ov_arr[keep]
+                        if kept_ov.size and not np.all(np.isnan(kept_ov)):
+                            roi_overlap_mean = round(float(np.nanmean(kept_ov)), 4)
 
                     # Tree-mask canopy filter (applies to ALL prompts — every
                     # category benefits from rejecting ground/sky/bg).
@@ -1155,6 +1283,7 @@ def main():
                         "near_frac_mean": near_mean,
                         "near_frac_max": near_max,
                         "canopy_overlap_mean": canopy_overlap_mean,
+                        "roi_overlap_mean": roi_overlap_mean,
                         "track_ids": ";".join(str(t) for t in track_ids) if track_ids else "",
                     })
 
@@ -1258,6 +1387,7 @@ def main():
     if rejection_totals:
         rej_path = out_dir / "rejections.csv"
         rej_fields = ["day", "category", "session", "prompt",
+                      "prgb_roi",
                       "tree_mask",
                       "depth_spread", "depth_row_corr",
                       "min_cluster_px", "max_cluster_px",
