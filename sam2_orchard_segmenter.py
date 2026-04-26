@@ -164,19 +164,25 @@ class SegmenterConfig:
     depth_estimator: str = "median"     # {"median", "mean", "p25"}
 
     # ── DBSCAN clustering ─────────────────────────────────────────
-    # eps in metres. tree_spacing_m / 2.5 gives a comfortable margin:
-    # within-tree trunk position jitter (depth noise, mask wobble) is
-    # typically well under 0.5 m, while between-tree spacing is at
-    # least tree_spacing_m. 1.2 m for a 3 m row is the sweet spot.
-    tree_spacing_m: float = 3.0
-    dbscan_eps_factor: float = 0.40     # eps = tree_spacing_m * this
+    # eps_m: maximum distance (metres) between trunk detections of the
+    # same physical tree. When None (default) the eps is auto-estimated
+    # from the data using the k-distance graph elbow — it finds the gap
+    # between within-tree jitter and between-tree spacing automatically,
+    # so it adapts to whatever spacing the orchard actually has without
+    # needing a manual tree_spacing_m parameter.
+    # Set to a float to override (useful if auto-estimation misbehaves on
+    # very sparse or very dense detection sets).
+    dbscan_eps_m: Optional[float] = None   # None = auto from data
     dbscan_min_samples: int = 3
 
+    # tree_spacing_m is kept for the spacing sanity check only.
+    tree_spacing_m: float = 3.0
+
     # ── Spacing sanity check ──────────────────────────────────────
-    # After clustering, flag any inter-cluster gap that deviates from
-    # tree_spacing_m by more than this fraction. These are candidates
-    # for missed trees (gap too large) or spurious doubles (gap too
-    # small) that warrant human review.
+    # Disabled by default because tree spacing varies across spray-variable
+    # orchards. Enable with spacing_check=True to flag gaps that deviate
+    # from tree_spacing_m by more than spacing_tolerance.
+    spacing_check: bool = False
     spacing_tolerance: float = 0.50     # ±50%
 
     # ── Frame attribution ────────────────────────────────────────
@@ -1001,6 +1007,39 @@ def _world_to_local_xy(
     return np.stack([x, y], axis=1)
 
 
+def _estimate_dbscan_eps(xy: np.ndarray, min_samples: int) -> float:
+    """Auto-estimate DBSCAN eps from the k-distance graph elbow.
+
+    Sorts every detection by its distance to its ``min_samples``-th
+    nearest neighbour. The resulting curve has a sharp elbow where
+    within-tree jitter ends and between-tree gaps begin. The elbow
+    (largest jump in the sorted distances) is the natural eps.
+
+    This adapts to whatever spacing the orchard actually has — no
+    tree_spacing_m parameter needed.
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    k = min(min_samples, len(xy) - 1)
+    nbrs = NearestNeighbors(n_neighbors=k).fit(xy)
+    distances, _ = nbrs.kneighbors(xy)
+    k_dist = np.sort(distances[:, -1])
+
+    # Largest jump in the sorted k-distance curve = elbow.
+    diffs = np.diff(k_dist)
+    elbow = int(np.argmax(diffs))
+    # eps sits at the midpoint of the jump so it falls cleanly between
+    # the two populations (within-tree vs between-tree distances).
+    eps = float((k_dist[elbow] + k_dist[elbow + 1]) / 2.0)
+
+    log.info(
+        "Auto-estimated DBSCAN eps=%.2f m from k-distance elbow "
+        "(k=%d, %d detections, jump %.2f→%.2f m)",
+        eps, k, len(xy), k_dist[elbow], k_dist[elbow + 1],
+    )
+    return eps
+
+
 def cluster_to_trees(
     tracks: List[TrunkTrack],
     cfg: SegmenterConfig,
@@ -1034,8 +1073,12 @@ def cluster_to_trees(
         return []
 
     xy = _world_to_local_xy(np.array(lats), np.array(lons))
-    eps_m = cfg.tree_spacing_m * cfg.dbscan_eps_factor
-    log.info("DBSCAN eps=%.2f m, min_samples=%d", eps_m, cfg.dbscan_min_samples)
+    if cfg.dbscan_eps_m is None:
+        eps_m = _estimate_dbscan_eps(xy, cfg.dbscan_min_samples)
+    else:
+        eps_m = cfg.dbscan_eps_m
+        log.info("DBSCAN eps=%.2f m (fixed), min_samples=%d",
+                 eps_m, cfg.dbscan_min_samples)
     db = DBSCAN(eps=eps_m, min_samples=cfg.dbscan_min_samples).fit(xy)
     labels = db.labels_
 
@@ -1564,7 +1607,8 @@ def process_run(
     clusters = cluster_to_trees(tracks, cfg)
 
     # 5. Sanity check.
-    clusters = sanity_check_spacing(clusters, cfg)
+    if cfg.spacing_check:
+        clusters = sanity_check_spacing(clusters, cfg)
 
     # 6. Frame attribution.
     attribution = attribute_frames(clusters, cfg)
@@ -1677,7 +1721,8 @@ def _run_one_session(
     tracks = propagate_with_sam2(loader, detections, cfg, device=args.device)
     tracks = project_tracks_to_world(tracks, loader, cfg)
     clusters = cluster_to_trees(tracks, cfg)
-    clusters = sanity_check_spacing(clusters, cfg)
+    if cfg.spacing_check:
+        clusters = sanity_check_spacing(clusters, cfg)
     attribution = attribute_frames(clusters, cfg)
 
     if flower_counts:
@@ -1745,8 +1790,12 @@ def _main() -> None:
                         default=None, metavar=("START", "STOP"),
                         help="Process only frames [START, STOP) — use the same "
                              "values as --frame-range in analyze_days.py.")
-    parser.add_argument("--tree-spacing-m", type=float, default=3.0,
-                        help="Expected spacing between trees in metres (default 3.0).")
+    parser.add_argument("--dbscan-eps-m", type=float, default=None,
+                        help="Max distance in metres between trunk detections of the "
+                             "same tree (DBSCAN eps). Default: auto-estimated from "
+                             "the k-distance graph elbow so it adapts to actual trunk "
+                             "spacing in the data. Override with a fixed value if "
+                             "the auto-estimate over- or under-splits.")
     parser.add_argument("--row-heading-deg", type=float, default=None,
                         help="Orchard row compass bearing. Auto-estimated from "
                              "GPS trail when omitted.")
@@ -1770,7 +1819,7 @@ def _main() -> None:
         gdino_model_id=args.gdino_model,
         sam2_model_cfg=args.sam2_cfg,
         sam2_checkpoint=args.sam2_ckpt,
-        tree_spacing_m=args.tree_spacing_m,
+        dbscan_eps_m=args.dbscan_eps_m,
     )
 
     sessions = _walk_all2023_sessions(Path(args.root))

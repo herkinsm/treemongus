@@ -18,6 +18,5 @@ python sam2_orchard_segmenter.py \
     --flower-prompt flower \
     --flower-count-col est_flowers \
     --frame-range 50 80 \
-    --tree-spacing-m 3.0 \
     --device cuda \
     -v
