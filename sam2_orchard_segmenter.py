@@ -827,24 +827,72 @@ def _propagate_image_mode(
 
     Each track here holds exactly one detection. The cluster step
     groups them by world position into per-tree TreeClusters.
+
+    If the ``sam2`` package isn't importable (e.g. the env only has
+    SAM 3, which is text-prompted and has no box-prompt API), we
+    fall back to using the GDINO bbox as a rectangular mask. GDINO
+    trunk boxes are tight enough that the downstream depth-median
+    and ROI-overlap signals still work well.
     """
-    import torch
-    from sam2.sam2_image_predictor import SAM2ImagePredictor
     from tqdm.auto import tqdm
 
-    log.info("Loading SAM2 (image mode): %s", cfg.sam2_model_id)
-    predictor = SAM2ImagePredictor.from_pretrained(cfg.sam2_model_id, device=device)
+    predictor = None
+    autocast_dtype = None
+    try:
+        import torch
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+        log.info("Loading SAM2 (image mode): %s", cfg.sam2_model_id)
+        predictor = SAM2ImagePredictor.from_pretrained(
+            cfg.sam2_model_id, device=device,
+        )
+        autocast_dtype = (
+            torch.bfloat16 if device.startswith("cuda") else torch.float32
+        )
+    except ImportError:
+        log.warning(
+            "sam2 package not installed — falling back to bbox-rectangle "
+            "masks for trunk detections. World coords / ROI overlap / "
+            "DBSCAN clustering all still work; only mask-pixel-level "
+            "refinement is skipped.",
+        )
 
     tracks: List[TrunkTrack] = []
     next_track_id = 1
 
-    autocast_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    def _bbox_mask(box, h: int, w: int) -> np.ndarray:
+        x1, y1, x2, y2 = (int(round(v)) for v in box)
+        x1 = max(0, min(w - 1, x1)); x2 = max(0, min(w, x2))
+        y1 = max(0, min(h - 1, y1)); y2 = max(0, min(h, y2))
+        m = np.zeros((h, w), dtype=bool)
+        if x2 > x1 and y2 > y1:
+            m[y1:y2, x1:x2] = True
+        return m
 
-    for frame_idx in tqdm(loader.frame_indices(), desc="SAM2 mask refine"):
+    desc = "SAM2 mask refine" if predictor is not None else "bbox-mask build"
+    for frame_idx in tqdm(loader.frame_indices(), desc=desc):
         dets = detections_by_frame.get(frame_idx, [])
         if not dets:
             continue
         rgb = loader.load_rgb(frame_idx)
+        h, w = rgb.shape[:2]
+
+        if predictor is None:
+            for det in dets:
+                m = _bbox_mask(det.bbox_xyxy, h, w)
+                if not m.any():
+                    continue
+                track = TrunkTrack(track_id=next_track_id)
+                next_track_id += 1
+                refined_det = TrunkDetection(
+                    frame_idx=frame_idx,
+                    bbox_xyxy=det.bbox_xyxy,
+                    score=det.score,
+                    mask=m,
+                    track_id=track.track_id,
+                )
+                track.detections.append(refined_det)
+                tracks.append(track)
+            continue
 
         with torch.inference_mode(), torch.autocast(device, dtype=autocast_dtype):
             predictor.set_image(rgb)
@@ -874,7 +922,8 @@ def _propagate_image_mode(
                 track.detections.append(refined_det)
                 tracks.append(track)
 
-    log.info("SAM2 image mode: %d single-frame tracks built", len(tracks))
+    mode_desc = "SAM2 image mode" if predictor is not None else "bbox-mask mode"
+    log.info("%s: %d single-frame tracks built", mode_desc, len(tracks))
     return tracks
 
 
