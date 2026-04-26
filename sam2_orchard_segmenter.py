@@ -1,0 +1,1480 @@
+"""sam2_orchard_segmenter.py — Trunk-anchored post-processing tree
+segmentation using Grounding DINO + SAM2 + DBSCAN.
+
+Drop-in replacement for ``TreeTracker.refine_with_signal``. Trades
+real-time capability (this runs at ~1-5 fps on a single GPU) for
+ground-truth-quality tree count and exact frame-to-tree attribution.
+
+The fundamental insight: canopy pixel sums blur identity at touching
+canopies; trunks don't. One trunk = one tree, always. We detect trunks
+zero-shot with Grounding DINO, refine each detection to a precise
+mask with SAM2 (image mode, one frame at a time), project each
+trunk's median depth into world coordinates, and DBSCAN the resulting
+cloud. Each cluster is one physical tree.
+
+**Frame rate note.** Your input is a 5 fps frame stream — individual
+RGB+depth frames captured chronologically. There is no video file
+involved. SAM2's "video predictor" is a misnomer: it operates on a
+directory of sequential JPEGs. That said, at 5 fps with tractor
+motion the inter-frame displacement (~10-40 cm of scene shift) is
+large enough that SAM2's temporal propagation gives diminishing
+returns over running SAM2 image-mode independently per frame and
+letting DBSCAN do the temporal-identity work via world coordinates.
+Image mode is the default and recommended path. Video mode is kept
+available behind ``cfg.propagation_mode = "video"`` for higher-fps
+collection (>= 15 fps) where temporal continuity is strong.
+
+Pipeline
+--------
+1. ``detect_trunks_grounding_dino`` — per-frame zero-shot trunk bboxes
+2. ``propagate_with_sam2``         — per-detection precise mask via
+                                     SAM2 image mode (default) or
+                                     temporal propagation (video mode)
+3. ``project_tracks_to_world``     — trunk centroid -> (lat, lon) via
+                                     existing ``camera_to_world``
+4. ``cluster_to_trees``            — DBSCAN on trunk world positions;
+                                     this is where temporal identity
+                                     is established in image mode
+5. ``attribute_frames``            — frame_idx -> [(tree_id, weight)]
+6. ``sanity_check_spacing``        — flag clusters that violate row geom
+7. ``build_contact_sheets``        — verification artifact for review
+8. ``populate_tree_tracker``       — write results back to TreeTracker
+
+Setup
+-----
+    pip install torch torchvision transformers scikit-learn
+    pip install opencv-python pillow numpy tqdm
+    # SAM2 from Meta:
+    pip install git+https://github.com/facebookresearch/sam2.git
+
+The Grounding DINO + SAM2 model weights download automatically on
+first run (~1.5 GB total). Both models live on GPU; one frame at a
+time fits comfortably in 16 GB VRAM at 1280x720.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import shutil
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+# Re-use the geometry helpers from the existing tracker so the
+# projection math stays consistent across the pipeline. Falls back to
+# local copies if the import path differs in your project layout.
+try:
+    from .tree_tracker import (
+        TrackedTree,
+        TreeDetection,
+        TreeTracker,
+        camera_to_world,
+        haversine_m,
+    )
+except ImportError:                         # standalone use / different layout
+    from tree_tracker import (               # type: ignore[no-redef]
+        TrackedTree,
+        TreeDetection,
+        TreeTracker,
+        camera_to_world,
+        haversine_m,
+    )
+
+
+log = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
+@dataclass
+class SegmenterConfig:
+    """All tuneable parameters for the post-processing pipeline.
+
+    Defaults are calibrated for tractor-mounted RealSense D455 at 5 fps
+    in central-leader / spindle apple orchards (Gala, Golden Delicious,
+    Sun Fuji, Old Block). Override per-orchard as needed.
+    """
+
+    # ── Grounding DINO ─────────────────────────────────────────────
+    gdino_model_id: str = "IDEA-Research/grounding-dino-base"
+    # Two prompts joined by "." — the first catches clean trunks against
+    # row middles, the second catches partially-occluded trunks. SAM2
+    # only needs ONE good detection per trunk to seed the propagation,
+    # so prompt redundancy + high recall is more useful than precision.
+    text_prompt: str = "a tree trunk. a wooden trunk."
+    box_threshold: float = 0.25
+    text_threshold: float = 0.20
+    # Reject detections whose bbox is implausibly small/large for a
+    # trunk at typical RealSense distances (1-4 m).
+    min_box_area_frac: float = 0.001    # 0.1% of frame area
+    max_box_area_frac: float = 0.20     # 20% of frame area
+    # Trunks are tall and narrow — drop fat blobs (likely canopy).
+    min_aspect_ratio: float = 1.5       # height / width
+
+    # ── SAM2 (image mode = default, video mode = optional) ───────
+    # Image mode runs SAM2 on each Grounding DINO bbox independently
+    # and lets DBSCAN establish temporal identity via world coords.
+    # This is the right choice for 5 fps capture: inter-frame
+    # displacement is too large for video propagation to add much,
+    # and image mode is simpler / more robust to detection gaps.
+    propagation_mode: str = "image"     # {"image", "video"}
+    sam2_model_id: str = "facebook/sam2.1-hiera-large"   # HF hub
+    # Used only when propagation_mode == "video" (>=15 fps capture):
+    sam2_model_cfg: str = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    sam2_checkpoint: str = "checkpoints/sam2.1_hiera_large.pt"
+    bidirectional: bool = True
+    # If a trunk has fewer than this many world-projected detections
+    # within DBSCAN's eps, it gets dropped as DBSCAN noise. Tune via
+    # dbscan_min_samples below; this is a separate per-track filter
+    # used only in video mode.
+    min_track_length: int = 4
+
+    # ── World projection ──────────────────────────────────────────
+    # Camera mounting offset from GPS antenna (metres). Lateral offset
+    # is positive to the right of travel direction.
+    camera_lateral_offset_m: float = 0.0
+    # Use the median depth inside the trunk mask rather than the mean —
+    # robust against the few aberrant depth pixels every D455 frame has.
+    depth_estimator: str = "median"     # {"median", "mean", "p25"}
+
+    # ── DBSCAN clustering ─────────────────────────────────────────
+    # eps in metres. tree_spacing_m / 2.5 gives a comfortable margin:
+    # within-tree trunk position jitter (depth noise, mask wobble) is
+    # typically well under 0.5 m, while between-tree spacing is at
+    # least tree_spacing_m. 1.2 m for a 3 m row is the sweet spot.
+    tree_spacing_m: float = 3.0
+    dbscan_eps_factor: float = 0.40     # eps = tree_spacing_m * this
+    dbscan_min_samples: int = 3
+
+    # ── Spacing sanity check ──────────────────────────────────────
+    # After clustering, flag any inter-cluster gap that deviates from
+    # tree_spacing_m by more than this fraction. These are candidates
+    # for missed trees (gap too large) or spurious doubles (gap too
+    # small) that warrant human review.
+    spacing_tolerance: float = 0.50     # ±50%
+
+    # ── Frame attribution ────────────────────────────────────────
+    # A frame is "attributed" to a tree if the tree's mask covers at
+    # least this fraction of the *largest* visible mask in that frame.
+    # This handles the common case where 2-3 trees are partially
+    # visible: the dominant one wins primary attribution, others get
+    # listed as secondary.
+    attribution_dominance_threshold: float = 0.30
+
+    # ── Verification artifacts ───────────────────────────────────
+    contact_sheet_thumb_size: int = 256
+    contact_sheet_max_thumbs: int = 24
+
+
+# ============================================================================
+# Data classes
+# ============================================================================
+@dataclass
+class TrunkDetection:
+    """One trunk observation in one frame.
+
+    Populated incrementally: detection stage fills bbox/score/mask;
+    projection stage adds (world_lat, world_lon, depth_m).
+    """
+
+    frame_idx: int
+    bbox_xyxy: Tuple[float, float, float, float]   # pixels, image coords
+    score: float
+    mask: Optional[np.ndarray] = None              # bool array, frame-shape
+    depth_m: float = 0.0
+    world_lat: float = 0.0
+    world_lon: float = 0.0
+    # Attached after SAM2 propagation:
+    track_id: int = -1
+
+
+@dataclass
+class TrunkTrack:
+    """One trunk identity across a contiguous span of frames.
+
+    Output of SAM2 video propagation. Each track will be projected to
+    world coordinates and clustered; a single tree may span 1+ tracks
+    if SAM2 lost the mask mid-traversal (the DBSCAN step re-merges).
+    """
+
+    track_id: int
+    detections: List[TrunkDetection] = field(default_factory=list)
+
+    @property
+    def n_frames(self) -> int:
+        return len(self.detections)
+
+    @property
+    def median_world(self) -> Tuple[float, float]:
+        if not self.detections:
+            return (0.0, 0.0)
+        lats = np.array([d.world_lat for d in self.detections])
+        lons = np.array([d.world_lon for d in self.detections])
+        return float(np.median(lats)), float(np.median(lons))
+
+    @property
+    def frame_range(self) -> Tuple[int, int]:
+        if not self.detections:
+            return (-1, -1)
+        idx = [d.frame_idx for d in self.detections]
+        return min(idx), max(idx)
+
+
+@dataclass
+class TreeCluster:
+    """Persistent tree identity after DBSCAN clustering.
+
+    Replaces ``TrackedTree`` for the post-processing output, with
+    direct conversion via :func:`to_tracked_tree`.
+    """
+
+    tree_id: int
+    world_lat: float
+    world_lon: float
+    tracks: List[TrunkTrack] = field(default_factory=list)
+    # Frames where this tree's mask was visible, with the per-frame
+    # mask pixel count (used as the "dominance weight" downstream).
+    frame_pixels: Dict[int, int] = field(default_factory=dict)
+    # Diagnostic flag set by sanity_check_spacing.
+    flagged_reason: Optional[str] = None
+    # Filled by attribute_flowers_via_roi(); total flowers attributed to this tree.
+    flower_count: float = 0.0
+
+    @property
+    def n_frames(self) -> int:
+        return len(self.frame_pixels)
+
+    @property
+    def first_frame(self) -> int:
+        return min(self.frame_pixels) if self.frame_pixels else -1
+
+    @property
+    def last_frame(self) -> int:
+        return max(self.frame_pixels) if self.frame_pixels else -1
+
+
+# ============================================================================
+# Frame-loading abstraction
+# ============================================================================
+class FrameLoader:
+    """Plug-in interface for pulling RGB + depth + metadata per frame.
+
+    Your existing pipeline almost certainly has its own data layout
+    (BAG file replay, PNG sequence + JSON sidecars, NPY arrays, etc.).
+    Subclass this and implement the four methods, or use the included
+    :class:`PNGSequenceLoader` for the standard "frames as files" case.
+    """
+
+    def __len__(self) -> int:                                  # noqa: D401
+        raise NotImplementedError
+
+    def frame_indices(self) -> List[int]:
+        """Frame indices in chronological order."""
+        raise NotImplementedError
+
+    def load_rgb(self, frame_idx: int) -> np.ndarray:
+        """Return an HxWx3 uint8 RGB image."""
+        raise NotImplementedError
+
+    def load_depth_m(self, frame_idx: int) -> np.ndarray:
+        """Return an HxW float32 depth-in-metres image (NaN for invalid)."""
+        raise NotImplementedError
+
+    def load_meta(self, frame_idx: int) -> Dict:
+        """Return the per-frame metadata dict.
+
+        Required keys: ``timestamp``, ``gps_lat``, ``gps_lon``,
+        ``heading_deg``, ``estimated_lai``. Anything else is forwarded
+        verbatim into the resulting TreeDetection.meta.
+        """
+        raise NotImplementedError
+
+    def load_roi_mask(self, frame_idx: int) -> Optional[np.ndarray]:
+        """Return a bool (H, W) PRGB ROI mask, or None if unavailable.
+
+        True pixels are inside the red-box region drawn by the sprayer
+        pipeline for this frame. Override in your FrameLoader subclass
+        to enable ROI-based flower attribution. The default always
+        returns None (no ROI available).
+        """
+        return None
+
+
+class PNGSequenceLoader(FrameLoader):
+    """Standard layout: frames extracted to ``rgb/{idx:06d}.png`` etc.
+
+    Directory structure expected::
+
+        run_root/
+            rgb/000000.png      # uint8 RGB
+            depth/000000.npy    # float32 metres, HxW
+            meta.json           # {"frames": [{"frame_idx": 0, ...}, ...]}
+
+    If your dataset is in a BAG file, use the RealSense SDK to pre-
+    extract once -- SAM2 needs frames-as-files anyway because its
+    video predictor takes a directory of JPEGs as input.
+    """
+
+    def __init__(self, run_root: str):
+        self.root = Path(run_root)
+        meta_path = self.root / "meta.json"
+        with meta_path.open("r") as fh:
+            payload = json.load(fh)
+        self._meta_by_idx: Dict[int, Dict] = {
+            int(f["frame_idx"]): f for f in payload["frames"]
+        }
+        self._indices = sorted(self._meta_by_idx)
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def frame_indices(self) -> List[int]:
+        return list(self._indices)
+
+    def load_rgb(self, frame_idx: int) -> np.ndarray:
+        import cv2
+        path = self.root / "rgb" / f"{frame_idx:06d}.png"
+        bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"Missing RGB frame: {path}")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    def load_depth_m(self, frame_idx: int) -> np.ndarray:
+        path = self.root / "depth" / f"{frame_idx:06d}.npy"
+        return np.load(path).astype(np.float32)
+
+    def load_meta(self, frame_idx: int) -> Dict:
+        return self._meta_by_idx[int(frame_idx)]
+
+
+# ============================================================================
+# Stage 1: Grounding DINO trunk detection
+# ============================================================================
+def detect_trunks_grounding_dino(
+    loader: FrameLoader,
+    cfg: SegmenterConfig,
+    device: str = "cuda",
+) -> Dict[int, List[TrunkDetection]]:
+    """Run Grounding DINO trunk detection on every frame.
+
+    Returns a dict mapping ``frame_idx -> List[TrunkDetection]``.
+    Detections at this stage have bbox + score only; mask, depth,
+    and world coords are populated in later stages.
+
+    The HF ``grounding-dino-base`` checkpoint handles "tree trunk" as
+    a zero-shot prompt remarkably well in orchard imagery. On Old
+    Block-style canopies with low limbs, increase ``box_threshold``
+    to 0.30 and add ``"trunk near ground"`` to the prompt to bias
+    toward the lower portion of the image.
+    """
+    import torch
+    from transformers import (
+        AutoModelForZeroShotObjectDetection,
+        AutoProcessor,
+    )
+    from tqdm.auto import tqdm
+
+    log.info("Loading Grounding DINO: %s", cfg.gdino_model_id)
+    processor = AutoProcessor.from_pretrained(cfg.gdino_model_id)
+    model = AutoModelForZeroShotObjectDetection.from_pretrained(
+        cfg.gdino_model_id
+    ).to(device)
+    model.eval()
+
+    detections_by_frame: Dict[int, List[TrunkDetection]] = {}
+
+    for frame_idx in tqdm(loader.frame_indices(), desc="GDINO trunk detect"):
+        rgb = loader.load_rgb(frame_idx)
+        h, w = rgb.shape[:2]
+        frame_area = float(h * w)
+
+        inputs = processor(
+            images=rgb,
+            text=cfg.text_prompt,
+            return_tensors="pt",
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            box_threshold=cfg.box_threshold,
+            text_threshold=cfg.text_threshold,
+            target_sizes=[(h, w)],
+        )[0]
+
+        kept: List[TrunkDetection] = []
+        for box, score in zip(results["boxes"], results["scores"]):
+            x1, y1, x2, y2 = [float(v) for v in box.tolist()]
+            bw, bh = x2 - x1, y2 - y1
+            if bw <= 0 or bh <= 0:
+                continue
+            area = bw * bh
+            area_frac = area / frame_area
+            if area_frac < cfg.min_box_area_frac:
+                continue
+            if area_frac > cfg.max_box_area_frac:
+                continue
+            aspect = bh / bw
+            if aspect < cfg.min_aspect_ratio:
+                continue
+            kept.append(TrunkDetection(
+                frame_idx=frame_idx,
+                bbox_xyxy=(x1, y1, x2, y2),
+                score=float(score),
+            ))
+
+        detections_by_frame[frame_idx] = kept
+
+    n_total = sum(len(v) for v in detections_by_frame.values())
+    log.info("GDINO: %d trunk detections across %d frames",
+             n_total, len(detections_by_frame))
+    return detections_by_frame
+
+
+# ============================================================================
+# Stage 2: SAM2 bidirectional propagation
+# ============================================================================
+def _select_seed_detections(
+    detections_by_frame: Dict[int, List[TrunkDetection]],
+    cfg: SegmenterConfig,
+) -> List[TrunkDetection]:
+    """Pick the best seed detection per likely-distinct trunk.
+
+    Heuristic: cluster detections by (frame_idx, bbox horizontal
+    centre) and keep the highest-confidence representative. Two
+    detections in *adjacent* frames at similar horizontal positions
+    are almost certainly the same trunk -- SAM2 will tie them
+    together via propagation, so we only seed once.
+
+    This avoids re-seeding the same trunk every frame, which would
+    fragment the SAM2 tracks and bloat the cluster step.
+    """
+    # Sort by (frame_idx, score desc) so the highest-conf det wins
+    # when two seeds collide.
+    all_dets: List[TrunkDetection] = []
+    for fid in sorted(detections_by_frame):
+        for det in detections_by_frame[fid]:
+            all_dets.append(det)
+
+    seeds: List[TrunkDetection] = []
+    for det in all_dets:
+        cx = (det.bbox_xyxy[0] + det.bbox_xyxy[2]) / 2.0
+        is_dup = False
+        for kept in seeds:
+            if abs(kept.frame_idx - det.frame_idx) > 3:
+                continue
+            kcx = (kept.bbox_xyxy[0] + kept.bbox_xyxy[2]) / 2.0
+            # Within 60 px horizontally and 3 frames -> same trunk.
+            if abs(kcx - cx) < 60.0:
+                is_dup = True
+                if det.score > kept.score:
+                    # Replace with higher-confidence seed.
+                    seeds.remove(kept)
+                    seeds.append(det)
+                break
+        if not is_dup:
+            seeds.append(det)
+
+    seeds.sort(key=lambda d: (d.frame_idx, -d.score))
+    log.info("Selected %d seed detections from %d raw", len(seeds), len(all_dets))
+    return seeds
+
+
+def _stage_jpegs_for_sam2(
+    loader: FrameLoader,
+    work_dir: Path,
+) -> List[int]:
+    """SAM2 video predictor needs a directory of JPEGs named NNNNN.jpg.
+
+    Returns the frame_indices in order. Names them 00000.jpg ... so
+    SAM2's internal sorting matches our chronological order. Caller
+    is responsible for ``shutil.rmtree(work_dir)``.
+    """
+    import cv2
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    indices = loader.frame_indices()
+    for sam_idx, frame_idx in enumerate(indices):
+        rgb = loader.load_rgb(frame_idx)
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(work_dir / f"{sam_idx:05d}.jpg"), bgr,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    return indices
+
+
+def propagate_with_sam2(
+    loader: FrameLoader,
+    detections_by_frame: Dict[int, List[TrunkDetection]],
+    cfg: SegmenterConfig,
+    device: str = "cuda",
+    work_dir: Optional[Path] = None,
+) -> List[TrunkTrack]:
+    """Refine Grounding DINO bboxes into precise trunk masks.
+
+    Dispatches to image mode (default, recommended for <=5 fps) or
+    video mode (recommended for >=15 fps) based on
+    ``cfg.propagation_mode``.
+
+    In image mode, each detection becomes a single-frame "track" --
+    DBSCAN clustering in world coordinates is what establishes
+    temporal identity (i.e. which detections belong to the same
+    physical tree). For 5 fps tractor data this is more reliable
+    than SAM2 video propagation because inter-frame displacement
+    exceeds SAM2's strong-prior regime.
+    """
+    mode = cfg.propagation_mode
+    if mode == "image":
+        return _propagate_image_mode(loader, detections_by_frame, cfg, device)
+    if mode == "video":
+        return _propagate_video_mode(
+            loader, detections_by_frame, cfg, device, work_dir,
+        )
+    raise ValueError(
+        f"propagation_mode must be 'image' or 'video', got {mode!r}"
+    )
+
+
+def _propagate_image_mode(
+    loader: FrameLoader,
+    detections_by_frame: Dict[int, List[TrunkDetection]],
+    cfg: SegmenterConfig,
+    device: str = "cuda",
+) -> List[TrunkTrack]:
+    """SAM2 image-mode mask refinement, one detection at a time.
+
+    For 5 fps tractor capture this is the recommended path. Every
+    Grounding DINO detection across every frame gets its own
+    SAM2-refined mask, then becomes a single-detection TrunkTrack.
+    DBSCAN over the resulting world-coordinate cloud is what
+    establishes "this detection in frame 12 and that one in frame
+    14 are the same physical tree" -- spatial proximity in world
+    coords is a stronger identity signal than mask-pixel continuity
+    when frames are 200 ms apart.
+
+    Each track here holds exactly one detection. The cluster step
+    groups them by world position into per-tree TreeClusters.
+    """
+    import torch
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+    from tqdm.auto import tqdm
+
+    log.info("Loading SAM2 (image mode): %s", cfg.sam2_model_id)
+    predictor = SAM2ImagePredictor.from_pretrained(cfg.sam2_model_id, device=device)
+
+    tracks: List[TrunkTrack] = []
+    next_track_id = 1
+
+    autocast_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+
+    for frame_idx in tqdm(loader.frame_indices(), desc="SAM2 mask refine"):
+        dets = detections_by_frame.get(frame_idx, [])
+        if not dets:
+            continue
+        rgb = loader.load_rgb(frame_idx)
+
+        with torch.inference_mode(), torch.autocast(device, dtype=autocast_dtype):
+            predictor.set_image(rgb)
+            for det in dets:
+                box = np.array(det.bbox_xyxy, dtype=np.float32)
+                masks, scores, _ = predictor.predict(
+                    box=box[None, :],   # (1, 4)
+                    multimask_output=False,
+                )
+                # masks shape: (1, 1, H, W) or (1, H, W) depending
+                # on SAM2 version. Squeeze defensively.
+                m = np.asarray(masks).squeeze().astype(bool)
+                if m.ndim != 2 or not m.any():
+                    continue
+
+                # Each detection becomes its own single-frame track.
+                # DBSCAN will collapse same-tree detections later.
+                track = TrunkTrack(track_id=next_track_id)
+                next_track_id += 1
+                refined_det = TrunkDetection(
+                    frame_idx=frame_idx,
+                    bbox_xyxy=det.bbox_xyxy,
+                    score=det.score * float(np.asarray(scores).squeeze()),
+                    mask=m,
+                    track_id=track.track_id,
+                )
+                track.detections.append(refined_det)
+                tracks.append(track)
+
+    log.info("SAM2 image mode: %d single-frame tracks built", len(tracks))
+    return tracks
+
+
+def _propagate_video_mode(
+    loader: FrameLoader,
+    detections_by_frame: Dict[int, List[TrunkDetection]],
+    cfg: SegmenterConfig,
+    device: str = "cuda",
+    work_dir: Optional[Path] = None,
+) -> List[TrunkTrack]:
+    """SAM2 bidirectional video propagation. Recommended only for >=15 fps.
+
+    Stages frames as JPEGs to a temp directory (SAM2's video API
+    requirement), seeds one trunk per likely-distinct detection,
+    then forward + backward propagates to build per-trunk multi-
+    frame mask tracks. At 5 fps this provides little benefit over
+    image mode -- inter-frame displacement is too large for SAM2's
+    temporal prior to substantially help. Kept available for
+    higher-fps collection runs.
+    """
+    import torch
+    from sam2.build_sam import build_sam2_video_predictor
+    from tqdm.auto import tqdm
+
+    log.info("Loading SAM2 (video mode): %s", cfg.sam2_checkpoint)
+    predictor = build_sam2_video_predictor(
+        cfg.sam2_model_cfg, cfg.sam2_checkpoint, device=device,
+    )
+
+    cleanup_work = work_dir is None
+    work_dir = work_dir or Path(tempfile.mkdtemp(prefix="sam2_orchard_"))
+    log.info("Staging frames to %s", work_dir)
+    chrono_indices = _stage_jpegs_for_sam2(loader, work_dir)
+    sam_to_frame = {i: f for i, f in enumerate(chrono_indices)}
+    frame_to_sam = {f: i for i, f in sam_to_frame.items()}
+
+    seeds = _select_seed_detections(detections_by_frame, cfg)
+
+    tracks: List[TrunkTrack] = []
+    next_track_id = 1
+
+    with torch.inference_mode(), torch.autocast(device, dtype=torch.bfloat16):
+        for seed in tqdm(seeds, desc="SAM2 propagate"):
+            state = predictor.init_state(video_path=str(work_dir))
+            sam_seed_idx = frame_to_sam[seed.frame_idx]
+            x1, y1, x2, y2 = seed.bbox_xyxy
+            box = np.array([[x1, y1, x2, y2]], dtype=np.float32)
+
+            _, _, _ = predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=sam_seed_idx,
+                obj_id=1,
+                box=box,
+            )
+
+            mask_per_frame: Dict[int, np.ndarray] = {}
+
+            for sam_idx, _, mask_logits in predictor.propagate_in_video(state):
+                m = (mask_logits[0] > 0.0).cpu().numpy().squeeze().astype(bool)
+                if m.any():
+                    mask_per_frame[sam_to_frame[sam_idx]] = m
+
+            if cfg.bidirectional:
+                for sam_idx, _, mask_logits in predictor.propagate_in_video(
+                    state, reverse=True,
+                ):
+                    m = (mask_logits[0] > 0.0).cpu().numpy().squeeze().astype(bool)
+                    fid = sam_to_frame[sam_idx]
+                    if m.any() and fid not in mask_per_frame:
+                        mask_per_frame[fid] = m
+
+            if len(mask_per_frame) < cfg.min_track_length:
+                continue
+
+            track = TrunkTrack(track_id=next_track_id)
+            next_track_id += 1
+            for fid, mask in sorted(mask_per_frame.items()):
+                ys, xs = np.where(mask)
+                if xs.size == 0:
+                    continue
+                bbox = (
+                    float(xs.min()), float(ys.min()),
+                    float(xs.max()), float(ys.max()),
+                )
+                det = TrunkDetection(
+                    frame_idx=fid,
+                    bbox_xyxy=bbox,
+                    score=float(seed.score),
+                    mask=mask,
+                    track_id=track.track_id,
+                )
+                track.detections.append(det)
+            tracks.append(track)
+
+    if cleanup_work:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    log.info("SAM2 video mode: %d tracks survived (>= %d frames each)",
+             len(tracks), cfg.min_track_length)
+    return tracks
+
+
+# ============================================================================
+# Stage 3: World projection
+# ============================================================================
+def _depth_in_mask(
+    depth_m: np.ndarray,
+    mask: np.ndarray,
+    estimator: str,
+) -> float:
+    """Robust depth aggregation inside a trunk mask.
+
+    Returns NaN if no valid depth pixels. Default 'median' rejects
+    the few aberrant near-zero or maxed-out depth pixels every D455
+    frame contains (especially near foliage boundaries and in low-
+    texture regions).
+    """
+    valid = mask & np.isfinite(depth_m) & (depth_m > 0.1) & (depth_m < 20.0)
+    if not valid.any():
+        return float("nan")
+    vals = depth_m[valid]
+    if estimator == "median":
+        return float(np.median(vals))
+    if estimator == "mean":
+        return float(np.mean(vals))
+    if estimator == "p25":
+        return float(np.percentile(vals, 25))
+    raise ValueError(f"unknown depth_estimator: {estimator}")
+
+
+def project_tracks_to_world(
+    tracks: List[TrunkTrack],
+    loader: FrameLoader,
+    cfg: SegmenterConfig,
+) -> List[TrunkTrack]:
+    """Fill in (depth_m, world_lat, world_lon) on every detection.
+
+    Uses :func:`tree_tracker.camera_to_world` -- same projection as
+    your existing pipeline, so output coordinates are directly
+    comparable with anything already in your TreeTracker registry.
+    """
+    from tqdm.auto import tqdm
+
+    for track in tqdm(tracks, desc="World projection"):
+        for det in track.detections:
+            depth = loader.load_depth_m(det.frame_idx)
+            d_m = _depth_in_mask(depth, det.mask, cfg.depth_estimator)
+            if not math.isfinite(d_m):
+                continue
+            meta = loader.load_meta(det.frame_idx)
+            wlat, wlon = camera_to_world(
+                gps_lat=float(meta["gps_lat"]),
+                gps_lon=float(meta["gps_lon"]),
+                heading_deg=float(meta["heading_deg"]),
+                depth_m=d_m,
+                lateral_offset_m=cfg.camera_lateral_offset_m,
+            )
+            det.depth_m = d_m
+            det.world_lat = wlat
+            det.world_lon = wlon
+    return tracks
+
+
+# ============================================================================
+# Stage 4: DBSCAN clustering -> persistent tree IDs
+# ============================================================================
+def _world_to_local_xy(
+    lats: np.ndarray, lons: np.ndarray,
+) -> np.ndarray:
+    """Project (lat, lon) to local metric (x, y) for clustering.
+
+    DBSCAN's eps is in the same units as the input. Doing it in
+    metres gives an interpretable knob (eps = 1.2 m). Flat-earth
+    is fine -- orchard rows are <1 km long.
+    """
+    lat0 = float(np.mean(lats))
+    lon0 = float(np.mean(lons))
+    cos_lat = math.cos(math.radians(lat0)) or 1e-6
+    x = (lons - lon0) * 111_320.0 * cos_lat
+    y = (lats - lat0) * 111_320.0
+    return np.stack([x, y], axis=1)
+
+
+def cluster_to_trees(
+    tracks: List[TrunkTrack],
+    cfg: SegmenterConfig,
+) -> List[TreeCluster]:
+    """DBSCAN over per-detection trunk world positions.
+
+    We cluster *detections*, not track-medians, because depth noise
+    means a single track can drift its world position by 0.3-0.6 m
+    across its frame span. Letting every detection vote, then taking
+    the cluster centroid as the canonical tree position, averages
+    that noise out. ``min_samples`` rejects single-detection clusters
+    that are usually false positives in distant background trees.
+    """
+    from sklearn.cluster import DBSCAN
+
+    # Flatten detections into a single array, keeping a mapping
+    # back to (track_idx, det_idx) so we can write tree_id back.
+    all_dets: List[Tuple[int, int, TrunkDetection]] = []
+    lats: List[float] = []
+    lons: List[float] = []
+    for ti, track in enumerate(tracks):
+        for di, det in enumerate(track.detections):
+            if det.world_lat == 0.0 and det.world_lon == 0.0:
+                continue                                # projection failed
+            all_dets.append((ti, di, det))
+            lats.append(det.world_lat)
+            lons.append(det.world_lon)
+
+    if not all_dets:
+        log.warning("No detections with valid world coords; clustering skipped")
+        return []
+
+    xy = _world_to_local_xy(np.array(lats), np.array(lons))
+    eps_m = cfg.tree_spacing_m * cfg.dbscan_eps_factor
+    log.info("DBSCAN eps=%.2f m, min_samples=%d", eps_m, cfg.dbscan_min_samples)
+    db = DBSCAN(eps=eps_m, min_samples=cfg.dbscan_min_samples).fit(xy)
+    labels = db.labels_
+
+    # Build TreeCluster per label (label==-1 is DBSCAN noise; drop it).
+    by_label: Dict[int, TreeCluster] = {}
+    next_tree_id = 1
+
+    # Stable tree_id assignment: order clusters by along-row position
+    # so tree 1 is at the start of the run, tree 2 next, etc. We use
+    # the centroid's projection onto the row's principal axis (PCA
+    # on cluster centroids).
+    cluster_centroids: Dict[int, Tuple[float, float]] = {}
+    for lbl in set(labels):
+        if lbl == -1:
+            continue
+        mask = labels == lbl
+        cx = float(np.mean(xy[mask, 0]))
+        cy = float(np.mean(xy[mask, 1]))
+        cluster_centroids[int(lbl)] = (cx, cy)
+
+    if not cluster_centroids:
+        log.warning("DBSCAN found no clusters")
+        return []
+
+    centroid_arr = np.array(list(cluster_centroids.values()))
+    if centroid_arr.shape[0] >= 2:
+        # PCA: principal axis = row direction.
+        c0 = centroid_arr - centroid_arr.mean(axis=0, keepdims=True)
+        u, _, _ = np.linalg.svd(c0, full_matrices=False)
+        # Project onto first principal component direction.
+        _, _, vt = np.linalg.svd(c0, full_matrices=False)
+        axis = vt[0]
+        proj = c0 @ axis
+        order = np.argsort(proj)
+        ordered_labels = [list(cluster_centroids.keys())[i] for i in order]
+    else:
+        ordered_labels = list(cluster_centroids.keys())
+
+    label_to_tree_id = {lbl: i + 1 for i, lbl in enumerate(ordered_labels)}
+
+    for (ti, di, det), lbl in zip(all_dets, labels):
+        if lbl == -1:
+            continue
+        tid = label_to_tree_id[int(lbl)]
+        if tid not in by_label:
+            cx, cy = cluster_centroids[int(lbl)]
+            # Convert back to (lat, lon) using the same lat0/lon0.
+            lat0 = float(np.mean(lats))
+            lon0 = float(np.mean(lons))
+            cos_lat = math.cos(math.radians(lat0)) or 1e-6
+            wlat = lat0 + cy / 111_320.0
+            wlon = lon0 + cx / (111_320.0 * cos_lat)
+            by_label[tid] = TreeCluster(
+                tree_id=tid, world_lat=wlat, world_lon=wlon,
+            )
+        cluster = by_label[tid]
+        if not cluster.tracks or cluster.tracks[-1].track_id != tracks[ti].track_id:
+            cluster.tracks.append(tracks[ti])
+        # Frame attribution: count mask pixels for dominance scoring.
+        n_pixels = int(det.mask.sum()) if det.mask is not None else 0
+        cluster.frame_pixels[det.frame_idx] = (
+            cluster.frame_pixels.get(det.frame_idx, 0) + n_pixels
+        )
+
+    clusters = sorted(by_label.values(), key=lambda c: c.tree_id)
+    n_noise = int(np.sum(labels == -1))
+    log.info("DBSCAN: %d trees, %d noise detections discarded",
+             len(clusters), n_noise)
+    return clusters
+
+
+# ============================================================================
+# Stage 5: Frame attribution
+# ============================================================================
+def attribute_frames(
+    clusters: List[TreeCluster],
+    cfg: SegmenterConfig,
+) -> Dict[int, List[Tuple[int, float]]]:
+    """For each frame, return ranked list of (tree_id, dominance_weight).
+
+    Weight is mask-pixel-count normalised by the largest mask in that
+    frame. Trees below ``attribution_dominance_threshold`` are dropped
+    (they're in the FOV but only marginally visible).
+
+    Use the first entry in each list as the primary tree_id for that
+    frame; the rest are secondary visible trees.
+    """
+    # Invert: frame_idx -> list of (tree_id, pixels)
+    by_frame: Dict[int, List[Tuple[int, int]]] = {}
+    for cluster in clusters:
+        for fid, npx in cluster.frame_pixels.items():
+            by_frame.setdefault(fid, []).append((cluster.tree_id, npx))
+
+    out: Dict[int, List[Tuple[int, float]]] = {}
+    for fid, items in by_frame.items():
+        max_px = max(p for _, p in items)
+        if max_px <= 0:
+            continue
+        ranked = sorted(items, key=lambda kv: -kv[1])
+        kept = [
+            (tid, p / max_px)
+            for tid, p in ranked
+            if (p / max_px) >= cfg.attribution_dominance_threshold
+        ]
+        if kept:
+            out[fid] = kept
+    return out
+
+
+# ============================================================================
+# Stage 5b: ROI-based flower attribution
+# ============================================================================
+def _frame_tree_mask_index(
+    clusters: List[TreeCluster],
+) -> Dict[int, Dict[int, np.ndarray]]:
+    """Build {frame_idx: {tree_id: trunk_mask}} from clustered tracks.
+
+    Only includes (frame, tree) pairs that the cluster step actually
+    accepted — i.e. frame_idx appears in cluster.frame_pixels.
+    """
+    idx: Dict[int, Dict[int, np.ndarray]] = {}
+    for cluster in clusters:
+        for track in cluster.tracks:
+            for det in track.detections:
+                if det.mask is not None and det.frame_idx in cluster.frame_pixels:
+                    idx.setdefault(det.frame_idx, {})[cluster.tree_id] = det.mask
+    return idx
+
+
+def attribute_flowers_via_roi(
+    clusters: List[TreeCluster],
+    attribution: Dict[int, List[Tuple[int, float]]],
+    flower_counts_by_frame: Dict[int, float],
+    roi_masks_by_frame: Dict[int, Optional[np.ndarray]],
+    min_trunk_roi_overlap_px: int = 50,
+) -> Dict[int, float]:
+    """Assign per-frame flower counts to trees using PRGB ROI masks.
+
+    Decision tree per frame
+    -----------------------
+    1. No ROI for this frame → skip. Flowers are already restricted to
+       the ROI by ``analyze_days.py --prgb``, so if there is no ROI the
+       frame contributed nothing and there is nothing to assign.
+    2. Exactly one tree's trunk overlaps the ROI → all flowers go to
+       that tree.
+    3. Two or more trunks overlap the same ROI → split proportionally
+       by dominance weight (trunk pixel count) among the in-ROI trees
+       only.
+    4. ROI present but no trunk detected inside it → fall back to the
+       primary attributed tree (highest-weight tree for that frame).
+
+    Parameters
+    ----------
+    flower_counts_by_frame
+        ``{frame_idx: n_flowers}`` — use ``n_detections`` or
+        ``est_flowers`` from ``analyze_days.py``'s ``results.csv``.
+        Build it with :func:`load_flower_counts_from_csv`.
+    roi_masks_by_frame
+        ``{frame_idx: bool_array_or_None}`` — the (H, W) PRGB ROI mask
+        for each frame. None means no ROI was extracted for that frame.
+        Build it from ``loader.load_roi_mask()`` or
+        ``analyze_days.extract_roi_mask()``.
+    min_trunk_roi_overlap_px
+        Minimum pixels of trunk-mask ∩ ROI-mask to consider a trunk
+        "inside" the ROI. Guards against a trunk that barely grazes the
+        ROI edge stealing attribution (default 50 px).
+
+    Returns
+    -------
+    Dict mapping tree_id → total flower count. Also mutates
+    ``cluster.flower_count`` on every cluster in *clusters*.
+    """
+    frame_tree_masks = _frame_tree_mask_index(clusters)
+    totals: Dict[int, float] = {c.tree_id: 0.0 for c in clusters}
+    n_assigned = n_skipped_no_roi = n_fallback = n_split = 0
+
+    for frame_idx, n_flowers in flower_counts_by_frame.items():
+        if n_flowers <= 0:
+            continue
+
+        roi = roi_masks_by_frame.get(frame_idx)
+        if roi is None or not roi.any():
+            n_skipped_no_roi += 1
+            continue
+
+        ranked = attribution.get(frame_idx, [])
+        tree_masks_frame = frame_tree_masks.get(frame_idx, {})
+
+        # Which trees have trunks that land inside this ROI?
+        in_roi: List[Tuple[int, float]] = []
+        for tree_id, weight in ranked:
+            mask = tree_masks_frame.get(tree_id)
+            if mask is None:
+                continue
+            overlap_px = int(np.logical_and(mask, roi).sum())
+            if overlap_px >= min_trunk_roi_overlap_px:
+                in_roi.append((tree_id, weight))
+
+        if not in_roi:
+            # Segmenter missed the trunk inside the ROI; use primary tree.
+            if ranked:
+                totals[ranked[0][0]] += n_flowers
+                n_fallback += 1
+                log.debug("frame %d: no trunk in ROI, fallback to tree %d",
+                          frame_idx, ranked[0][0])
+        elif len(in_roi) == 1:
+            totals[in_roi[0][0]] += n_flowers
+            n_assigned += 1
+        else:
+            # Multiple trunks in the same ROI → weighted split.
+            total_w = sum(w for _, w in in_roi)
+            if total_w <= 0:
+                totals[in_roi[0][0]] += n_flowers
+            else:
+                for tree_id, w in in_roi:
+                    totals[tree_id] += n_flowers * (w / total_w)
+            n_split += 1
+            log.debug("frame %d: %d trunks in ROI, split %.1f flowers",
+                      frame_idx, len(in_roi), n_flowers)
+
+    for cluster in clusters:
+        cluster.flower_count = totals.get(cluster.tree_id, 0.0)
+
+    log.info(
+        "Flower attribution: %d frames → 1 tree, %d split, "
+        "%d fallback, %d skipped (no ROI)",
+        n_assigned, n_split, n_fallback, n_skipped_no_roi,
+    )
+    return totals
+
+
+def load_flower_counts_from_csv(
+    csv_path: str,
+    session: str,
+    prompt: str = "apple blossom",
+    count_col: str = "est_flowers",
+) -> Dict[int, float]:
+    """Parse ``analyze_days.py``'s ``results.csv`` into ``{frame_idx: n}``.
+
+    ``frame_idx`` is inferred by stripping non-digits from the image
+    filename stem (e.g. ``20230504_143201-RGB-BP.bmp`` has no leading
+    digits, but ``000042.bmp`` → 42). If your filenames embed the index
+    differently, build the dict manually instead.
+
+    Parameters
+    ----------
+    session
+        The session folder name to filter on (``session`` column in the CSV).
+    prompt
+        The SAM 3 prompt to sum over (default ``"apple blossom"``).
+    count_col
+        Which count column to use: ``"est_flowers"`` (density estimate)
+        or ``"n_detections"`` (raw SAM 3 detections after quality filter).
+    """
+    import csv as _csv
+    import re as _re
+
+    counts: Dict[int, float] = {}
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        for row in _csv.DictReader(fh):
+            if row.get("session") != session:
+                continue
+            if row.get("prompt") != prompt:
+                continue
+            stem = Path(row["image"]).stem
+            digits = _re.sub(r"\D", "", stem)
+            if not digits:
+                continue
+            frame_idx = int(digits)
+            counts[frame_idx] = counts.get(frame_idx, 0.0) + float(row.get(count_col) or 0)
+    return counts
+
+
+# ============================================================================
+# Stage 6: Sanity check on inter-cluster spacing
+# ============================================================================
+def sanity_check_spacing(
+    clusters: List[TreeCluster],
+    cfg: SegmenterConfig,
+) -> List[TreeCluster]:
+    """Flag clusters whose neighbour spacing is implausible.
+
+    Two failure modes to catch:
+      * **Gap too large** (> tree_spacing × (1 + tol)) -> a tree was
+        likely missed between this cluster and its predecessor. Flag
+        BOTH endpoints so the operator can scrub the contact sheet
+        for either side and decide where to insert.
+      * **Gap too small** (< tree_spacing × (1 - tol)) -> two clusters
+        likely belong to one physical tree. Flag the smaller-mass
+        cluster as a merge candidate.
+
+    Mutates ``flagged_reason`` on the affected clusters and returns
+    the same list (chainable).
+    """
+    if len(clusters) < 2:
+        return clusters
+
+    lats = np.array([c.world_lat for c in clusters])
+    lons = np.array([c.world_lon for c in clusters])
+    xy = _world_to_local_xy(lats, lons)
+
+    # Re-order along the row's principal axis (already done by the
+    # cluster step, but be defensive).
+    if len(clusters) >= 2:
+        c0 = xy - xy.mean(axis=0, keepdims=True)
+        _, _, vt = np.linalg.svd(c0, full_matrices=False)
+        axis = vt[0]
+        proj = c0 @ axis
+        order = np.argsort(proj)
+        clusters_sorted = [clusters[i] for i in order]
+        proj_sorted = proj[order]
+    else:
+        clusters_sorted = list(clusters)
+        proj_sorted = np.zeros(len(clusters))
+
+    spacing = np.diff(proj_sorted)
+    lo = cfg.tree_spacing_m * (1.0 - cfg.spacing_tolerance)
+    hi = cfg.tree_spacing_m * (1.0 + cfg.spacing_tolerance)
+
+    for i, gap in enumerate(spacing):
+        gap = float(abs(gap))
+        if gap > hi:
+            msg = f"large_gap_{gap:.2f}m"
+            clusters_sorted[i].flagged_reason = (
+                f"{clusters_sorted[i].flagged_reason or ''};{msg}".strip(";")
+            )
+            clusters_sorted[i + 1].flagged_reason = (
+                f"{clusters_sorted[i + 1].flagged_reason or ''};{msg}".strip(";")
+            )
+        elif gap < lo:
+            # Flag the lighter-evidence cluster as merge candidate.
+            a, b = clusters_sorted[i], clusters_sorted[i + 1]
+            target = a if a.n_frames < b.n_frames else b
+            msg = f"close_neighbour_{gap:.2f}m"
+            target.flagged_reason = (
+                f"{target.flagged_reason or ''};{msg}".strip(";")
+            )
+
+    n_flagged = sum(1 for c in clusters if c.flagged_reason)
+    log.info("Spacing sanity check: %d/%d clusters flagged",
+             n_flagged, len(clusters))
+    return clusters
+
+
+# ============================================================================
+# Stage 7: Verification artifact
+# ============================================================================
+def build_contact_sheets(
+    clusters: List[TreeCluster],
+    loader: FrameLoader,
+    output_dir: str,
+    cfg: SegmenterConfig,
+) -> List[str]:
+    """Render one PNG per tree showing every attributed frame thumbnail.
+
+    Each thumbnail has the SAM2 mask outlined in red. Five minutes
+    of human flipping through the sheets catches any residual mis-
+    attributions and lets the operator manually merge / split via
+    cluster IDs. Sheets for flagged clusters get a warning banner.
+    """
+    import cv2
+    from PIL import Image
+
+    out_paths: List[str] = []
+    out_root = Path(output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    THUMB = cfg.contact_sheet_thumb_size
+
+    for cluster in clusters:
+        # Pick up to N thumbs evenly spaced through the frame range.
+        frames = sorted(cluster.frame_pixels.keys())
+        if len(frames) > cfg.contact_sheet_max_thumbs:
+            step = len(frames) / cfg.contact_sheet_max_thumbs
+            frames = [frames[int(i * step)]
+                      for i in range(cfg.contact_sheet_max_thumbs)]
+
+        # Build a mapping frame_idx -> mask for this cluster.
+        masks_by_frame: Dict[int, np.ndarray] = {}
+        for track in cluster.tracks:
+            for det in track.detections:
+                if det.frame_idx in cluster.frame_pixels and det.mask is not None:
+                    masks_by_frame[det.frame_idx] = det.mask
+
+        # Build the grid.
+        cols = min(6, len(frames))
+        rows = (len(frames) + cols - 1) // cols
+        grid = Image.new("RGB", (cols * THUMB, rows * THUMB), (0, 0, 0))
+        for k, fid in enumerate(frames):
+            rgb = loader.load_rgb(fid)
+            mask = masks_by_frame.get(fid)
+            if mask is not None:
+                # Red contour of the mask.
+                contours, _ = cv2.findContours(
+                    mask.astype(np.uint8),
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE,
+                )
+                cv2.drawContours(rgb, contours, -1, (255, 0, 0), 3)
+            thumb = cv2.resize(rgb, (THUMB, THUMB))
+            grid.paste(Image.fromarray(thumb),
+                       ((k % cols) * THUMB, (k // cols) * THUMB))
+
+        suffix = f"_FLAGGED_{cluster.flagged_reason}" if cluster.flagged_reason else ""
+        path = out_root / f"tree_{cluster.tree_id:03d}{suffix}.png"
+        grid.save(path)
+        out_paths.append(str(path))
+
+    log.info("Wrote %d contact sheets to %s", len(out_paths), out_root)
+    return out_paths
+
+
+# ============================================================================
+# Stage 8: Integration with TreeTracker
+# ============================================================================
+def populate_tree_tracker(
+    tracker: TreeTracker,
+    clusters: List[TreeCluster],
+    loader: FrameLoader,
+) -> None:
+    """Write cluster results into a fresh ``TreeTracker``.
+
+    Mirrors the ``segments`` -> ``TrackedTree`` registration loop at
+    the bottom of ``TreeTracker.refine_with_signal``. After this call
+    the tracker holds N TrackedTrees, one per cluster, with full
+    TreeDetection observations preserved.
+
+    The tracker is reset() first so this is safe to call repeatedly.
+    """
+    tracker.reset()
+    for cluster in clusters:
+        # Allocate the right tree_id by burning IDs up to it.
+        while tracker._next_id < cluster.tree_id:
+            tracker._next_id += 1
+        for fid, npx in sorted(cluster.frame_pixels.items()):
+            meta = loader.load_meta(fid)
+            # Use the cluster centroid as the canonical world coord
+            # (rather than per-frame trunk projection, which carries
+            # depth noise).
+            det = TreeDetection(
+                frame_idx=fid,
+                world_lat=cluster.world_lat,
+                world_lon=cluster.world_lon,
+                depth_m=float(meta.get("mean_depth_m", 0.0)),
+                estimated_lai=float(meta.get("estimated_lai", 0.0)),
+                gps_lat=float(meta["gps_lat"]),
+                gps_lon=float(meta["gps_lon"]),
+                heading_deg=float(meta["heading_deg"]),
+                timestamp=float(meta["timestamp"]),
+                meta={
+                    "trunk_mask_pixels": npx,
+                    "source": "sam2_orchard_segmenter",
+                    "flagged": cluster.flagged_reason,
+                },
+            )
+            with tracker._lock:
+                if cluster.tree_id not in tracker._trees:
+                    tracker._trees[cluster.tree_id] = TrackedTree(
+                        tree_id=cluster.tree_id,
+                        world_lat=cluster.world_lat,
+                        world_lon=cluster.world_lon,
+                    )
+                tracker._trees[cluster.tree_id].update_position(det)
+                tracker._next_id = max(tracker._next_id, cluster.tree_id + 1)
+
+
+# ============================================================================
+# Top-level orchestrator
+# ============================================================================
+def process_run(
+    run_root: str,
+    cfg: Optional[SegmenterConfig] = None,
+    output_dir: Optional[str] = None,
+    device: str = "cuda",
+    write_contact_sheets: bool = True,
+    flower_counts_by_frame: Optional[Dict[int, float]] = None,
+    roi_masks_by_frame: Optional[Dict[int, Optional[np.ndarray]]] = None,
+) -> Tuple[List[TreeCluster], Dict[int, List[Tuple[int, float]]]]:
+    """End-to-end: run the full pipeline on a staged orchard run.
+
+    Parameters
+    ----------
+    run_root : path to the run directory (see :class:`PNGSequenceLoader`)
+    cfg      : :class:`SegmenterConfig`. Defaults if None.
+    output_dir : where to write contact sheets and a ``trees.json``
+                 summary. Defaults to ``run_root/sam2_segmenter_out``.
+    device   : "cuda" or "cpu". CPU is feasible but slow (~30 min/run).
+    flower_counts_by_frame
+        Optional ``{frame_idx: n_flowers}`` from ``analyze_days.py``.
+        When provided, calls :func:`attribute_flowers_via_roi` to
+        populate ``cluster.flower_count`` on every returned cluster.
+        Build with :func:`load_flower_counts_from_csv`.
+    roi_masks_by_frame
+        Optional ``{frame_idx: bool_array_or_None}`` PRGB ROI masks.
+        When None (default), the loader's :meth:`FrameLoader.load_roi_mask`
+        is called for each frame. Override that method in your loader
+        subclass, or pass precomputed masks here.
+
+    Returns
+    -------
+    clusters : the persistent tree list (``cluster.flower_count`` is set
+               when *flower_counts_by_frame* is provided).
+    attribution : ``{frame_idx: [(tree_id, weight), ...]}`` mapping.
+    """
+    cfg = cfg or SegmenterConfig()
+    out_root = Path(output_dir or (Path(run_root) / "sam2_segmenter_out"))
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    loader = PNGSequenceLoader(run_root)
+
+    # 1. Detection.
+    detections = detect_trunks_grounding_dino(loader, cfg, device=device)
+
+    # 2. SAM2 propagation.
+    tracks = propagate_with_sam2(loader, detections, cfg, device=device)
+
+    # 3. World projection.
+    tracks = project_tracks_to_world(tracks, loader, cfg)
+
+    # 4. Cluster.
+    clusters = cluster_to_trees(tracks, cfg)
+
+    # 5. Sanity check.
+    clusters = sanity_check_spacing(clusters, cfg)
+
+    # 6. Frame attribution.
+    attribution = attribute_frames(clusters, cfg)
+
+    # 6b. Flower attribution via PRGB ROI (optional).
+    if flower_counts_by_frame:
+        if roi_masks_by_frame is None:
+            roi_masks_by_frame = {
+                fid: loader.load_roi_mask(fid)
+                for fid in loader.frame_indices()
+            }
+        attribute_flowers_via_roi(
+            clusters, attribution, flower_counts_by_frame, roi_masks_by_frame,
+        )
+
+    # 7. Verification artifacts.
+    if write_contact_sheets:
+        build_contact_sheets(clusters, loader, str(out_root / "contact_sheets"), cfg)
+
+    # 8. Summary JSON for downstream consumption.
+    summary = {
+        "n_trees": len(clusters),
+        "config": {k: getattr(cfg, k) for k in cfg.__dataclass_fields__},
+        "trees": [
+            {
+                "tree_id": c.tree_id,
+                "world_lat": c.world_lat,
+                "world_lon": c.world_lon,
+                "n_frames": c.n_frames,
+                "first_frame": c.first_frame,
+                "last_frame": c.last_frame,
+                "flagged_reason": c.flagged_reason,
+                "flower_count": round(c.flower_count, 1),
+            }
+            for c in clusters
+        ],
+        "frame_attribution": {
+            str(fid): [(tid, round(w, 4)) for tid, w in items]
+            for fid, items in attribution.items()
+        },
+    }
+    with (out_root / "trees.json").open("w") as fh:
+        json.dump(summary, fh, indent=2)
+
+    log.info("Done: %d trees, %d frames attributed",
+             len(clusters), len(attribution))
+    return clusters, attribution
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+def _main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Trunk-anchored orchard tree segmentation",
+    )
+    parser.add_argument("run_root", type=str,
+                        help="Run directory with rgb/, depth/, meta.json")
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--tree-spacing-m", type=float, default=3.0)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--no-contact-sheets", action="store_true")
+    parser.add_argument("--gdino-model", type=str,
+                        default="IDEA-Research/grounding-dino-base")
+    parser.add_argument("--sam2-cfg", type=str,
+                        default="configs/sam2.1/sam2.1_hiera_l.yaml")
+    parser.add_argument("--sam2-ckpt", type=str,
+                        default="checkpoints/sam2.1_hiera_large.pt")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    cfg = SegmenterConfig(
+        gdino_model_id=args.gdino_model,
+        sam2_model_cfg=args.sam2_cfg,
+        sam2_checkpoint=args.sam2_ckpt,
+        tree_spacing_m=args.tree_spacing_m,
+    )
+
+    clusters, _ = process_run(
+        run_root=args.run_root,
+        cfg=cfg,
+        output_dir=args.output_dir,
+        device=args.device,
+        write_contact_sheets=not args.no_contact_sheets,
+    )
+    print(f"Detected {len(clusters)} trees")
+    for c in clusters:
+        flag = f"  [{c.flagged_reason}]" if c.flagged_reason else ""
+        flowers = f"  flowers={c.flower_count:.0f}" if c.flower_count else ""
+        print(f"  Tree {c.tree_id:3d}: "
+              f"({c.world_lat:.7f}, {c.world_lon:.7f})  "
+              f"frames {c.first_frame}-{c.last_frame} "
+              f"(n={c.n_frames}){flowers}{flag}")
+
+
+if __name__ == "__main__":
+    _main()
+
+
+__all__ = [
+    "SegmenterConfig",
+    "TrunkDetection",
+    "TrunkTrack",
+    "TreeCluster",
+    "FrameLoader",
+    "PNGSequenceLoader",
+    "detect_trunks_grounding_dino",
+    "propagate_with_sam2",
+    "project_tracks_to_world",
+    "cluster_to_trees",
+    "sanity_check_spacing",
+    "attribute_frames",
+    "attribute_flowers_via_roi",
+    "load_flower_counts_from_csv",
+    "build_contact_sheets",
+    "populate_tree_tracker",
+    "process_run",
+]
