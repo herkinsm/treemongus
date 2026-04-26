@@ -828,33 +828,52 @@ def _propagate_image_mode(
     Each track here holds exactly one detection. The cluster step
     groups them by world position into per-tree TreeClusters.
 
-    If the ``sam2`` package isn't importable (e.g. the env only has
-    SAM 3, which is text-prompted and has no box-prompt API), we
-    fall back to using the GDINO bbox as a rectangular mask. GDINO
-    trunk boxes are tight enough that the downstream depth-median
-    and ROI-overlap signals still work well.
+    Tries SAM 2 first (box-prompt API). If unavailable, tries SAM 3
+    (Meta) via ``Sam3Processor.add_geometric_prompt`` -- SAM 3 also
+    accepts a box prompt and returns a refined mask. As a last
+    resort falls back to using the GDINO bbox as a rectangular
+    mask, which keeps depth/ROI/DBSCAN working but skips pixel-
+    level refinement.
     """
     from tqdm.auto import tqdm
+    from PIL import Image
 
-    predictor = None
+    sam2_predictor = None
+    sam3_processor = None
     autocast_dtype = None
+    backend = "bbox"
+
     try:
         import torch
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         log.info("Loading SAM2 (image mode): %s", cfg.sam2_model_id)
-        predictor = SAM2ImagePredictor.from_pretrained(
+        sam2_predictor = SAM2ImagePredictor.from_pretrained(
             cfg.sam2_model_id, device=device,
         )
         autocast_dtype = (
             torch.bfloat16 if device.startswith("cuda") else torch.float32
         )
+        backend = "sam2"
     except ImportError:
-        log.warning(
-            "sam2 package not installed — falling back to bbox-rectangle "
-            "masks for trunk detections. World coords / ROI overlap / "
-            "DBSCAN clustering all still work; only mask-pixel-level "
-            "refinement is skipped.",
-        )
+        try:
+            import torch  # noqa: F401
+            from sam3 import build_sam3_image_model
+            from sam3.model.sam3_image_processor import Sam3Processor
+            log.info("Loading SAM 3 (geometric box prompt) for trunk masks")
+            sam3_model = build_sam3_image_model()
+            # Low confidence threshold so SAM 3 returns a mask for
+            # essentially every GDINO box we feed it. We trust the
+            # GDINO detection -- SAM 3 only needs to produce the
+            # pixel mask.
+            sam3_processor = Sam3Processor(
+                sam3_model, device=device, confidence_threshold=0.05,
+            )
+            backend = "sam3"
+        except ImportError:
+            log.warning(
+                "Neither sam2 nor sam3 importable — falling back to "
+                "bbox-rectangle masks for trunk detections.",
+            )
 
     tracks: List[TrunkTrack] = []
     next_track_id = 1
@@ -868,15 +887,62 @@ def _propagate_image_mode(
             m[y1:y2, x1:x2] = True
         return m
 
-    desc = "SAM2 mask refine" if predictor is not None else "bbox-mask build"
-    for frame_idx in tqdm(loader.frame_indices(), desc=desc):
+    def _xyxy_to_norm_cxcywh(box, h: int, w: int):
+        x1, y1, x2, y2 = (float(v) for v in box)
+        cx = (x1 + x2) / 2.0 / w
+        cy = (y1 + y2) / 2.0 / h
+        bw = (x2 - x1) / w
+        bh = (y2 - y1) / h
+        return [cx, cy, bw, bh]
+
+    def _pick_sam3_mask(state, gdino_box, h: int, w: int):
+        """Pick the SAM 3 mask whose box overlaps the GDINO box most."""
+        masks = state.get("masks")
+        boxes = state.get("boxes")
+        if masks is None or boxes is None or len(masks) == 0:
+            return None, 0.0
+        masks_np = masks.detach().cpu().numpy().astype(bool)
+        if masks_np.ndim == 4:
+            masks_np = masks_np.squeeze(1)
+        boxes_np = boxes.detach().cpu().numpy()
+        scores = state.get("scores")
+        scores_np = (
+            scores.detach().cpu().numpy()
+            if scores is not None else np.ones(len(masks_np))
+        )
+        gx1, gy1, gx2, gy2 = gdino_box
+        ga = max(0.0, gx2 - gx1) * max(0.0, gy2 - gy1)
+        best_iou = -1.0
+        best_idx = -1
+        for i, b in enumerate(boxes_np):
+            bx1, by1, bx2, by2 = b
+            ix1 = max(gx1, bx1); iy1 = max(gy1, by1)
+            ix2 = min(gx2, bx2); iy2 = min(gy2, by2)
+            iw = max(0.0, ix2 - ix1); ih = max(0.0, iy2 - iy1)
+            inter = iw * ih
+            ba = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            union = ga + ba - inter
+            iou = inter / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = i
+        if best_idx < 0:
+            return None, 0.0
+        return masks_np[best_idx], float(scores_np[best_idx])
+
+    desc_map = {
+        "sam2": "SAM2 mask refine",
+        "sam3": "SAM3 mask refine",
+        "bbox": "bbox-mask build",
+    }
+    for frame_idx in tqdm(loader.frame_indices(), desc=desc_map[backend]):
         dets = detections_by_frame.get(frame_idx, [])
         if not dets:
             continue
         rgb = loader.load_rgb(frame_idx)
         h, w = rgb.shape[:2]
 
-        if predictor is None:
+        if backend == "bbox":
             for det in dets:
                 m = _bbox_mask(det.bbox_xyxy, h, w)
                 if not m.any():
@@ -894,22 +960,48 @@ def _propagate_image_mode(
                 tracks.append(track)
             continue
 
+        if backend == "sam3":
+            pil_img = Image.fromarray(rgb)
+            state = sam3_processor.set_image(pil_img)
+            for det in dets:
+                sam3_processor.reset_all_prompts(state)
+                norm_box = _xyxy_to_norm_cxcywh(det.bbox_xyxy, h, w)
+                state = sam3_processor.add_geometric_prompt(
+                    box=norm_box, label=True, state=state,
+                )
+                m, sam3_score = _pick_sam3_mask(state, det.bbox_xyxy, h, w)
+                if m is None or not m.any():
+                    # SAM 3 returned nothing usable -- fall back to
+                    # the bbox as a rectangle mask for this detection.
+                    m = _bbox_mask(det.bbox_xyxy, h, w)
+                    if not m.any():
+                        continue
+                    sam3_score = 1.0
+                track = TrunkTrack(track_id=next_track_id)
+                next_track_id += 1
+                refined_det = TrunkDetection(
+                    frame_idx=frame_idx,
+                    bbox_xyxy=det.bbox_xyxy,
+                    score=det.score * sam3_score,
+                    mask=m.astype(bool),
+                    track_id=track.track_id,
+                )
+                track.detections.append(refined_det)
+                tracks.append(track)
+            continue
+
+        # SAM 2 path
         with torch.inference_mode(), torch.autocast(device, dtype=autocast_dtype):
-            predictor.set_image(rgb)
+            sam2_predictor.set_image(rgb)
             for det in dets:
                 box = np.array(det.bbox_xyxy, dtype=np.float32)
-                masks, scores, _ = predictor.predict(
+                masks, scores, _ = sam2_predictor.predict(
                     box=box[None, :],   # (1, 4)
                     multimask_output=False,
                 )
-                # masks shape: (1, 1, H, W) or (1, H, W) depending
-                # on SAM2 version. Squeeze defensively.
                 m = np.asarray(masks).squeeze().astype(bool)
                 if m.ndim != 2 or not m.any():
                     continue
-
-                # Each detection becomes its own single-frame track.
-                # DBSCAN will collapse same-tree detections later.
                 track = TrunkTrack(track_id=next_track_id)
                 next_track_id += 1
                 refined_det = TrunkDetection(
@@ -922,8 +1014,7 @@ def _propagate_image_mode(
                 track.detections.append(refined_det)
                 tracks.append(track)
 
-    mode_desc = "SAM2 image mode" if predictor is not None else "bbox-mask mode"
-    log.info("%s: %d single-frame tracks built", mode_desc, len(tracks))
+    log.info("%s: %d single-frame tracks built", desc_map[backend], len(tracks))
     return tracks
 
 
