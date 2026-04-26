@@ -13,10 +13,10 @@ cd ~/sam3-apple-analysis && git pull
 
 python sam2_orchard_segmenter.py \
     --root "/fs/scratch/PAS0228" \
-    --out "$HOME/sam3_50to80_v29" \
-    --flower-csv "$HOME/sam3_50to80_v29/results.csv" \
+    --out "$HOME/sam3_1to100_v29" \
+    --flower-csv "$HOME/sam3_1to100_v29/results.csv" \
     --flower-prompt flower \
     --flower-count-col est_flowers \
-    --frame-range 50 80 \
+    --frame-range 1 100 \
     --device cuda \
     -v
