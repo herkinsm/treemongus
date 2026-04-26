@@ -173,7 +173,7 @@ class SegmenterConfig:
     # Set to a float to override (useful if auto-estimation misbehaves on
     # very sparse or very dense detection sets).
     dbscan_eps_m: Optional[float] = None   # None = auto from data
-    dbscan_min_samples: int = 3
+    dbscan_min_samples: int = 2
 
     # tree_spacing_m is kept for the spacing sanity check only.
     tree_spacing_m: float = 3.0
@@ -2357,6 +2357,12 @@ def _main() -> None:
                              "the k-distance graph elbow so it adapts to actual trunk "
                              "spacing in the data. Override with a fixed value if "
                              "the auto-estimate over- or under-splits.")
+    parser.add_argument("--dbscan-min-samples", type=int, default=2,
+                        help="Minimum trunk detections required to form a tree "
+                             "cluster (default 2). Lower this for sparse "
+                             "fly-by data where a tree may only be seen in 2 "
+                             "frames; raise it to suppress single-frame "
+                             "GDINO false positives.")
     parser.add_argument("--row-heading-deg", type=float, default=None,
                         help="Orchard row compass bearing. Auto-estimated from "
                              "GPS trail when omitted.")
@@ -2384,6 +2390,7 @@ def _main() -> None:
         sam2_model_cfg=args.sam2_cfg,
         sam2_checkpoint=args.sam2_ckpt,
         dbscan_eps_m=args.dbscan_eps_m,
+        dbscan_min_samples=args.dbscan_min_samples,
     )
 
     sessions = _walk_all2023_sessions(Path(args.root))
