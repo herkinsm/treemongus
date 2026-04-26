@@ -1591,107 +1591,62 @@ def process_run(
 
 
 # ============================================================================
-# CLI
+# CLI helpers
 # ============================================================================
-def _main() -> None:
-    import argparse
+def _walk_all2023_sessions(root: Path) -> List[Path]:
+    """Return every session directory under an All2023 root.
 
-    parser = argparse.ArgumentParser(
-        description="Trunk-anchored orchard tree segmentation",
-    )
-    parser.add_argument("run_root", type=str,
-                        help="Session or run directory (see --loader).")
-    parser.add_argument("--loader", choices=["png_sequence", "all2023"],
-                        default="png_sequence",
-                        help="Data layout: 'png_sequence' (default) expects "
-                             "rgb/000000.png + depth/000000.npy + meta.json; "
-                             "'all2023' reads the native All2023 session layout "
-                             "(RGB/<ts>-RGB-BP.bmp, depth/<ts>-Depth.bmp, "
-                             "PRGB/<ts>-RGB-PP.bmp, <ts>.txt sidecars).")
-    parser.add_argument("--row-heading-deg", type=float, default=None,
-                        help="Compass bearing of the orchard row (0=N, 90=E). "
-                             "Used by --loader all2023. Auto-estimated from the "
-                             "GPS trail when omitted.")
-    parser.add_argument("--frame-range", type=int, nargs=2,
-                        default=None, metavar=("START", "STOP"),
-                        help="Process only frames [START, STOP) — matches the "
-                             "--frame-range used in analyze_days.py so the same "
-                             "frames are analysed by both tools.")
-    parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--tree-spacing-m", type=float, default=3.0)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--no-contact-sheets", action="store_true")
-    parser.add_argument("--gdino-model", type=str,
-                        default="IDEA-Research/grounding-dino-base")
-    parser.add_argument("--sam2-cfg", type=str,
-                        default="configs/sam2.1/sam2.1_hiera_l.yaml")
-    parser.add_argument("--sam2-ckpt", type=str,
-                        default="checkpoints/sam2.1_hiera_large.pt")
-    parser.add_argument("--flower-csv", type=str, default=None,
-                        help="Path to analyze_days.py results.csv. When provided, "
-                             "flower counts are attributed to trees via PRGB ROI masks.")
-    parser.add_argument("--flower-session", type=str, default=None,
-                        help="Session name to filter in --flower-csv (required with "
-                             "--flower-csv).")
-    parser.add_argument("--flower-prompt", type=str, default="apple blossom",
-                        help="Prompt column to use from --flower-csv (default: "
-                             "'apple blossom').")
-    parser.add_argument("--flower-count-col", type=str, default="est_flowers",
-                        choices=["est_flowers", "n_detections"],
-                        help="Which count column to use from the CSV "
-                             "(default: est_flowers).")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
+    Mirrors the directory walk in ``analyze_days.find_images`` so the
+    two tools always see the same sessions.
+    """
+    sessions: List[Path] = []
+    for day_dir in sorted(root.glob("2023 day *")):
+        inner = day_dir / day_dir.name
+        day_root = inner if inner.is_dir() else day_dir
+        for cat in sorted(p for p in day_root.iterdir() if p.is_dir()):
+            for sess in sorted(p for p in cat.iterdir() if p.is_dir()):
+                if (sess / "RGB").is_dir():
+                    sessions.append(sess)
+    return sessions
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
 
-    cfg = SegmenterConfig(
-        gdino_model_id=args.gdino_model,
-        sam2_model_cfg=args.sam2_cfg,
-        sam2_checkpoint=args.sam2_ckpt,
-        tree_spacing_m=args.tree_spacing_m,
-    )
+def _run_one_session(
+    session_dir: Path,
+    cfg: SegmenterConfig,
+    args,
+    out_base: Path,
+) -> None:
+    """Run the full pipeline on a single session directory."""
+    import json as _json
 
-    # Build the appropriate loader.
+    session_name = session_dir.name
     frame_range = tuple(args.frame_range) if args.frame_range else None
-    if args.loader == "all2023":
-        loader = All2023FrameLoader(
-            args.run_root,
-            row_heading_deg=args.row_heading_deg,
-            frame_range=frame_range,
-        )
-    else:
-        loader = PNGSequenceLoader(args.run_root)
+
+    loader = All2023FrameLoader(
+        str(session_dir),
+        row_heading_deg=getattr(args, "row_heading_deg", None),
+        frame_range=frame_range,
+    )
+    if len(loader) == 0:
+        log.warning("Session %s: no frames found, skipping", session_name)
+        return
 
     flower_counts = None
     if args.flower_csv:
-        if not args.flower_session:
-            parser.error("--flower-session is required when --flower-csv is set")
         flower_counts = load_flower_counts_from_csv(
             args.flower_csv,
-            session=args.flower_session,
+            session=session_name,
             prompt=args.flower_prompt,
             count_col=args.flower_count_col,
         )
-        log.info("Loaded flower counts for %d frames from %s",
-                 len(flower_counts), args.flower_csv)
+        log.info("Session %s: %d frames with flower data",
+                 session_name, len(flower_counts))
 
-    # ROI masks come from the loader's load_roi_mask() — All2023FrameLoader
-    # implements this using analyze_days.extract_roi_mask(); PNGSequenceLoader
-    # returns None by default (no PRGB available in that layout).
     roi_masks = None
     if flower_counts:
-        roi_masks = {
-            fid: loader.load_roi_mask(fid)
-            for fid in loader.frame_indices()
-        }
+        roi_masks = {fid: loader.load_roi_mask(fid) for fid in loader.frame_indices()}
 
-    # Run the pipeline directly with the pre-built loader instead of
-    # going through process_run (which always constructs a PNGSequenceLoader).
-    out_root = Path(args.output_dir or (Path(args.run_root) / "sam2_segmenter_out"))
+    out_root = out_base / session_name
     out_root.mkdir(parents=True, exist_ok=True)
 
     detections = detect_trunks_grounding_dino(loader, cfg, device=args.device)
@@ -1707,8 +1662,8 @@ def _main() -> None:
     if not args.no_contact_sheets:
         build_contact_sheets(clusters, loader, str(out_root / "contact_sheets"), cfg)
 
-    import json as _json
     summary = {
+        "session": session_name,
         "n_trees": len(clusters),
         "trees": [
             {
@@ -1726,8 +1681,8 @@ def _main() -> None:
     }
     with (out_root / "trees.json").open("w") as fh:
         _json.dump(summary, fh, indent=2)
-    log.info("Written %s", out_root / "trees.json")
-    print(f"Detected {len(clusters)} trees")
+
+    print(f"\n[{session_name}] {len(clusters)} trees detected")
     for c in clusters:
         flag = f"  [{c.flagged_reason}]" if c.flagged_reason else ""
         flowers = f"  flowers={c.flower_count:.0f}" if c.flower_count else ""
@@ -1735,6 +1690,79 @@ def _main() -> None:
               f"({c.world_lat:.7f}, {c.world_lon:.7f})  "
               f"frames {c.first_frame}-{c.last_frame} "
               f"(n={c.n_frames}){flowers}{flag}")
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+def _main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Trunk-anchored orchard tree segmentation",
+    )
+    parser.add_argument("--root", type=str, required=True,
+                        help="All2023 dataset root (same path you pass to "
+                             "analyze_days.py --root). Every session folder "
+                             "found under this root is processed automatically.")
+    parser.add_argument("--out", type=str, required=True,
+                        help="Output directory. One sub-folder per session is "
+                             "created here, each containing trees.json and "
+                             "optional contact_sheets/.")
+    parser.add_argument("--flower-csv", type=str, default=None,
+                        help="Path to analyze_days.py results.csv. When provided, "
+                             "flower counts are attributed to trees via PRGB ROI.")
+    parser.add_argument("--flower-prompt", type=str, default="flower",
+                        help="Prompt to pull from results.csv (default: flower).")
+    parser.add_argument("--flower-count-col", type=str, default="est_flowers",
+                        choices=["est_flowers", "n_detections"],
+                        help="Count column to use (default: est_flowers).")
+    parser.add_argument("--frame-range", type=int, nargs=2,
+                        default=None, metavar=("START", "STOP"),
+                        help="Process only frames [START, STOP) — use the same "
+                             "values as --frame-range in analyze_days.py.")
+    parser.add_argument("--tree-spacing-m", type=float, default=3.0,
+                        help="Expected spacing between trees in metres (default 3.0).")
+    parser.add_argument("--row-heading-deg", type=float, default=None,
+                        help="Orchard row compass bearing. Auto-estimated from "
+                             "GPS trail when omitted.")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--no-contact-sheets", action="store_true")
+    parser.add_argument("--gdino-model", type=str,
+                        default="IDEA-Research/grounding-dino-base")
+    parser.add_argument("--sam2-cfg", type=str,
+                        default="configs/sam2.1/sam2.1_hiera_l.yaml")
+    parser.add_argument("--sam2-ckpt", type=str,
+                        default="checkpoints/sam2.1_hiera_large.pt")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    cfg = SegmenterConfig(
+        gdino_model_id=args.gdino_model,
+        sam2_model_cfg=args.sam2_cfg,
+        sam2_checkpoint=args.sam2_ckpt,
+        tree_spacing_m=args.tree_spacing_m,
+    )
+
+    sessions = _walk_all2023_sessions(Path(args.root))
+    if not sessions:
+        print(f"No sessions found under {args.root}")
+        return
+    print(f"Found {len(sessions)} sessions under {args.root}")
+
+    out_base = Path(args.out) / "trees"
+    out_base.mkdir(parents=True, exist_ok=True)
+
+    for session_dir in sessions:
+        try:
+            _run_one_session(session_dir, cfg, args, out_base)
+        except Exception as exc:
+            log.error("Session %s failed: %s", session_dir.name, exc, exc_info=True)
 
 
 if __name__ == "__main__":
