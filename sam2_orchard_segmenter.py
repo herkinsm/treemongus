@@ -654,13 +654,25 @@ def detect_trunks_grounding_dino(
         with torch.no_grad():
             outputs = model(**inputs)
 
-        results = processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            box_threshold=cfg.box_threshold,
-            text_threshold=cfg.text_threshold,
-            target_sizes=[(h, w)],
-        )[0]
+        try:
+            # transformers >= 4.38 accepts thresholds directly.
+            results = processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                box_threshold=cfg.box_threshold,
+                text_threshold=cfg.text_threshold,
+                target_sizes=[(h, w)],
+            )[0]
+        except TypeError:
+            # Older / newer API variant — get all boxes and filter manually.
+            results = processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                target_sizes=[(h, w)],
+            )[0]
+            keep = results["scores"] >= cfg.box_threshold
+            results = {k: v[keep] if hasattr(v, "__getitem__") else v
+                       for k, v in results.items()}
 
         kept: List[TrunkDetection] = []
         for box, score in zip(results["boxes"], results["scores"]):
@@ -1851,8 +1863,9 @@ def _main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    # PIL logs every PNG chunk at DEBUG — suppress it regardless of -v.
-    logging.getLogger("PIL").setLevel(logging.WARNING)
+    # Suppress noisy third-party debug loggers regardless of -v.
+    for _noisy in ("PIL", "httpx", "httpcore", "urllib3"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
     cfg = SegmenterConfig(
         gdino_model_id=args.gdino_model,
