@@ -159,6 +159,16 @@ class SegmenterConfig:
     # Camera mounting offset from GPS antenna (metres). Lateral offset
     # is positive to the right of travel direction.
     camera_lateral_offset_m: float = 0.0
+    # Camera horizontal field of view (degrees). Used to convert a
+    # detection's pixel-x to a true lateral offset in world coords:
+    # a trunk seen at the left edge of a 60°-HFOV frame at depth 4 m
+    # has lateral_offset ≈ -2.3 m, not 0. Without this every trunk
+    # in a frame projects to the same point, and a single tree's
+    # detections smear several metres along the row as the camera
+    # passes by — DBSCAN can't reassemble them. RealSense D435 RGB
+    # is ~69°; default 60° is a conservative pick that under-shoots
+    # rather than over-shoots lateral spread.
+    camera_hfov_deg: float = 60.0
     # Use the median depth inside the trunk mask rather than the mean —
     # robust against the few aberrant depth pixels every D455 frame has.
     depth_estimator: str = "median"     # {"median", "mean", "p25"}
@@ -419,16 +429,30 @@ class All2023FrameLoader(FrameLoader):
     def load_depth_m(self, frame_idx: int) -> np.ndarray:
         import cv2
         base = self._base_stem(self._imgs[frame_idx])
+        h, w = self.load_rgb(frame_idx).shape[:2]
+
+        def _resize_to_rgb(d: np.ndarray) -> np.ndarray:
+            # All2023 depth .txt files are stored decimated horizontally
+            # (480 rows × ~50 cols for a 640×480 RGB frame). Bilinearly
+            # upsample to the RGB resolution so masks line up.
+            if d.shape == (h, w):
+                return d
+            from PIL import Image as _PILImage
+            pim = _PILImage.fromarray(
+                d.astype(np.float32), mode="F",
+            ).resize((w, h), _PILImage.BILINEAR)
+            return np.asarray(pim, dtype=np.float32)
+
         bmp = self._depth_dir / f"{base}-Depth.bmp"
         if bmp.is_file():
             raw = cv2.imread(str(bmp), cv2.IMREAD_ANYDEPTH)
             if raw is not None:
-                return raw.astype(np.float32) * self._DEPTH_MM_TO_M
+                return _resize_to_rgb(raw.astype(np.float32)) * self._DEPTH_MM_TO_M
         txt = self._depth_dir / f"{base}-Depth.txt"
         if txt.is_file():
-            return np.loadtxt(str(txt), dtype=np.float32) * self._DEPTH_MM_TO_M
+            d = np.loadtxt(str(txt), dtype=np.float32)
+            return _resize_to_rgb(d) * self._DEPTH_MM_TO_M
         # Missing depth → all NaN; projection skips this frame gracefully.
-        h, w = self.load_rgb(frame_idx).shape[:2]
         log.warning("No depth file for frame %d (%s)", frame_idx, base)
         return np.full((h, w), float("nan"), dtype=np.float32)
 
@@ -1230,6 +1254,7 @@ def project_tracks_to_world(
     from tqdm.auto import tqdm
 
     n_skipped_no_gps = 0
+    hfov = math.radians(cfg.camera_hfov_deg)
     for track in tqdm(tracks, desc="World projection"):
         for det in track.detections:
             depth = loader.load_depth_m(det.frame_idx)
@@ -1240,12 +1265,22 @@ def project_tracks_to_world(
             if "gps_lat" not in meta or "gps_lon" not in meta:
                 n_skipped_no_gps += 1
                 continue
+            # Pixel-x of trunk centroid → angle off the optical axis →
+            # true forward + lateral split. Without this every trunk in
+            # a frame projects to the same lat/lon and a single tree
+            # smears several metres along the row as the camera passes.
+            h, w = depth.shape[:2]
+            x1, _, x2, _ = det.bbox_xyxy
+            cx = (float(x1) + float(x2)) * 0.5
+            angle = ((cx - w * 0.5) / w) * hfov
+            forward_m = d_m * math.cos(angle)
+            lateral_px = d_m * math.sin(angle)
             wlat, wlon = camera_to_world(
                 gps_lat=float(meta["gps_lat"]),
                 gps_lon=float(meta["gps_lon"]),
                 heading_deg=float(meta["heading_deg"]),
-                depth_m=d_m,
-                lateral_offset_m=cfg.camera_lateral_offset_m,
+                depth_m=forward_m,
+                lateral_offset_m=cfg.camera_lateral_offset_m + lateral_px,
             )
             det.depth_m = d_m
             det.world_lat = wlat
@@ -1713,6 +1748,8 @@ def attribute_flowers_3d_nearest_tree(
             n_no_gps += 1
             continue
 
+        h_img, w_img = depth.shape[:2]
+        hfov = math.radians(cfg.camera_hfov_deg)
         per_cluster: Dict[int, int] = {tid: 0 for tid, _, _ in cluster_pos}
         for m in masks:
             m = np.asarray(m, dtype=bool)
@@ -1723,12 +1760,17 @@ def attribute_flowers_3d_nearest_tree(
             if d_pixels.size == 0:
                 continue
             d_m = float(np.median(d_pixels))
+            ys, xs = np.where(m)
+            cx = float(xs.mean())
+            angle = ((cx - w_img * 0.5) / w_img) * hfov
+            forward_m = d_m * math.cos(angle)
+            lateral_px = d_m * math.sin(angle)
             wlat, wlon = camera_to_world(
                 gps_lat=float(meta["gps_lat"]),
                 gps_lon=float(meta["gps_lon"]),
                 heading_deg=float(meta["heading_deg"]),
-                depth_m=d_m,
-                lateral_offset_m=cfg.camera_lateral_offset_m,
+                depth_m=forward_m,
+                lateral_offset_m=cfg.camera_lateral_offset_m + lateral_px,
             )
             best_tid = None
             best_d = max_assign_distance_m
@@ -2366,6 +2408,13 @@ def _main() -> None:
     parser.add_argument("--row-heading-deg", type=float, default=None,
                         help="Orchard row compass bearing. Auto-estimated from "
                              "GPS trail when omitted.")
+    parser.add_argument("--camera-hfov-deg", type=float, default=60.0,
+                        help="Camera horizontal FOV in degrees (default 60). "
+                             "Used to convert each detection's pixel-x into a "
+                             "true lateral world offset; without it every "
+                             "trunk in a frame projects to the same point and "
+                             "the same tree smears along the row as the "
+                             "camera passes by. RealSense D435 RGB is ~69°.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no-contact-sheets", action="store_true")
     parser.add_argument("--gdino-model", type=str,
@@ -2391,6 +2440,7 @@ def _main() -> None:
         sam2_checkpoint=args.sam2_ckpt,
         dbscan_eps_m=args.dbscan_eps_m,
         dbscan_min_samples=args.dbscan_min_samples,
+        camera_hfov_deg=args.camera_hfov_deg,
     )
 
     sessions = _walk_all2023_sessions(Path(args.root))
