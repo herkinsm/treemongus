@@ -940,18 +940,27 @@ def _propagate_image_mode(
 
     def _pick_sam3_mask(state, gdino_box, h: int, w: int):
         """Pick the SAM 3 mask whose box overlaps the GDINO box most."""
+        import torch as _torch
         masks = state.get("masks")
         boxes = state.get("boxes")
         if masks is None or boxes is None or len(masks) == 0:
             return None, 0.0
-        masks_np = masks.detach().cpu().numpy().astype(bool)
+
+        def _to_np(t):
+            t = t.detach().cpu()
+            # numpy doesn't support bfloat16 / float16 -- upcast.
+            if t.dtype in (_torch.bfloat16, _torch.float16):
+                t = t.to(_torch.float32)
+            return t.numpy()
+
+        masks_np = _to_np(masks).astype(bool)
         if masks_np.ndim == 4:
             masks_np = masks_np.squeeze(1)
-        boxes_np = boxes.detach().cpu().numpy()
+        boxes_np = _to_np(boxes)
         scores = state.get("scores")
         scores_np = (
-            scores.detach().cpu().numpy()
-            if scores is not None else np.ones(len(masks_np))
+            _to_np(scores) if scores is not None
+            else np.ones(len(masks_np))
         )
         gx1, gy1, gx2, gy2 = gdino_box
         ga = max(0.0, gx2 - gx1) * max(0.0, gy2 - gy1)
