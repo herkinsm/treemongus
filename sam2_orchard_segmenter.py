@@ -473,6 +473,7 @@ class All2023FrameLoader(FrameLoader):
         content = txt.read_text(errors="replace")
 
         # GPS Code (NMEA format): N 4044.17959, W 08154.19095
+        # (when the GPS is locked and reporting a position fix)
         gps_m = _re.search(
             r"GPS Code \(NMEA format\):\s*([NS])\s+([\d.]+),\s*([EW])\s+([\d.]+)",
             content,
@@ -490,6 +491,36 @@ class All2023FrameLoader(FrameLoader):
             meta["gps_lat"] = lat
             meta["gps_lon"] = lon
 
+        # Fallback: parse Raw GPS data line for $GPGGA or $GPRMC sentences.
+        # These appear when the GPS Code line has a u-blox text message
+        # instead of coordinates (GPS not yet locked on that frame).
+        if "gps_lat" not in meta:
+            raw_m = _re.search(r"Raw GPS data:\s*(.+)", content)
+            if raw_m:
+                raw = raw_m.group(1)
+                # $GPGGA,HHMMSS,DDMM.MMMM,N,DDDMM.MMMM,W,...
+                gg = _re.search(
+                    r"\$GPGGA,[\d.]*,([\d.]+),([NS]),([\d.]+),([EW])",
+                    raw,
+                )
+                # $GPRMC,HHMMSS,A,DDMM.MMMM,N,DDDMM.MMMM,W,...
+                rm = gg or _re.search(
+                    r"\$GPRMC,[\d.]*,[AV],([\d.]+),([NS]),([\d.]+),([EW])",
+                    raw,
+                )
+                if rm:
+                    lat_v, hN, lon_v, hE = rm.groups()
+                    lat_deg = int(float(lat_v) / 100)
+                    lat = lat_deg + (float(lat_v) - lat_deg * 100) / 60.0
+                    if hN == "S":
+                        lat = -lat
+                    lon_deg = int(float(lon_v) / 100)
+                    lon = lon_deg + (float(lon_v) - lon_deg * 100) / 60.0
+                    if hE == "W":
+                        lon = -lon
+                    meta["gps_lat"] = lat
+                    meta["gps_lon"] = lon
+
         # Travel Speed: 3 mph
         spd = _re.search(r"Travel Speed:\s*([\d.]+)\s*mph", content)
         if spd:
@@ -506,8 +537,14 @@ class All2023FrameLoader(FrameLoader):
         """Compute the compass bearing from the first to last GPS fix."""
         lats = [m["gps_lat"] for m in self._sidecars if "gps_lat" in m]
         lons = [m["gps_lon"] for m in self._sidecars if "gps_lon" in m]
+        n_total = len(self._sidecars)
         if len(lats) < 2:
-            log.warning("Too few GPS fixes to estimate heading; defaulting to 0°")
+            log.warning(
+                "Too few GPS fixes in session (%d/%d frames had coordinates) — "
+                "GPS likely not locked. Heading defaults to 0°. "
+                "Pass --row-heading-deg to override.",
+                len(lats), n_total,
+            )
             return 0.0
         lat1, lon1 = math.radians(lats[0]), math.radians(lons[0])
         lat2, lon2 = math.radians(lats[-1]), math.radians(lons[-1])
