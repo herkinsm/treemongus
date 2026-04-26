@@ -66,25 +66,44 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-# Re-use the geometry helpers from the existing tracker so the
-# projection math stays consistent across the pipeline. Falls back to
-# local copies if the import path differs in your project layout.
-try:
-    from .tree_tracker import (
-        TrackedTree,
-        TreeDetection,
-        TreeTracker,
-        camera_to_world,
-        haversine_m,
-    )
-except ImportError:                         # standalone use / different layout
-    from tree_tracker import (               # type: ignore[no-redef]
-        TrackedTree,
-        TreeDetection,
-        TreeTracker,
-        camera_to_world,
-        haversine_m,
-    )
+# Geometry helpers — implemented locally so the script runs standalone
+# without needing tree_tracker on the Python path.
+# populate_tree_tracker() still imports tree_tracker lazily if you use it.
+
+def camera_to_world(
+    gps_lat: float,
+    gps_lon: float,
+    heading_deg: float,
+    depth_m: float,
+    lateral_offset_m: float = 0.0,
+) -> Tuple[float, float]:
+    """Project a trunk depth observation to world (lat, lon).
+
+    Assumes the camera faces the direction of travel (heading_deg).
+    depth_m is the distance to the trunk. lateral_offset_m shifts the
+    effective origin laterally (positive = right of travel direction).
+    """
+    h = math.radians(heading_deg)
+    # Forward component (into the row).
+    dx = math.sin(h) * depth_m        # east, metres
+    dy = math.cos(h) * depth_m        # north, metres
+    # Lateral offset: camera mounted right/left of GPS antenna.
+    h_right = h + math.pi / 2
+    dx += math.sin(h_right) * lateral_offset_m
+    dy += math.cos(h_right) * lateral_offset_m
+    # Metres → degrees.
+    cos_lat = math.cos(math.radians(gps_lat)) or 1e-9
+    return gps_lat + dy / 111_320.0, gps_lon + dx / (111_320.0 * cos_lat)
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in metres between two (lat, lon) points."""
+    R = 6_371_000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 log = logging.getLogger(__name__)
@@ -1433,7 +1452,7 @@ def build_contact_sheets(
 # Stage 8: Integration with TreeTracker
 # ============================================================================
 def populate_tree_tracker(
-    tracker: TreeTracker,
+    tracker,
     clusters: List[TreeCluster],
     loader: FrameLoader,
 ) -> None:
@@ -1446,6 +1465,11 @@ def populate_tree_tracker(
 
     The tracker is reset() first so this is safe to call repeatedly.
     """
+    try:
+        from .tree_tracker import TreeDetection, TrackedTree
+    except ImportError:
+        from tree_tracker import TreeDetection, TrackedTree  # type: ignore
+
     tracker.reset()
     for cluster in clusters:
         # Allocate the right tree_id by burning IDs up to it.
