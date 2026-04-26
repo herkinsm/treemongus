@@ -1254,17 +1254,21 @@ def project_tracks_to_world(
     from tqdm.auto import tqdm
 
     n_skipped_no_gps = 0
+    n_skipped_no_depth = 0
+    n_projected = 0
     hfov = math.radians(cfg.camera_hfov_deg)
     for track in tqdm(tracks, desc="World projection"):
         for det in track.detections:
             depth = loader.load_depth_m(det.frame_idx)
             d_m = _depth_in_mask(depth, det.mask, cfg.depth_estimator)
             if not math.isfinite(d_m):
+                n_skipped_no_depth += 1
                 continue
             meta = loader.load_meta(det.frame_idx)
             if "gps_lat" not in meta or "gps_lon" not in meta:
                 n_skipped_no_gps += 1
                 continue
+            n_projected += 1
             # Pixel-x of trunk centroid → angle off the optical axis →
             # true forward + lateral split. Without this every trunk in
             # a frame projects to the same lat/lon and a single tree
@@ -1285,11 +1289,11 @@ def project_tracks_to_world(
             det.depth_m = d_m
             det.world_lat = wlat
             det.world_lon = wlon
-    if n_skipped_no_gps:
-        log.warning(
-            "World projection: skipped %d detections with no GPS fix",
-            n_skipped_no_gps,
-        )
+    log.info(
+        "World projection: %d projected, %d skipped no-GPS, "
+        "%d skipped no-depth",
+        n_projected, n_skipped_no_gps, n_skipped_no_depth,
+    )
     return tracks
 
 
@@ -1316,8 +1320,8 @@ def _world_to_local_xy(
 def _estimate_dbscan_eps(
     xy: np.ndarray,
     min_samples: int,
-    max_eps_m: float = 1.0,
-    min_eps_m: float = 0.3,
+    max_eps_m: float = 2.0,
+    min_eps_m: float = 0.2,
 ) -> float:
     """Auto-estimate DBSCAN eps from the k-distance graph elbow.
 
