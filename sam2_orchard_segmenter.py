@@ -670,9 +670,11 @@ def detect_trunks_grounding_dino(
                 inputs.input_ids,
                 target_sizes=[(h, w)],
             )[0]
-            keep = results["scores"] >= cfg.box_threshold
-            results = {k: v[keep] if hasattr(v, "__getitem__") else v
-                       for k, v in results.items()}
+            keep = (results["scores"] >= cfg.box_threshold).nonzero(
+                as_tuple=False
+            ).squeeze(1)
+            results["boxes"] = results["boxes"][keep]
+            results["scores"] = results["scores"][keep]
 
         kept: List[TrunkDetection] = []
         for box, score in zip(results["boxes"], results["scores"]):
