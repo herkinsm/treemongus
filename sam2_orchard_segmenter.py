@@ -1229,6 +1229,7 @@ def project_tracks_to_world(
     """
     from tqdm.auto import tqdm
 
+    n_skipped_no_gps = 0
     for track in tqdm(tracks, desc="World projection"):
         for det in track.detections:
             depth = loader.load_depth_m(det.frame_idx)
@@ -1236,6 +1237,9 @@ def project_tracks_to_world(
             if not math.isfinite(d_m):
                 continue
             meta = loader.load_meta(det.frame_idx)
+            if "gps_lat" not in meta or "gps_lon" not in meta:
+                n_skipped_no_gps += 1
+                continue
             wlat, wlon = camera_to_world(
                 gps_lat=float(meta["gps_lat"]),
                 gps_lon=float(meta["gps_lon"]),
@@ -1246,6 +1250,11 @@ def project_tracks_to_world(
             det.depth_m = d_m
             det.world_lat = wlat
             det.world_lon = wlon
+    if n_skipped_no_gps:
+        log.warning(
+            "World projection: skipped %d detections with no GPS fix",
+            n_skipped_no_gps,
+        )
     return tracks
 
 
@@ -1621,6 +1630,24 @@ def attribute_flowers_3d_nearest_tree(
 
     n_no_npz = n_no_gps = n_no_attribution = 0
     n_handled = 0
+    logged_first_path = False
+
+    # If <flower_masks_dir>/<flower_slug> doesn't exist but the masks
+    # dir has a sibling slug (e.g. "apple_blossom" instead of
+    # "flower"), pick that. analyze_days.py merges the
+    # --flower-multi-prompts list under the FIRST prompt's slug.
+    candidate_slugs = [flower_slug]
+    if flower_masks_dir.is_dir():
+        for sub in sorted(p.name for p in flower_masks_dir.iterdir()
+                          if p.is_dir()):
+            if sub != flower_slug and sub not in candidate_slugs:
+                candidate_slugs.append(sub)
+    else:
+        log.warning(
+            "Flower masks dir does not exist: %s "
+            "(3D attribution will be skipped)",
+            flower_masks_dir,
+        )
 
     for frame_idx, expected_total in flower_counts_by_frame.items():
         if expected_total <= 0:
@@ -1634,8 +1661,21 @@ def attribute_flowers_3d_nearest_tree(
         except Exception:
             n_no_npz += 1
             continue
-        npz_path = flower_masks_dir / flower_slug / rel
-        if not npz_path.is_file():
+        npz_path = None
+        for slug in candidate_slugs:
+            p = flower_masks_dir / slug / rel
+            if p.is_file():
+                npz_path = p
+                break
+        if not logged_first_path:
+            log.info(
+                "Flower 3D-attribution: looking under %s for %s "
+                "(slugs tried: %s) -> %s",
+                flower_masks_dir, rel, candidate_slugs,
+                "FOUND" if npz_path else "MISSING",
+            )
+            logged_first_path = True
+        if npz_path is None:
             n_no_npz += 1
             continue
 
