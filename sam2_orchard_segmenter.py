@@ -1561,6 +1561,193 @@ def attribute_flowers_via_roi(
     return totals
 
 
+def attribute_flowers_3d_nearest_tree(
+    clusters: List[TreeCluster],
+    loader: "FrameLoader",
+    dataset_root: Path,
+    flower_masks_dir: Path,
+    flower_slug: str,
+    flower_counts_by_frame: Dict[int, float],
+    cfg: SegmenterConfig,
+    max_assign_distance_m: float = 3.0,
+) -> Tuple[Dict[int, float], set]:
+    """Project each per-flower mask to world coords; assign to nearest tree.
+
+    For each frame:
+      1. Load ``<flower_masks_dir>/<slug>/<rel_path>.npz`` produced by
+         ``analyze_days.py --save-masks``.
+      2. For every flower mask, take the median depth inside that mask
+         and project the frame's GPS forward by that depth (same
+         projection ``project_tracks_to_world`` uses for trunks).
+      3. Find the cluster centroid closest by haversine distance,
+         capped at ``max_assign_distance_m``. If no cluster is within
+         range, the flower is left unattributed for that frame.
+      4. Scale the per-cluster integer hits by
+         ``flower_counts_by_frame[frame] / n_attributed`` so each
+         frame's CSV-reported total (e.g. ``est_flowers``) is
+         preserved while the *split* between trees is the 3D one.
+
+    Frames with no ``.npz``, no GPS, or zero attributable masks are
+    returned in *frames_unhandled* so the caller can run the
+    ROI-overlap path on them as a fallback.
+
+    Returns
+    -------
+    (totals, frames_handled)
+        ``totals`` is ``{tree_id: flower_count}`` aggregated across
+        successfully 3D-attributed frames. ``frames_handled`` is the
+        set of frame indices that the 3D path successfully attributed
+        — caller should skip these in the ROI fallback.
+    """
+    if not clusters:
+        return {}, set()
+
+    cluster_pos = [
+        (c.tree_id, c.world_lat, c.world_lon) for c in clusters
+    ]
+    totals: Dict[int, float] = {tid: 0.0 for tid, _, _ in cluster_pos}
+    frames_handled: set = set()
+
+    n_no_npz = n_no_gps = n_no_attribution = 0
+    n_handled = 0
+
+    for frame_idx, expected_total in flower_counts_by_frame.items():
+        if expected_total <= 0:
+            continue
+
+        # Locate the per-frame .npz of flower masks. analyze_days.py
+        # writes them at <out>/masks/<slug>/<rel-to-args.root>.npz.
+        try:
+            img_path = loader._imgs[frame_idx]  # type: ignore[attr-defined]
+            rel = img_path.relative_to(dataset_root).with_suffix(".npz")
+        except Exception:
+            n_no_npz += 1
+            continue
+        npz_path = flower_masks_dir / flower_slug / rel
+        if not npz_path.is_file():
+            n_no_npz += 1
+            continue
+
+        try:
+            data = np.load(npz_path)
+            masks = data["masks"]
+        except Exception:
+            n_no_npz += 1
+            continue
+        if masks.ndim != 3 or len(masks) == 0:
+            n_no_npz += 1
+            continue
+
+        meta = loader.load_meta(frame_idx)
+        if "gps_lat" not in meta or "gps_lon" not in meta:
+            n_no_gps += 1
+            continue
+        depth = loader.load_depth_m(frame_idx)
+        if depth is None or not np.isfinite(depth).any():
+            n_no_gps += 1
+            continue
+
+        per_cluster: Dict[int, int] = {tid: 0 for tid, _, _ in cluster_pos}
+        for m in masks:
+            m = np.asarray(m, dtype=bool)
+            if not m.any():
+                continue
+            d_pixels = depth[m]
+            d_pixels = d_pixels[np.isfinite(d_pixels) & (d_pixels > 0)]
+            if d_pixels.size == 0:
+                continue
+            d_m = float(np.median(d_pixels))
+            wlat, wlon = camera_to_world(
+                gps_lat=float(meta["gps_lat"]),
+                gps_lon=float(meta["gps_lon"]),
+                heading_deg=float(meta["heading_deg"]),
+                depth_m=d_m,
+                lateral_offset_m=cfg.camera_lateral_offset_m,
+            )
+            best_tid = None
+            best_d = max_assign_distance_m
+            for tid, clat, clon in cluster_pos:
+                d_to = haversine_m(wlat, wlon, clat, clon)
+                if d_to < best_d:
+                    best_d = d_to
+                    best_tid = tid
+            if best_tid is not None:
+                per_cluster[best_tid] += 1
+
+        n_attributed = sum(per_cluster.values())
+        if n_attributed == 0:
+            n_no_attribution += 1
+            continue
+
+        # Scale to match the CSV's per-frame total (e.g. est_flowers).
+        scale = float(expected_total) / float(n_attributed)
+        for tid, n in per_cluster.items():
+            if n:
+                totals[tid] += n * scale
+        frames_handled.add(frame_idx)
+        n_handled += 1
+
+    log.info(
+        "Flower 3D-attribution: %d frames handled, %d no-mask-file, "
+        "%d no-gps/depth, %d zero-in-range",
+        n_handled, n_no_npz, n_no_gps, n_no_attribution,
+    )
+    return totals, frames_handled
+
+
+def attribute_flowers(
+    clusters: List[TreeCluster],
+    attribution: Dict[int, List[Tuple[int, float]]],
+    flower_counts_by_frame: Dict[int, float],
+    roi_masks_by_frame: Dict[int, Optional[np.ndarray]],
+    loader: "FrameLoader",
+    cfg: SegmenterConfig,
+    dataset_root: Optional[Path] = None,
+    flower_masks_dir: Optional[Path] = None,
+    flower_slug: Optional[str] = None,
+    max_assign_distance_m: float = 3.0,
+    min_trunk_roi_overlap_px: int = 50,
+) -> Dict[int, float]:
+    """Assign flowers to trees: 3D nearest-tree first, ROI-overlap fallback.
+
+    The 3D path runs only when ``flower_masks_dir`` and ``flower_slug``
+    are provided AND per-frame mask .npz files exist. Frames the 3D
+    path can't handle (missing masks, missing GPS/depth, zero in-range)
+    fall through to :func:`attribute_flowers_via_roi`.
+
+    Mutates ``cluster.flower_count`` on every cluster and returns the
+    same ``{tree_id: total}`` dict.
+    """
+    totals_3d: Dict[int, float] = {}
+    frames_handled_3d: set = set()
+    if (flower_masks_dir is not None and flower_slug is not None
+            and dataset_root is not None):
+        totals_3d, frames_handled_3d = attribute_flowers_3d_nearest_tree(
+            clusters, loader, dataset_root, flower_masks_dir, flower_slug,
+            flower_counts_by_frame, cfg,
+            max_assign_distance_m=max_assign_distance_m,
+        )
+
+    # Run ROI fallback only on frames the 3D path didn't handle.
+    fallback_counts = {
+        f: n for f, n in flower_counts_by_frame.items()
+        if f not in frames_handled_3d
+    }
+    totals_roi = attribute_flowers_via_roi(
+        clusters, attribution, fallback_counts, roi_masks_by_frame,
+        min_trunk_roi_overlap_px=min_trunk_roi_overlap_px,
+    )
+
+    combined: Dict[int, float] = {c.tree_id: 0.0 for c in clusters}
+    for tid, n in totals_3d.items():
+        combined[tid] = combined.get(tid, 0.0) + n
+    for tid, n in totals_roi.items():
+        combined[tid] = combined.get(tid, 0.0) + n
+    for cluster in clusters:
+        cluster.flower_count = combined.get(cluster.tree_id, 0.0)
+    return combined
+
+
 def load_flower_counts_from_csv(
     csv_path: str,
     session: str,
@@ -1977,7 +2164,32 @@ def _run_one_session(
     attribution = attribute_frames(clusters, cfg)
 
     if flower_counts:
-        attribute_flowers_via_roi(clusters, attribution, flower_counts, roi_masks)
+        # Prefer 3D nearest-tree (per-flower mask centroid → world →
+        # nearest cluster). Fall back per-frame to ROI overlap when
+        # the mask .npz is missing or no flower projects in range.
+        flower_masks_dir = None
+        flower_slug = None
+        if getattr(args, "flower_masks_dir", None):
+            flower_masks_dir = Path(args.flower_masks_dir)
+        elif args.out:
+            candidate = Path(args.out) / "masks"
+            if candidate.is_dir():
+                flower_masks_dir = candidate
+        if flower_masks_dir is not None:
+            import re as _re
+            flower_slug = _re.sub(
+                r"[^a-z0-9]+", "_", args.flower_prompt.lower(),
+            ).strip("_")
+        attribute_flowers(
+            clusters, attribution, flower_counts, roi_masks,
+            loader=loader, cfg=cfg,
+            dataset_root=Path(args.root),
+            flower_masks_dir=flower_masks_dir,
+            flower_slug=flower_slug,
+            max_assign_distance_m=getattr(
+                args, "flower_max_assign_distance_m", 3.0,
+            ),
+        )
 
     if not args.no_contact_sheets:
         build_contact_sheets(clusters, loader, str(out_root / "contact_sheets"), cfg)
@@ -2037,6 +2249,19 @@ def _main() -> None:
     parser.add_argument("--flower-count-col", type=str, default="est_flowers",
                         choices=["est_flowers", "n_detections"],
                         help="Count column to use (default: est_flowers).")
+    parser.add_argument("--flower-masks-dir", type=str, default=None,
+                        help="Directory containing per-frame flower mask "
+                             ".npz files written by analyze_days.py "
+                             "--save-masks. Defaults to <out>/masks if that "
+                             "directory exists. Enables 3D nearest-tree "
+                             "flower attribution; when missing, the pipeline "
+                             "falls back to PRGB-ROI overlap only.")
+    parser.add_argument("--flower-max-assign-distance-m", type=float,
+                        default=3.0,
+                        help="Max metres between a flower's projected world "
+                             "coord and a tree's centroid for the 3D "
+                             "attribution path (default 3.0). Frames with no "
+                             "flower in range fall back to ROI overlap.")
     parser.add_argument("--frame-range", type=int, nargs=2,
                         default=None, metavar=("START", "STOP"),
                         help="Process only frames [START, STOP) — use the same "
@@ -2111,6 +2336,8 @@ __all__ = [
     "sanity_check_spacing",
     "attribute_frames",
     "attribute_flowers_via_roi",
+    "attribute_flowers_3d_nearest_tree",
+    "attribute_flowers",
     "load_flower_counts_from_csv",
     "build_contact_sheets",
     "populate_tree_tracker",
