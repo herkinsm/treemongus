@@ -443,7 +443,13 @@ class All2023FrameLoader(FrameLoader):
         try:
             from analyze_days import extract_roi_mask
         except ImportError:
-            log.warning("analyze_days not importable; ROI masks unavailable")
+            if not getattr(self, "_warned_roi_import", False):
+                log.warning(
+                    "analyze_days not importable; ROI masks unavailable "
+                    "(3D nearest-tree attribution still works; only the "
+                    "ROI-overlap fallback is disabled)",
+                )
+                self._warned_roi_import = True
             return None
         base = self._base_stem(self._imgs[frame_idx])
         prgb_path = self._prgb_dir / f"{base}-RGB-PP.bmp"
@@ -549,19 +555,24 @@ class All2023FrameLoader(FrameLoader):
         if "gps_lat" not in meta and not getattr(
             self, "_warned_no_gps_match", False,
         ):
-            # Show every GPS-related line in this sidecar so we can
-            # see what format it actually uses. Only logged once
-            # per session.
             gps_lines = [
                 ln for ln in content.splitlines()
                 if "gps" in ln.lower() or "nmea" in ln.lower()
                 or ln.strip().startswith("$")
             ]
-            log.warning(
-                "GPS regex did not match in %s. GPS-related lines: %r",
-                txt.name,
-                gps_lines[:5],
+            # An empty "GPS Code (NMEA format): , " line means the
+            # GPS hadn't locked yet -- not a parser bug, just no
+            # data. Suppress the warning in that case.
+            empty_gps = any(
+                _re.search(r"GPS Code \(NMEA format\):\s*,?\s*$", ln)
+                for ln in gps_lines
             )
+            if not empty_gps:
+                log.warning(
+                    "GPS regex did not match in %s. GPS-related lines: %r",
+                    txt.name,
+                    gps_lines[:5],
+                )
             self._warned_no_gps_match = True
 
         # Travel Speed: 3 mph
