@@ -392,9 +392,6 @@ class All2023FrameLoader(FrameLoader):
             p for p in self._rgb_dir.iterdir()
             if p.suffix.lower() in {".bmp", ".jpg", ".png"}
         )
-        if frame_range is not None:
-            a, b = frame_range
-            all_imgs = all_imgs[max(0, a): b]
 
         if require_all_modalities:
             kept: List[Path] = []
@@ -428,6 +425,13 @@ class All2023FrameLoader(FrameLoader):
                     n_drop_depth, n_drop_prgb, n_drop_info,
                 )
             all_imgs = kept
+
+        # Slice AFTER modality filtering so --frame-range 1 100 means
+        # "the first 100 fully-modal frames in timestamp order", not
+        # "frames 1-100 of which some may be dropped".
+        if frame_range is not None:
+            a, b = frame_range
+            all_imgs = all_imgs[max(0, a): b]
 
         self._imgs = all_imgs
 
