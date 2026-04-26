@@ -120,7 +120,9 @@ def make_overlay(img: Image.Image, masks: np.ndarray, boxes: np.ndarray | None,
                  title: str | None = None,
                  track_ids: list[int] | None = None,
                  tile_rects: list[tuple[int, int, int, int]] | None = None,
-                 roi_mask: np.ndarray | None = None) -> Image.Image:
+                 roi_mask: np.ndarray | None = None,
+                 mask_color: tuple[float, float, float, float] | None = None,
+                 count_label: str | None = None) -> Image.Image:
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
 
@@ -131,13 +133,21 @@ def make_overlay(img: Image.Image, masks: np.ndarray, boxes: np.ndarray | None,
         roi_rgba[roi_mask] = [1.0, 1.0, 0.0, 0.10]  # faint yellow wash
         ax.imshow(roi_rgba)
     if masks is not None and len(masks) > 0:
-        rng = np.random.default_rng(0)
-        for m in masks:
-            color = np.concatenate([rng.random(3), [0.45]])
-            h, w = m.shape[-2:]
-            rgba = np.zeros((h, w, 4))
-            rgba[m.astype(bool)] = color
-            ax.imshow(rgba)
+        if mask_color is not None:
+            color = np.asarray(mask_color, dtype=np.float32)
+            for m in masks:
+                h, w = m.shape[-2:]
+                rgba = np.zeros((h, w, 4))
+                rgba[m.astype(bool)] = color
+                ax.imshow(rgba)
+        else:
+            rng = np.random.default_rng(0)
+            for m in masks:
+                rcol = np.concatenate([rng.random(3), [0.45]])
+                h, w = m.shape[-2:]
+                rgba = np.zeros((h, w, 4))
+                rgba[m.astype(bool)] = rcol
+                ax.imshow(rgba)
     if tile_rects:
         for (tx, ty, tw, th) in tile_rects:
             ax.add_patch(Rectangle((tx, ty), tw, th, fill=False,
@@ -157,6 +167,14 @@ def make_overlay(img: Image.Image, masks: np.ndarray, boxes: np.ndarray | None,
                                   edgecolor="none", pad=1))
     if title:
         ax.set_title(title, fontsize=10)
+    if count_label:
+        # Big count badge in the top-left of the IMAGE (not the figure).
+        ax.text(8, 22, count_label,
+                color="white", fontsize=18, fontweight="bold",
+                family="sans-serif",
+                bbox=dict(facecolor="deeppink", alpha=0.9,
+                          edgecolor="white", linewidth=1.5,
+                          boxstyle="round,pad=0.4"))
     ax.axis("off")
     fig.canvas.draw()
     # matplotlib >=3.10 removed tostring_rgb(); use buffer_rgba() and drop A.
@@ -1861,12 +1879,22 @@ def main():
                         roi_mask_for_overlay = (
                             roi_mask_img if args.show_roi else None
                         )
+                        # Pink mask paint + top-left count badge for flower
+                        # prompts; other prompts keep random colors and the
+                        # default title-only label.
+                        overlay_mask_color = None
+                        overlay_count_label = None
+                        if is_flower_prompt:
+                            overlay_mask_color = (1.0, 0.412, 0.706, 0.5)  # hot pink, 50% alpha
+                            overlay_count_label = f"Flowers: {n}"
                         overlay = make_overlay(
                             img, masks_np, boxes_np,
                             title=f"{prompt} (n={n})",
                             track_ids=track_ids if track_ids else None,
                             tile_rects=tile_rects_for_overlay,
                             roi_mask=roi_mask_for_overlay,
+                            mask_color=overlay_mask_color,
+                            count_label=overlay_count_label,
                         )
                         overlay.save(op, quality=85)
 
