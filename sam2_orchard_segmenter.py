@@ -465,9 +465,34 @@ class All2023FrameLoader(FrameLoader):
     def _parse_sidecar(self, img_path: Path) -> Dict:
         import re as _re
         base = self._base_stem(img_path)
-        txt = self._session_dir / "Info" / f"{base}.txt"
+        # Try a few common layouts: <Info>/<base>.txt, then with -RGB-BP suffix
+        # restored, then in the session root, then a glob over Info/.
+        info_dir = self._session_dir / "Info"
+        candidates = [
+            info_dir / f"{base}.txt",
+            info_dir / f"{base}-RGB-BP.txt",
+            info_dir / f"{base}-RGB.txt",
+            info_dir / f"{base}-Info.txt",
+            self._session_dir / f"{base}.txt",
+        ]
+        txt = next((p for p in candidates if p.is_file()), None)
+        if txt is None and info_dir.is_dir():
+            for p in info_dir.glob(f"{base}*.txt"):
+                txt = p
+                break
+
         meta: Dict = {}
-        if not txt.is_file():
+        if txt is None:
+            if not getattr(self, "_warned_missing_sidecar", False):
+                log.warning(
+                    "No sidecar .txt found for %s. Tried: %s. "
+                    "Info dir contents: %s",
+                    img_path.name,
+                    [str(c.relative_to(self._session_dir)) for c in candidates],
+                    sorted(p.name for p in info_dir.glob("*.txt"))[:5]
+                    if info_dir.is_dir() else "<no Info/ dir>",
+                )
+                self._warned_missing_sidecar = True
             return meta
 
         content = txt.read_text(errors="replace")
@@ -520,6 +545,24 @@ class All2023FrameLoader(FrameLoader):
                         lon = -lon
                     meta["gps_lat"] = lat
                     meta["gps_lon"] = lon
+
+        if "gps_lat" not in meta and not getattr(
+            self, "_warned_no_gps_match", False,
+        ):
+            # Show every GPS-related line in this sidecar so we can
+            # see what format it actually uses. Only logged once
+            # per session.
+            gps_lines = [
+                ln for ln in content.splitlines()
+                if "gps" in ln.lower() or "nmea" in ln.lower()
+                or ln.strip().startswith("$")
+            ]
+            log.warning(
+                "GPS regex did not match in %s. GPS-related lines: %r",
+                txt.name,
+                gps_lines[:5],
+            )
+            self._warned_no_gps_match = True
 
         # Travel Speed: 3 mph
         spd = _re.search(r"Travel Speed:\s*([\d.]+)\s*mph", content)
@@ -961,33 +1004,41 @@ def _propagate_image_mode(
             continue
 
         if backend == "sam3":
+            import torch as _torch
             pil_img = Image.fromarray(rgb)
-            state = sam3_processor.set_image(pil_img)
-            for det in dets:
-                sam3_processor.reset_all_prompts(state)
-                norm_box = _xyxy_to_norm_cxcywh(det.bbox_xyxy, h, w)
-                state = sam3_processor.add_geometric_prompt(
-                    box=norm_box, label=True, state=state,
-                )
-                m, sam3_score = _pick_sam3_mask(state, det.bbox_xyxy, h, w)
-                if m is None or not m.any():
-                    # SAM 3 returned nothing usable -- fall back to
-                    # the bbox as a rectangle mask for this detection.
-                    m = _bbox_mask(det.bbox_xyxy, h, w)
-                    if not m.any():
-                        continue
-                    sam3_score = 1.0
-                track = TrunkTrack(track_id=next_track_id)
-                next_track_id += 1
-                refined_det = TrunkDetection(
-                    frame_idx=frame_idx,
-                    bbox_xyxy=det.bbox_xyxy,
-                    score=det.score * sam3_score,
-                    mask=m.astype(bool),
-                    track_id=track.track_id,
-                )
-                track.detections.append(refined_det)
-                tracks.append(track)
+            ac_dtype = (
+                _torch.bfloat16 if device.startswith("cuda") else _torch.float32
+            )
+            with _torch.autocast(
+                "cuda" if device.startswith("cuda") else "cpu",
+                dtype=ac_dtype,
+            ):
+                state = sam3_processor.set_image(pil_img)
+                for det in dets:
+                    sam3_processor.reset_all_prompts(state)
+                    norm_box = _xyxy_to_norm_cxcywh(det.bbox_xyxy, h, w)
+                    state = sam3_processor.add_geometric_prompt(
+                        box=norm_box, label=True, state=state,
+                    )
+                    m, sam3_score = _pick_sam3_mask(
+                        state, det.bbox_xyxy, h, w,
+                    )
+                    if m is None or not m.any():
+                        m = _bbox_mask(det.bbox_xyxy, h, w)
+                        if not m.any():
+                            continue
+                        sam3_score = 1.0
+                    track = TrunkTrack(track_id=next_track_id)
+                    next_track_id += 1
+                    refined_det = TrunkDetection(
+                        frame_idx=frame_idx,
+                        bbox_xyxy=det.bbox_xyxy,
+                        score=det.score * sam3_score,
+                        mask=m.astype(bool),
+                        track_id=track.track_id,
+                    )
+                    track.detections.append(refined_det)
+                    tracks.append(track)
             continue
 
         # SAM 2 path
