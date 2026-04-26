@@ -1851,6 +1851,8 @@ def _main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    # PIL logs every PNG chunk at DEBUG — suppress it regardless of -v.
+    logging.getLogger("PIL").setLevel(logging.WARNING)
 
     cfg = SegmenterConfig(
         gdino_model_id=args.gdino_model,
