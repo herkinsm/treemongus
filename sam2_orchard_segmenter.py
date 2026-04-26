@@ -379,12 +379,14 @@ class All2023FrameLoader(FrameLoader):
         session_dir: str,
         row_heading_deg: Optional[float] = None,
         frame_range: Optional[Tuple[int, int]] = None,
+        require_all_modalities: bool = True,
     ):
         import re as _re
         self._session_dir = Path(session_dir)
         self._rgb_dir = self._session_dir / "RGB"
         self._depth_dir = self._session_dir / "depth"
         self._prgb_dir = self._session_dir / "PRGB"
+        self._info_dir = self._session_dir / "Info"
 
         all_imgs = sorted(
             p for p in self._rgb_dir.iterdir()
@@ -393,6 +395,40 @@ class All2023FrameLoader(FrameLoader):
         if frame_range is not None:
             a, b = frame_range
             all_imgs = all_imgs[max(0, a): b]
+
+        if require_all_modalities:
+            kept: List[Path] = []
+            n_drop_depth = n_drop_prgb = n_drop_info = 0
+            for p in all_imgs:
+                base = self._base_stem(p)
+                has_depth = (
+                    (self._depth_dir / f"{base}-Depth.txt").is_file()
+                    or (self._depth_dir / f"{base}-Depth.bmp").is_file()
+                )
+                has_prgb = (
+                    self._prgb_dir / f"{base}-RGB-PP.bmp"
+                ).is_file()
+                has_info = (
+                    self._info_dir.is_dir()
+                    and any(self._info_dir.glob(f"{base}*.txt"))
+                )
+                if not has_depth:
+                    n_drop_depth += 1; continue
+                if not has_prgb:
+                    n_drop_prgb += 1; continue
+                if not has_info:
+                    n_drop_info += 1; continue
+                kept.append(p)
+            n_dropped = len(all_imgs) - len(kept)
+            if n_dropped:
+                log.info(
+                    "All2023FrameLoader: dropped %d/%d frames lacking "
+                    "modalities (no-depth=%d no-prgb=%d no-info=%d)",
+                    n_dropped, len(all_imgs),
+                    n_drop_depth, n_drop_prgb, n_drop_info,
+                )
+            all_imgs = kept
+
         self._imgs = all_imgs
 
         # Parse every sidecar up front (fast — small text files).
@@ -2262,6 +2298,9 @@ def _run_one_session(
         str(session_dir),
         row_heading_deg=getattr(args, "row_heading_deg", None),
         frame_range=frame_range,
+        require_all_modalities=not getattr(
+            args, "allow_missing_modalities", False,
+        ),
     )
     if len(loader) == 0:
         log.warning("Session %s: no frames found, skipping", session_name)
@@ -2419,6 +2458,12 @@ def _main() -> None:
                              "trunk in a frame projects to the same point and "
                              "the same tree smears along the row as the "
                              "camera passes by. RealSense D435 RGB is ~69°.")
+    parser.add_argument("--allow-missing-modalities", action="store_true",
+                        help="By default the loader drops any frame missing "
+                             "depth, PRGB, or Info — mirrors analyze_days.py "
+                             "--require-all-modalities --skip-no-roi. Set "
+                             "this flag to keep partial frames and let "
+                             "downstream stages handle missing data.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no-contact-sheets", action="store_true")
     parser.add_argument("--gdino-model", type=str,
