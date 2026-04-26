@@ -440,7 +440,7 @@ class All2023FrameLoader(FrameLoader):
     def _parse_sidecar(self, img_path: Path) -> Dict:
         import re as _re
         base = self._base_stem(img_path)
-        txt = self._session_dir / f"{base}.txt"
+        txt = self._session_dir / "Info" / f"{base}.txt"
         meta: Dict = {}
         if not txt.is_file():
             return meta
