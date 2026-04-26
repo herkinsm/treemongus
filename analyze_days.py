@@ -1879,22 +1879,26 @@ def main():
                         roi_mask_for_overlay = (
                             roi_mask_img if args.show_roi else None
                         )
-                        # Pink mask paint + top-left count badge for flower
-                        # prompts; other prompts keep random colors and the
-                        # default title-only label.
+                        # For flower overlays: pink masks only — strip the
+                        # green bboxes, track-id labels, and the corner count
+                        # badge so the user can visually verify segmentation
+                        # without anything occluding the flowers. Count
+                        # remains visible via the matplotlib title.
                         overlay_mask_color = None
-                        overlay_count_label = None
+                        overlay_boxes = boxes_np
+                        overlay_track_ids = track_ids if track_ids else None
                         if is_flower_prompt:
                             overlay_mask_color = (1.0, 0.412, 0.706, 0.5)  # hot pink, 50% alpha
-                            overlay_count_label = f"Flowers: {n}"
+                            overlay_boxes = None
+                            overlay_track_ids = None
                         overlay = make_overlay(
-                            img, masks_np, boxes_np,
+                            img, masks_np, overlay_boxes,
                             title=f"{prompt} (n={n})",
-                            track_ids=track_ids if track_ids else None,
+                            track_ids=overlay_track_ids,
                             tile_rects=tile_rects_for_overlay,
                             roi_mask=roi_mask_for_overlay,
                             mask_color=overlay_mask_color,
-                            count_label=overlay_count_label,
+                            count_label=None,
                         )
                         overlay.save(op, quality=85)
 
