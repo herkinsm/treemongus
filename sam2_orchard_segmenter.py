@@ -1278,16 +1278,28 @@ def _world_to_local_xy(
     return np.stack([x, y], axis=1)
 
 
-def _estimate_dbscan_eps(xy: np.ndarray, min_samples: int) -> float:
+def _estimate_dbscan_eps(
+    xy: np.ndarray,
+    min_samples: int,
+    max_eps_m: float = 1.0,
+    min_eps_m: float = 0.3,
+) -> float:
     """Auto-estimate DBSCAN eps from the k-distance graph elbow.
 
     Sorts every detection by its distance to its ``min_samples``-th
     nearest neighbour. The resulting curve has a sharp elbow where
-    within-tree jitter ends and between-tree gaps begin. The elbow
-    (largest jump in the sorted distances) is the natural eps.
+    within-tree jitter ends and between-tree gaps begin.
 
-    This adapts to whatever spacing the orchard actually has — no
-    tree_spacing_m parameter needed.
+    eps sits just above the within-tree side of the elbow (the
+    *lower* end of the jump, plus a small safety margin) — putting
+    it at the midpoint risks bridging two adjacent trees when the
+    jump is wide. Result is then clamped to
+    ``[min_eps_m, max_eps_m]`` to guard against pathological
+    distance distributions.
+
+    Apple orchards typically plant trees 1–3 m apart, so capping
+    eps at 1.0 m by default keeps neighbours from being merged
+    even when the elbow heuristic mis-fires.
     """
     from sklearn.neighbors import NearestNeighbors
 
@@ -1296,17 +1308,20 @@ def _estimate_dbscan_eps(xy: np.ndarray, min_samples: int) -> float:
     distances, _ = nbrs.kneighbors(xy)
     k_dist = np.sort(distances[:, -1])
 
-    # Largest jump in the sorted k-distance curve = elbow.
     diffs = np.diff(k_dist)
     elbow = int(np.argmax(diffs))
-    # eps sits at the midpoint of the jump so it falls cleanly between
-    # the two populations (within-tree vs between-tree distances).
-    eps = float((k_dist[elbow] + k_dist[elbow + 1]) / 2.0)
+    # Sit just above the within-tree side of the elbow. The 1.15
+    # multiplier gives ~15% headroom to absorb noise without
+    # pushing eps into the inter-tree gap.
+    eps_raw = float(k_dist[elbow]) * 1.15
+    eps = float(np.clip(eps_raw, min_eps_m, max_eps_m))
 
     log.info(
-        "Auto-estimated DBSCAN eps=%.2f m from k-distance elbow "
-        "(k=%d, %d detections, jump %.2f→%.2f m)",
-        eps, k, len(xy), k_dist[elbow], k_dist[elbow + 1],
+        "Auto-estimated DBSCAN eps=%.2f m (raw %.2f, clamped to "
+        "[%.2f, %.2f]) from k-distance elbow (k=%d, %d detections, "
+        "jump %.2f→%.2f m)",
+        eps, eps_raw, min_eps_m, max_eps_m, k, len(xy),
+        k_dist[elbow], k_dist[elbow + 1],
     )
     return eps
 
@@ -1802,20 +1817,25 @@ def attribute_flowers(
 def load_flower_counts_from_csv(
     csv_path: str,
     session: str,
+    loader: "FrameLoader",
     prompt: str = "apple blossom",
     count_col: str = "est_flowers",
 ) -> Dict[int, float]:
-    """Parse ``analyze_days.py``'s ``results.csv`` into ``{frame_idx: n}``.
+    """Parse ``analyze_days.py``'s ``results.csv`` into ``{loader_frame_idx: n}``.
 
-    ``frame_idx`` is inferred by stripping non-digits from the image
-    filename stem (e.g. ``20230504_143201-RGB-BP.bmp`` has no leading
-    digits, but ``000042.bmp`` → 42). If your filenames embed the index
-    differently, build the dict manually instead.
+    Keys are the loader's *internal* frame indices (0..N-1 for the
+    --frame-range slice the loader was constructed with), matching
+    what ``loader.frame_indices()`` returns. The CSV's ``image``
+    column holds the absolute path written by analyze_days.py; we
+    map it back to the loader index by image filename stem.
 
     Parameters
     ----------
     session
         The session folder name to filter on (``session`` column in the CSV).
+    loader
+        The frame loader for this session — needed to resolve image
+        stems back to loader-internal frame indices.
     prompt
         The SAM 3 prompt to sum over (default ``"apple blossom"``).
     count_col
@@ -1823,9 +1843,13 @@ def load_flower_counts_from_csv(
         or ``"n_detections"`` (raw SAM 3 detections after quality filter).
     """
     import csv as _csv
-    import re as _re
+
+    stem_to_idx: Dict[str, int] = {
+        p.stem: i for i, p in enumerate(getattr(loader, "_imgs", []))
+    }
 
     counts: Dict[int, float] = {}
+    n_unmatched = 0
     with open(csv_path, newline="", encoding="utf-8") as fh:
         for row in _csv.DictReader(fh):
             if row.get("session") != session:
@@ -1833,11 +1857,20 @@ def load_flower_counts_from_csv(
             if row.get("prompt") != prompt:
                 continue
             stem = Path(row["image"]).stem
-            digits = _re.sub(r"\D", "", stem)
-            if not digits:
+            frame_idx = stem_to_idx.get(stem)
+            if frame_idx is None:
+                n_unmatched += 1
                 continue
-            frame_idx = int(digits)
-            counts[frame_idx] = counts.get(frame_idx, 0.0) + float(row.get(count_col) or 0)
+            counts[frame_idx] = (
+                counts.get(frame_idx, 0.0)
+                + float(row.get(count_col) or 0)
+            )
+    if n_unmatched:
+        log.debug(
+            "Flower CSV: %d rows for session %s had image stems not "
+            "in the loader's frame slice (frame-range mismatch)",
+            n_unmatched, session,
+        )
     return counts
 
 
@@ -2193,6 +2226,7 @@ def _run_one_session(
         flower_counts = load_flower_counts_from_csv(
             args.flower_csv,
             session=session_name,
+            loader=loader,
             prompt=args.flower_prompt,
             count_col=args.flower_count_col,
         )
