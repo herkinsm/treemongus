@@ -307,6 +307,194 @@ class FrameLoader:
         return None
 
 
+class All2023FrameLoader(FrameLoader):
+    """FrameLoader for the All2023 orchard dataset layout.
+
+    Reads the native session directory produced by the sprayer pipeline —
+    no frame extraction needed. Directory structure expected::
+
+        <session_dir>/
+            RGB/<timestamp>-RGB-BP.bmp     uint8 RGB
+            depth/<timestamp>-Depth.bmp    16-bit depth in mm
+            PRGB/<timestamp>-RGB-PP.bmp    sprayer ROI overlay
+            <timestamp>.txt                GPS + metadata sidecar
+
+    GPS is parsed from the NMEA line in each sidecar .txt file.
+    Row heading is estimated from the GPS trail of the full session
+    (bearing from first to last valid GPS fix) unless you override it
+    with ``row_heading_deg``. For a straight orchard row the GPS-trail
+    estimate is reliable to ±5°, which is enough for DBSCAN clustering.
+
+    Parameters
+    ----------
+    session_dir
+        Path to one session folder (the one that contains RGB/, depth/, PRGB/).
+    row_heading_deg
+        Compass bearing (0 = north, 90 = east) of the orchard row. When
+        None (default) the heading is estimated from the GPS trail.
+    frame_range
+        Optional (start, stop) frame indices (0-based, stop exclusive) to
+        match the ``--frame-range`` used in analyze_days.py.
+    """
+
+    _DEPTH_MM_TO_M: float = 1e-3   # RealSense stores depth as uint16 mm
+
+    def __init__(
+        self,
+        session_dir: str,
+        row_heading_deg: Optional[float] = None,
+        frame_range: Optional[Tuple[int, int]] = None,
+    ):
+        import re as _re
+        self._session_dir = Path(session_dir)
+        self._rgb_dir = self._session_dir / "RGB"
+        self._depth_dir = self._session_dir / "depth"
+        self._prgb_dir = self._session_dir / "PRGB"
+
+        all_imgs = sorted(
+            p for p in self._rgb_dir.iterdir()
+            if p.suffix.lower() in {".bmp", ".jpg", ".png"}
+        )
+        if frame_range is not None:
+            a, b = frame_range
+            all_imgs = all_imgs[max(0, a): b]
+        self._imgs = all_imgs
+
+        # Parse every sidecar up front (fast — small text files).
+        self._sidecars: List[Dict] = [
+            self._parse_sidecar(p) for p in self._imgs
+        ]
+
+        if row_heading_deg is not None:
+            self._heading = float(row_heading_deg)
+        else:
+            self._heading = self._estimate_heading()
+
+        log.info(
+            "All2023FrameLoader: %d frames in '%s', heading=%.1f°",
+            len(self._imgs), self._session_dir.name, self._heading,
+        )
+
+    # ── FrameLoader interface ────────────────────────────────────────
+
+    def __len__(self) -> int:
+        return len(self._imgs)
+
+    def frame_indices(self) -> List[int]:
+        return list(range(len(self._imgs)))
+
+    def load_rgb(self, frame_idx: int) -> np.ndarray:
+        import cv2
+        path = self._imgs[frame_idx]
+        bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"Missing RGB: {path}")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    def load_depth_m(self, frame_idx: int) -> np.ndarray:
+        import cv2
+        base = self._base_stem(self._imgs[frame_idx])
+        bmp = self._depth_dir / f"{base}-Depth.bmp"
+        if bmp.is_file():
+            raw = cv2.imread(str(bmp), cv2.IMREAD_ANYDEPTH)
+            if raw is not None:
+                return raw.astype(np.float32) * self._DEPTH_MM_TO_M
+        txt = self._depth_dir / f"{base}-Depth.txt"
+        if txt.is_file():
+            return np.loadtxt(str(txt), dtype=np.float32) * self._DEPTH_MM_TO_M
+        # Missing depth → all NaN; projection skips this frame gracefully.
+        h, w = self.load_rgb(frame_idx).shape[:2]
+        log.warning("No depth file for frame %d (%s)", frame_idx, base)
+        return np.full((h, w), float("nan"), dtype=np.float32)
+
+    def load_meta(self, frame_idx: int) -> Dict:
+        m = dict(self._sidecars[frame_idx])
+        m.setdefault("heading_deg", self._heading)
+        m.setdefault("estimated_lai", 0.0)
+        m.setdefault("timestamp", float(frame_idx))
+        return m
+
+    def load_roi_mask(self, frame_idx: int) -> Optional[np.ndarray]:
+        try:
+            from analyze_days import extract_roi_mask
+        except ImportError:
+            log.warning("analyze_days not importable; ROI masks unavailable")
+            return None
+        base = self._base_stem(self._imgs[frame_idx])
+        prgb_path = self._prgb_dir / f"{base}-RGB-PP.bmp"
+        rgb = self.load_rgb(frame_idx)
+        h, w = rgb.shape[:2]
+        return extract_roi_mask(prgb_path, (h, w))
+
+    # ── Internals ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _base_stem(img_path: Path) -> str:
+        """Strip the -RGB-BP suffix (and variants) from the image stem."""
+        stem = img_path.stem
+        for sfx in ("-RGB-BP", "-RGB-bp", "-RGB", "-rgb"):
+            if stem.endswith(sfx):
+                return stem[: -len(sfx)]
+        return stem
+
+    def _parse_sidecar(self, img_path: Path) -> Dict:
+        import re as _re
+        base = self._base_stem(img_path)
+        txt = self._session_dir / f"{base}.txt"
+        meta: Dict = {}
+        if not txt.is_file():
+            return meta
+
+        content = txt.read_text(errors="replace")
+
+        # GPS Code (NMEA format): N 4044.17959, W 08154.19095
+        gps_m = _re.search(
+            r"GPS Code \(NMEA format\):\s*([NS])\s+([\d.]+),\s*([EW])\s+([\d.]+)",
+            content,
+        )
+        if gps_m:
+            hN, lat_v, hE, lon_v = gps_m.groups()
+            lat_deg = int(float(lat_v) / 100)
+            lat = lat_deg + (float(lat_v) - lat_deg * 100) / 60.0
+            if hN == "S":
+                lat = -lat
+            lon_deg = int(float(lon_v) / 100)
+            lon = lon_deg + (float(lon_v) - lon_deg * 100) / 60.0
+            if hE == "W":
+                lon = -lon
+            meta["gps_lat"] = lat
+            meta["gps_lon"] = lon
+
+        # Travel Speed: 3 mph
+        spd = _re.search(r"Travel Speed:\s*([\d.]+)\s*mph", content)
+        if spd:
+            meta["travel_speed_mph"] = float(spd.group(1))
+
+        # Capture Time: 204  (ms since some epoch; convert to seconds)
+        ct = _re.search(r"Capture Time:\s*(\d+)", content)
+        if ct:
+            meta["timestamp"] = int(ct.group(1)) / 1000.0
+
+        return meta
+
+    def _estimate_heading(self) -> float:
+        """Compute the compass bearing from the first to last GPS fix."""
+        lats = [m["gps_lat"] for m in self._sidecars if "gps_lat" in m]
+        lons = [m["gps_lon"] for m in self._sidecars if "gps_lon" in m]
+        if len(lats) < 2:
+            log.warning("Too few GPS fixes to estimate heading; defaulting to 0°")
+            return 0.0
+        lat1, lon1 = math.radians(lats[0]), math.radians(lons[0])
+        lat2, lon2 = math.radians(lats[-1]), math.radians(lons[-1])
+        dlon = lon2 - lon1
+        x = math.sin(dlon) * math.cos(lat2)
+        y = (math.cos(lat1) * math.sin(lat2)
+             - math.sin(lat1) * math.cos(lat2) * math.cos(dlon))
+        bearing = math.degrees(math.atan2(x, y)) % 360.0
+        log.info("GPS-trail heading estimate: %.1f°", bearing)
+        return bearing
+
+
 class PNGSequenceLoader(FrameLoader):
     """Standard layout: frames extracted to ``rgb/{idx:06d}.png`` etc.
 
@@ -1412,7 +1600,23 @@ def _main() -> None:
         description="Trunk-anchored orchard tree segmentation",
     )
     parser.add_argument("run_root", type=str,
-                        help="Run directory with rgb/, depth/, meta.json")
+                        help="Session or run directory (see --loader).")
+    parser.add_argument("--loader", choices=["png_sequence", "all2023"],
+                        default="png_sequence",
+                        help="Data layout: 'png_sequence' (default) expects "
+                             "rgb/000000.png + depth/000000.npy + meta.json; "
+                             "'all2023' reads the native All2023 session layout "
+                             "(RGB/<ts>-RGB-BP.bmp, depth/<ts>-Depth.bmp, "
+                             "PRGB/<ts>-RGB-PP.bmp, <ts>.txt sidecars).")
+    parser.add_argument("--row-heading-deg", type=float, default=None,
+                        help="Compass bearing of the orchard row (0=N, 90=E). "
+                             "Used by --loader all2023. Auto-estimated from the "
+                             "GPS trail when omitted.")
+    parser.add_argument("--frame-range", type=int, nargs=2,
+                        default=None, metavar=("START", "STOP"),
+                        help="Process only frames [START, STOP) — matches the "
+                             "--frame-range used in analyze_days.py so the same "
+                             "frames are analysed by both tools.")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--tree-spacing-m", type=float, default=3.0)
     parser.add_argument("--device", type=str, default="cuda")
@@ -1451,6 +1655,17 @@ def _main() -> None:
         tree_spacing_m=args.tree_spacing_m,
     )
 
+    # Build the appropriate loader.
+    frame_range = tuple(args.frame_range) if args.frame_range else None
+    if args.loader == "all2023":
+        loader = All2023FrameLoader(
+            args.run_root,
+            row_heading_deg=args.row_heading_deg,
+            frame_range=frame_range,
+        )
+    else:
+        loader = PNGSequenceLoader(args.run_root)
+
     flower_counts = None
     if args.flower_csv:
         if not args.flower_session:
@@ -1464,14 +1679,54 @@ def _main() -> None:
         log.info("Loaded flower counts for %d frames from %s",
                  len(flower_counts), args.flower_csv)
 
-    clusters, _ = process_run(
-        run_root=args.run_root,
-        cfg=cfg,
-        output_dir=args.output_dir,
-        device=args.device,
-        write_contact_sheets=not args.no_contact_sheets,
-        flower_counts_by_frame=flower_counts,
-    )
+    # ROI masks come from the loader's load_roi_mask() — All2023FrameLoader
+    # implements this using analyze_days.extract_roi_mask(); PNGSequenceLoader
+    # returns None by default (no PRGB available in that layout).
+    roi_masks = None
+    if flower_counts:
+        roi_masks = {
+            fid: loader.load_roi_mask(fid)
+            for fid in loader.frame_indices()
+        }
+
+    # Run the pipeline directly with the pre-built loader instead of
+    # going through process_run (which always constructs a PNGSequenceLoader).
+    out_root = Path(args.output_dir or (Path(args.run_root) / "sam2_segmenter_out"))
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    detections = detect_trunks_grounding_dino(loader, cfg, device=args.device)
+    tracks = propagate_with_sam2(loader, detections, cfg, device=args.device)
+    tracks = project_tracks_to_world(tracks, loader, cfg)
+    clusters = cluster_to_trees(tracks, cfg)
+    clusters = sanity_check_spacing(clusters, cfg)
+    attribution = attribute_frames(clusters, cfg)
+
+    if flower_counts:
+        attribute_flowers_via_roi(clusters, attribution, flower_counts, roi_masks)
+
+    if not args.no_contact_sheets:
+        build_contact_sheets(clusters, loader, str(out_root / "contact_sheets"), cfg)
+
+    import json as _json
+    summary = {
+        "n_trees": len(clusters),
+        "trees": [
+            {
+                "tree_id": c.tree_id,
+                "world_lat": c.world_lat,
+                "world_lon": c.world_lon,
+                "n_frames": c.n_frames,
+                "first_frame": c.first_frame,
+                "last_frame": c.last_frame,
+                "flagged_reason": c.flagged_reason,
+                "flower_count": round(c.flower_count, 1),
+            }
+            for c in clusters
+        ],
+    }
+    with (out_root / "trees.json").open("w") as fh:
+        _json.dump(summary, fh, indent=2)
+    log.info("Written %s", out_root / "trees.json")
     print(f"Detected {len(clusters)} trees")
     for c in clusters:
         flag = f"  [{c.flagged_reason}]" if c.flagged_reason else ""
@@ -1492,6 +1747,7 @@ __all__ = [
     "TrunkTrack",
     "TreeCluster",
     "FrameLoader",
+    "All2023FrameLoader",
     "PNGSequenceLoader",
     "detect_trunks_grounding_dino",
     "propagate_with_sam2",
