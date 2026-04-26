@@ -1423,6 +1423,19 @@ def _main() -> None:
                         default="configs/sam2.1/sam2.1_hiera_l.yaml")
     parser.add_argument("--sam2-ckpt", type=str,
                         default="checkpoints/sam2.1_hiera_large.pt")
+    parser.add_argument("--flower-csv", type=str, default=None,
+                        help="Path to analyze_days.py results.csv. When provided, "
+                             "flower counts are attributed to trees via PRGB ROI masks.")
+    parser.add_argument("--flower-session", type=str, default=None,
+                        help="Session name to filter in --flower-csv (required with "
+                             "--flower-csv).")
+    parser.add_argument("--flower-prompt", type=str, default="apple blossom",
+                        help="Prompt column to use from --flower-csv (default: "
+                             "'apple blossom').")
+    parser.add_argument("--flower-count-col", type=str, default="est_flowers",
+                        choices=["est_flowers", "n_detections"],
+                        help="Which count column to use from the CSV "
+                             "(default: est_flowers).")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1438,12 +1451,26 @@ def _main() -> None:
         tree_spacing_m=args.tree_spacing_m,
     )
 
+    flower_counts = None
+    if args.flower_csv:
+        if not args.flower_session:
+            parser.error("--flower-session is required when --flower-csv is set")
+        flower_counts = load_flower_counts_from_csv(
+            args.flower_csv,
+            session=args.flower_session,
+            prompt=args.flower_prompt,
+            count_col=args.flower_count_col,
+        )
+        log.info("Loaded flower counts for %d frames from %s",
+                 len(flower_counts), args.flower_csv)
+
     clusters, _ = process_run(
         run_root=args.run_root,
         cfg=cfg,
         output_dir=args.output_dir,
         device=args.device,
         write_contact_sheets=not args.no_contact_sheets,
+        flower_counts_by_frame=flower_counts,
     )
     print(f"Detected {len(clusters)} trees")
     for c in clusters:
