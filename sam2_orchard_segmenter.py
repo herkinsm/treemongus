@@ -3027,8 +3027,12 @@ def compute_per_frame_lai(
         # ground filter + bottom cutoff.
         if depth_mm is not None and canopy_union.any():
             if target_med_mm is not None:
-                band_lo = max(1, int(target_med_mm - 700))
-                band_hi = int(target_med_mm + 700)
+                # ±500 mm tightens vs the previous ±700 to drop far-
+                # corner background trees that crept into the wider
+                # band. Foreground canopy depth typically varies by
+                # ~300-500 mm across leaves, so 500 mm is enough.
+                band_lo = max(1, int(target_med_mm - 500))
+                band_hi = int(target_med_mm + 500)
             else:
                 band_lo, band_hi = _CMM, _CXMM
             in_band = (depth_mm >= band_lo) & (depth_mm <= band_hi)
@@ -3073,22 +3077,42 @@ def compute_per_frame_lai(
             except Exception:
                 pass
 
-            # Gradient ground filter on the lower half.
+            # Smoothness-based ground filter (plane-like detector).
+            # Real canopy has many leaves at varying depths in any
+            # 7x7 neighbourhood, so local depth std is noisy
+            # (typically 50-200 mm). Planar ground has smooth depth
+            # (local std < ~25 mm). Reject canopy pixels that are
+            # in a smooth-depth neighbourhood AND in the lower half
+            # of the frame (where ground appears).
             try:
-                gap = 5
-                grad = np.zeros_like(depth_mm, dtype=np.float32)
-                grad[:-gap, :] = (
-                    depth_mm[gap:, :].astype(np.float32)
-                    - depth_mm[:-gap, :].astype(np.float32)
+                import cv2 as _cv2
+                depth_f = depth_mm.astype(np.float32)
+                # Compute local depth std via box-filter trick:
+                # std² = E[x²] - E[x]², on valid pixels only.
+                valid_d = (depth_mm > 0).astype(np.float32)
+                k = (7, 7)
+                sum_d = _cv2.boxFilter(
+                    depth_f * valid_d, -1, k, normalize=False,
                 )
-                valid_pair = (
-                    (depth_mm > 0)
-                    & (np.roll(depth_mm, -gap, axis=0) > 0)
+                sum_d2 = _cv2.boxFilter(
+                    depth_f * depth_f * valid_d, -1, k, normalize=False,
                 )
-                ground_like = valid_pair & (np.abs(grad) > 5.0 * gap)
-                lower_band_arr = np.zeros_like(canopy)
-                lower_band_arr[240:, :] = True
-                canopy = canopy & ~(ground_like & lower_band_arr)
+                cnt = _cv2.boxFilter(valid_d, -1, k, normalize=False)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    mean_d = np.where(cnt > 0, sum_d / cnt, 0)
+                    var_d = np.where(
+                        cnt > 0,
+                        np.maximum(sum_d2 / cnt - mean_d * mean_d, 0),
+                        0,
+                    )
+                local_std = np.sqrt(var_d)
+                # Smooth = std < 25 mm AND enough valid pixels (>=20)
+                # in the 7x7 window (avoids tagging sparse-depth
+                # canopy edges as smooth).
+                smooth = (local_std < 25.0) & (cnt >= 20)
+                lower = np.zeros_like(canopy)
+                lower[240:, :] = True
+                canopy = canopy & ~(smooth & lower)
             except Exception:
                 pass
         else:
