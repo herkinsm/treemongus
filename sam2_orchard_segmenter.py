@@ -1459,29 +1459,57 @@ def project_tracks_to_world(
         return d2, math.isfinite(d2)
 
     n_used_nominal = 0
+    canopy_min_m = max(0.1, cfg.trunk_min_depth_m)
+    # Plausible canopy distance — beyond ~5 m is background, not the
+    # tree being tracked. Tighter than the [trunk_min, trunk_max]
+    # range used for the gate, because we need to *find* canopy
+    # depth here, not just validate it.
+    canopy_max_m = min(5.0, cfg.trunk_max_depth_m)
+
     for track in tqdm(tracks, desc="World projection"):
         for det in track.detections:
             depth = loader.load_depth_m(det.frame_idx)
-            # Prefer the whole-tree mask for depth: thin-trunk pixels
-            # often have no depth, but the canopy has thousands of
-            # valid pixels at roughly the same distance. Use p10
-            # (closest 10%) when sampling from the tree mask -- the
-            # mask includes sky/background visible through sparse
-            # canopy gaps, and p10 latches onto the actual canopy
-            # surface instead of being dragged toward background.
-            d_m: float
+            # Strategy: try several mask-depth aggregations, accept
+            # only the first one that lands in [canopy_min, canopy_max].
+            # That keeps depths from being dragged to background-
+            # through-canopy-gaps, which is what was killing this
+            # before. Fall back to nominal distance if nothing fits.
+            d_m: float = float("nan")
             used_dilated = False
-            if det.tree_mask is not None and det.tree_mask.any():
-                valid = (det.tree_mask
-                         & np.isfinite(depth)
-                         & (depth > 0.1)
-                         & (depth < 20.0))
-                if valid.any():
-                    d_m = float(np.percentile(depth[valid], 10))
-                else:
-                    d_m, used_dilated = _trunk_depth_m(depth, det.mask)
-            else:
-                d_m, used_dilated = _trunk_depth_m(depth, det.mask)
+
+            def _candidate_in_range(mask: np.ndarray, pct: float) -> float:
+                if mask is None or not mask.any():
+                    return float("nan")
+                v = (mask
+                     & np.isfinite(depth)
+                     & (depth >= canopy_min_m)
+                     & (depth <= canopy_max_m))
+                if not v.any():
+                    return float("nan")
+                return float(np.percentile(depth[v], pct))
+
+            # 1. Tree mask, closest pixels (p10) — best signal when
+            #    SAM 3 picked up the tree.
+            if det.tree_mask is not None:
+                d_m = _candidate_in_range(det.tree_mask, 10)
+            # 2. Trunk mask median — fallback when tree mask was
+            #    rejected or out of range.
+            if not math.isfinite(d_m):
+                d_m = _candidate_in_range(det.mask, 50)
+            # 3. Dilated trunk mask p10 — picks up foliage near the
+            #    trunk when the tight masks have no in-range depth.
+            if not math.isfinite(d_m) and det.mask is not None and det.mask.any():
+                try:
+                    import cv2 as _cv2
+                    kernel = np.ones((21, 21), dtype=np.uint8)
+                    dil = _cv2.dilate(
+                        det.mask.astype(np.uint8), kernel, iterations=1,
+                    ).astype(bool)
+                    d_m = _candidate_in_range(dil, 10)
+                    if math.isfinite(d_m):
+                        used_dilated = True
+                except Exception:
+                    pass
             used_nominal = False
             if used_dilated:
                 n_used_dilated += 1
