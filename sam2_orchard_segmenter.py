@@ -1130,6 +1130,7 @@ def _propagate_image_mode(
         "sam3": "SAM3 mask refine",
         "bbox": "bbox-mask build",
     }
+    n_tree_mask_ok = n_tree_mask_fail = 0
     for frame_idx in tqdm(loader.frame_indices(), desc=desc_map[backend]):
         dets = detections_by_frame.get(frame_idx, [])
         if not dets:
@@ -1209,7 +1210,13 @@ def _propagate_image_mode(
                                 cand, trunk_mask,
                             ).sum() >= int(trunk_mask.sum() * 0.10):
                                 tree_mask = cand.astype(bool)
+                                n_tree_mask_ok += 1
+                            else:
+                                n_tree_mask_fail += 1
+                        else:
+                            n_tree_mask_fail += 1
                     except Exception as exc:
+                        n_tree_mask_fail += 1
                         log.debug(
                             "SAM 3 tree pass failed on frame %d: %s",
                             frame_idx, exc,
@@ -1254,6 +1261,11 @@ def _propagate_image_mode(
                 tracks.append(track)
 
     log.info("%s: %d single-frame tracks built", desc_map[backend], len(tracks))
+    if backend == "sam3":
+        log.info(
+            "Whole-tree mask (text+box prompt %r): %d ok, %d failed/discarded",
+            cfg.tree_text_prompt, n_tree_mask_ok, n_tree_mask_fail,
+        )
     return tracks
 
 
@@ -2383,12 +2395,17 @@ def build_contact_sheets(
             frames = [frames[int(i * step)]
                       for i in range(cfg.contact_sheet_max_thumbs)]
 
-        # Build a mapping frame_idx -> mask for this cluster.
-        masks_by_frame: Dict[int, np.ndarray] = {}
+        # Build mappings frame_idx -> trunk_mask, frame_idx -> tree_mask
+        trunk_by_frame: Dict[int, np.ndarray] = {}
+        tree_by_frame: Dict[int, np.ndarray] = {}
         for track in cluster.tracks:
             for det in track.detections:
-                if det.frame_idx in cluster.frame_pixels and det.mask is not None:
-                    masks_by_frame[det.frame_idx] = det.mask
+                if det.frame_idx not in cluster.frame_pixels:
+                    continue
+                if det.mask is not None:
+                    trunk_by_frame[det.frame_idx] = det.mask
+                if det.tree_mask is not None and det.tree_mask.any():
+                    tree_by_frame[det.frame_idx] = det.tree_mask
 
         # Build the grid.
         cols = min(6, len(frames))
@@ -2396,11 +2413,26 @@ def build_contact_sheets(
         grid = Image.new("RGB", (cols * THUMB, rows * THUMB), (0, 0, 0))
         for k, fid in enumerate(frames):
             rgb = loader.load_rgb(fid)
-            mask = masks_by_frame.get(fid)
-            if mask is not None:
-                # Red contour of the mask.
+            tree_mask = tree_by_frame.get(fid)
+            trunk_mask = trunk_by_frame.get(fid)
+            # Whole-tree mask: translucent green fill + green contour.
+            if tree_mask is not None:
+                tint = rgb.copy()
+                tint[tree_mask] = (
+                    tint[tree_mask] * 0.5
+                    + np.array([0, 200, 0], dtype=np.float32) * 0.5
+                ).astype(np.uint8)
+                rgb = tint
                 contours, _ = cv2.findContours(
-                    mask.astype(np.uint8),
+                    tree_mask.astype(np.uint8),
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE,
+                )
+                cv2.drawContours(rgb, contours, -1, (0, 255, 0), 2)
+            # Trunk mask on top: red contour.
+            if trunk_mask is not None:
+                contours, _ = cv2.findContours(
+                    trunk_mask.astype(np.uint8),
                     cv2.RETR_EXTERNAL,
                     cv2.CHAIN_APPROX_SIMPLE,
                 )
