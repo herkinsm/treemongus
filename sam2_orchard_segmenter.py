@@ -3106,10 +3106,12 @@ def compute_per_frame_lai(
                         0,
                     )
                 local_std = np.sqrt(var_d)
-                # Smooth = std < 25 mm AND enough valid pixels (>=20)
-                # in the 7x7 window (avoids tagging sparse-depth
-                # canopy edges as smooth).
-                smooth = (local_std < 25.0) & (cnt >= 20)
+                # Smooth = std < 50 mm AND enough valid pixels (>=20)
+                # in the 7x7 window. Apple canopy locally has
+                # leaves at many depths -> std typically 60-200 mm.
+                # Grass / smooth ground has std ~10-40 mm. 50 mm
+                # is the discriminator.
+                smooth = (local_std < 50.0) & (cnt >= 20)
                 lower = np.zeros_like(canopy)
                 lower[240:, :] = True
                 canopy = canopy & ~(smooth & lower)
