@@ -1221,12 +1221,16 @@ def _propagate_image_mode(
                 # We then split the canopy across the frame's trunks
                 # via nearest-trunk assignment so touching trees
                 # stay separated.
-                # Pre-load depth_mm once per frame; build_tree_mask
-                # is called per-detection below (anchored on each
-                # trunk's pixel-x column) so each tree gets a mask
-                # that respects its own position, the way
-                # sprayer_pipeline does in single-tree frames.
+                # Pre-load depth + per-frame canopy mask once.
+                # The canopy is the union of:
+                #   1. build_wide_tree_mask (depth + sky/ground filters)
+                #   2. SAM 3 leaf detection at canopy depth
+                # SAM 3 catches leaves where RealSense returns no
+                # depth (thin foliage against sky, edge dropouts);
+                # depth catches branches/trunk SAM 3 doesn't tag as
+                # leaves. Together they cover the whole canopy.
                 depth_mm: Optional[np.ndarray] = None
+                wide_canopy: Optional[np.ndarray] = None
                 target_depth_band: Optional[Tuple[int, int]] = None
                 try:
                     depth_m = loader.load_depth_m(frame_idx)
@@ -1236,6 +1240,95 @@ def _propagate_image_mode(
                             (depth_m * 1000.0).astype(np.uint16),
                             np.zeros_like(depth_m, dtype=np.uint16),
                         )
+                        # Step 1: depth-based wide mask.
+                        try:
+                            from tree_mask import (
+                                build_wide_tree_mask,
+                                CANOPY_DEPTH_MIN_MM as _CMM,
+                                CANOPY_DEPTH_MAX_MM as _CXMM,
+                            )
+                            wide_u8 = build_wide_tree_mask(
+                                depth_mm, rgb,
+                            )
+                            wide_canopy = (wide_u8 > 0)
+                        except Exception as exc:
+                            log.warning(
+                                "build_wide_tree_mask failed frame %d: %s",
+                                frame_idx, exc,
+                            )
+                            wide_canopy = None
+
+                        # Step 2: SAM 3 "leaves" augmentation.
+                        # Run SAM 3 with text prompt "leaves" once
+                        # per frame (we already have set_image done
+                        # below for trunk box prompts; do it here
+                        # before the trunk loop to get leaf masks).
+                        # Pixels SAM 3 calls "leaves" at canopy depth
+                        # are added to the canopy mask -- catches
+                        # what depth missed.
+                        try:
+                            import torch as _torch
+                            from PIL import Image as _PILImage
+                            ac_dtype = (
+                                _torch.bfloat16
+                                if device.startswith("cuda")
+                                else _torch.float32
+                            )
+                            with _torch.autocast(
+                                "cuda" if device.startswith("cuda")
+                                else "cpu",
+                                dtype=ac_dtype,
+                            ):
+                                lf_state = sam3_processor.set_image(
+                                    _PILImage.fromarray(rgb),
+                                )
+                                sam3_processor.reset_all_prompts(lf_state)
+                                lf_state = sam3_processor.set_text_prompt(
+                                    prompt="leaves", state=lf_state,
+                                )
+                                lf_masks = lf_state.get("masks")
+                            if lf_masks is not None and len(lf_masks) > 0:
+                                arr = lf_masks.detach().cpu()
+                                if arr.dtype != _torch.bool:
+                                    arr = arr.to(_torch.bool)
+                                arr = arr.numpy()
+                                if arr.ndim == 4:
+                                    arr = arr.squeeze(1)
+                                # Union all leaf instance masks.
+                                leaves_union = np.zeros(
+                                    (h, w), dtype=bool,
+                                )
+                                for i in range(arr.shape[0]):
+                                    leaves_union |= arr[i].astype(bool)
+                                # Restrict to canopy depth band so
+                                # SAM 3 doesn't pull in distant
+                                # background leaves at 5 m+.
+                                in_canopy_depth = (
+                                    (depth_mm >= _CMM)
+                                    & (depth_mm <= _CXMM)
+                                )
+                                # Pixels with no valid depth on a
+                                # leaf -- include them too if they're
+                                # in the upper half of the frame
+                                # (RealSense often fails on thin
+                                # leaves; not having depth doesn't
+                                # mean they're not real leaves).
+                                no_depth_upper = (
+                                    (depth_mm == 0)
+                                    & (np.arange(h)[:, None] < 380)
+                                )
+                                leaves_keep = leaves_union & (
+                                    in_canopy_depth | no_depth_upper
+                                )
+                                if wide_canopy is None:
+                                    wide_canopy = leaves_keep
+                                else:
+                                    wide_canopy = wide_canopy | leaves_keep
+                        except Exception as exc:
+                            log.debug(
+                                "SAM 3 leaf augmentation failed frame "
+                                "%d: %s", frame_idx, exc,
+                            )
                 except Exception as exc:
                     log.warning(
                         "Depth load failed on frame %d: %s",
@@ -1272,47 +1365,29 @@ def _propagate_image_mode(
                     # apply a depth-coherence cut so adjacent trees
                     # at different distances stay separated even
                     # when their canopies overlap in pixel space.
-                    # Use build_wide_tree_mask exactly the way
-                    # sprayer_pipeline.main.py uses it: pass the
-                    # frame's depth + RGB, take the whole output as
-                    # the tree mask.
+                    # Use the precomputed canopy (depth + SAM 3
+                    # leaves) for this frame. Every detection in
+                    # this frame shares the same canopy mask.
                     tree_mask: Optional[np.ndarray] = None
-                    if depth_mm is not None:
-                        try:
-                            from tree_mask import build_wide_tree_mask
-                            wide_u8 = build_wide_tree_mask(
-                                depth_mm, rgb,
-                            )
-                            tree_mask = (wide_u8 > 0) | trunk_mask
-
-                            # Validity check: a real apple tree has
-                            # canopy pixels NEAR the trunk. A barn
-                            # column / car / fence post has none.
-                            # Skip the entire detection when the
-                            # trunk's bbox neighbourhood has no
-                            # canopy in the wide mask.
-                            x1b, y1b, x2b, y2b = (
-                                int(round(v)) for v in det.bbox_xyxy
-                            )
-                            pad = 60
-                            nx0 = max(0, x1b - pad)
-                            nx1 = min(w, x2b + pad)
-                            ny0 = max(0, y1b - pad)
-                            ny1 = min(h, y2b + pad)
-                            canopy_near_trunk = (
-                                (wide_u8 > 0)[ny0:ny1, nx0:nx1].sum()
-                            )
-                            if int(canopy_near_trunk) < 100:
-                                continue
-
-                            if not tree_mask.any():
-                                tree_mask = None
-                        except Exception as exc:
-                            log.warning(
-                                "build_wide_tree_mask failed for det "
-                                "in frame %d: %s",
-                                frame_idx, exc,
-                            )
+                    if wide_canopy is not None:
+                        # Validity check: real trunk has canopy
+                        # pixels nearby; barns / cars / fence posts
+                        # don't.
+                        x1b, y1b, x2b, y2b = (
+                            int(round(v)) for v in det.bbox_xyxy
+                        )
+                        pad = 60
+                        nx0 = max(0, x1b - pad)
+                        nx1 = min(w, x2b + pad)
+                        ny0 = max(0, y1b - pad)
+                        ny1 = min(h, y2b + pad)
+                        canopy_near_trunk = (
+                            wide_canopy[ny0:ny1, nx0:nx1].sum()
+                        )
+                        if int(canopy_near_trunk) < 100:
+                            continue
+                        tree_mask = wide_canopy | trunk_mask
+                        if not tree_mask.any():
                             tree_mask = None
                     if tree_mask is not None:
                         n_tree_mask_ok += 1
