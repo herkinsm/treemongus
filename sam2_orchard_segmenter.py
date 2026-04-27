@@ -1137,6 +1137,8 @@ def _propagate_image_mode(
         "bbox": "bbox-mask build",
     }
     n_tree_mask_ok = n_tree_mask_fail = 0
+    n_fail_no_canopy = n_fail_no_cc = n_fail_voronoi = n_fail_exception = 0
+    n_canopy_built = n_canopy_empty = n_canopy_error = 0
     for frame_idx in tqdm(loader.frame_indices(), desc=desc_map[backend]):
         dets = detections_by_frame.get(frame_idx, [])
         if not dets:
@@ -1234,12 +1236,19 @@ def _propagate_image_mode(
 
                         if not canopy_mask_frame.any():
                             canopy_mask_frame = None
+                            n_canopy_empty += 1
+                        else:
+                            n_canopy_built += 1
                 except Exception as exc:
-                    log.debug(
+                    n_canopy_error += 1
+                    log.warning(
                         "build_tree_mask failed on frame %d: %s",
                         frame_idx, exc,
                     )
                     canopy_mask_frame = None
+                if canopy_mask_frame is None and n_canopy_built == 0 and n_canopy_empty == 0 and n_canopy_error == 0:
+                    # Could not even attempt build_tree_mask (depth missing).
+                    n_canopy_error += 1
 
                 for det in dets:
                     # ── Pass 1: trunk-tight mask via box prompt ──
@@ -1353,16 +1362,20 @@ def _propagate_image_mode(
                                 else:
                                     tree_mask = None
                                     n_tree_mask_fail += 1
+                                    n_fail_voronoi += 1
                             else:
                                 n_tree_mask_fail += 1
+                                n_fail_no_cc += 1
                         except Exception as exc:
                             n_tree_mask_fail += 1
-                            log.debug(
+                            n_fail_exception += 1
+                            log.warning(
                                 "Canopy split failed on frame %d: %s",
                                 frame_idx, exc,
                             )
                     else:
                         n_tree_mask_fail += 1
+                        n_fail_no_canopy += 1
 
                     track = TrunkTrack(track_id=next_track_id)
                     next_track_id += 1
@@ -1406,9 +1419,17 @@ def _propagate_image_mode(
     if backend == "sam3":
         total = n_tree_mask_ok + n_tree_mask_fail
         log.info(
+            "===== CANOPY MASK PER FRAME: %d built ok, %d empty, "
+            "%d errored =====",
+            n_canopy_built, n_canopy_empty, n_canopy_error,
+        )
+        log.info(
             "===== TREE MASK STATUS: %d/%d detections got a canopy "
-            "tree_mask (%d failed/discarded) =====",
-            n_tree_mask_ok, total, n_tree_mask_fail,
+            "tree_mask (no-canopy=%d no-CC-in-bbox=%d voronoi-empty=%d "
+            "exception=%d) =====",
+            n_tree_mask_ok, total,
+            n_fail_no_canopy, n_fail_no_cc,
+            n_fail_voronoi, n_fail_exception,
         )
     return tracks
 
