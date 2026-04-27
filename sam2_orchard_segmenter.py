@@ -1262,14 +1262,7 @@ def _propagate_image_mode(
                     # ── Per-trunk vanilla build_tree_mask ──
                     # Run the canonical sprayer_pipeline canopy mask
                     # ONCE for THIS trunk, anchored on the trunk's
-                    # own pixel-x column. That tells build_tree_mask
-                    # "the tree of interest is in this column," same
-                    # contract sprayer_pipeline gives it -- the row-
-                    # banded ground filter, depth band, and CC
-                    # anchoring all work as designed because we're
-                    # using the function the way it was meant to be
-                    # used (one tree at a time, anchored on its
-                    # actual column position).
+                    # own pixel-x column.
                     tree_mask: Optional[np.ndarray] = None
                     if depth_mm is not None:
                         try:
@@ -1277,16 +1270,49 @@ def _propagate_image_mode(
                             x1b, _, x2b, _ = (
                                 int(round(v)) for v in det.bbox_xyxy
                             )
-                            anchor_pad = 30  # let build_tree_mask see
-                                             # ~30 px on each side of
-                                             # the trunk for context
+                            anchor_pad = 30
                             cc0 = max(0, x1b - anchor_pad)
                             cc1 = min(w - 1, x2b + anchor_pad)
                             canopy_u8 = build_tree_mask(
                                 depth_mm, rgb=rgb,
                                 roi_cols=(cc0, cc1),
                             )
-                            tree_mask = (canopy_u8 > 0) | trunk_mask
+                            canopy_bool = (canopy_u8 > 0)
+
+                            # ── Depth-coherence post-filter ──
+                            # build_tree_mask's row-banded ground
+                            # filter only rejects depths FARTHER than
+                            # the trunk centre. On a horizontal-
+                            # facing camera the ground is at the
+                            # SAME depth as (or closer than) the
+                            # trunk, so it passes through and shows
+                            # up as a horizontal band at the bottom
+                            # of the mask. Fix: take the median
+                            # depth inside the build_tree_mask
+                            # output (that's the trunk + canopy's
+                            # actual depth) and drop any pixel
+                            # whose depth differs by more than
+                            # ±400 mm. Same tree's pixels cluster
+                            # within ~±300 mm; ground in front of
+                            # camera is closer, far background is
+                            # farther -- both get cut.
+                            valid_in_canopy = (
+                                canopy_bool & (depth_mm > 0)
+                            )
+                            if valid_in_canopy.any():
+                                tree_depths = depth_mm[valid_in_canopy]
+                                tree_med = float(np.median(tree_depths))
+                                coh_lo = max(1, int(tree_med - 400))
+                                coh_hi = int(tree_med + 400)
+                                coherent = (
+                                    canopy_bool
+                                    & (depth_mm >= coh_lo)
+                                    & (depth_mm <= coh_hi)
+                                )
+                                tree_mask = coherent | trunk_mask
+                            else:
+                                tree_mask = canopy_bool | trunk_mask
+
                             if not tree_mask.any():
                                 tree_mask = None
                         except Exception as exc:
