@@ -2920,10 +2920,11 @@ def compute_per_frame_lai(
 
     log.info("Per-frame LAI: loading SAM 3 (text-only canopy)")
     sam3_model = build_sam3_image_model()
-    # 0.15 lets partial / edge-cut trees fire while still keeping
-    # noisy text-prompt detections out.
+    # Lower threshold (0.10) lets partial / edge-cut / occluded
+    # trees fire. Per-CC depth filter below catches false
+    # positives from low-confidence text detections.
     processor = Sam3Processor(
-        sam3_model, device=device, confidence_threshold=0.15,
+        sam3_model, device=device, confidence_threshold=0.10,
     )
     autocast_dtype = (
         _torch.bfloat16 if device.startswith("cuda") else _torch.float32
@@ -3057,8 +3058,12 @@ def compute_per_frame_lai(
                     )
                     cc_total[0] = 1   # avoid div-by-zero on background
                     in_band_frac = cc_in_band / cc_total
+                    # >=30% in-band keeps partial / edge trees
+                    # whose visible portion still has substantial
+                    # in-band depth coverage. Background trees
+                    # (depth=0 across the whole CC) sit at ~0%.
                     for cc_id in range(1, n_cc):
-                        if in_band_frac[cc_id] >= 0.50:
+                        if in_band_frac[cc_id] >= 0.30:
                             keep_lut[cc_id] = True
                     if keep_lut.any():
                         # Restrict canopy union to kept CCs, then re-apply
