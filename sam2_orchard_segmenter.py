@@ -1275,12 +1275,7 @@ def _propagate_image_mode(
                     # Use build_wide_tree_mask exactly the way
                     # sprayer_pipeline.main.py uses it: pass the
                     # frame's depth + RGB, take the whole output as
-                    # the tree mask. No CC pick, no column band, no
-                    # depth-coherence filter -- the function's own
-                    # depth band, gradient ground filter, sky
-                    # exclusion, and row-420 cutoff are what it ships
-                    # with and what the validated R²=0.564 LAI
-                    # estimator uses.
+                    # the tree mask.
                     tree_mask: Optional[np.ndarray] = None
                     if depth_mm is not None:
                         try:
@@ -1289,6 +1284,27 @@ def _propagate_image_mode(
                                 depth_mm, rgb,
                             )
                             tree_mask = (wide_u8 > 0) | trunk_mask
+
+                            # Validity check: a real apple tree has
+                            # canopy pixels NEAR the trunk. A barn
+                            # column / car / fence post has none.
+                            # Skip the entire detection when the
+                            # trunk's bbox neighbourhood has no
+                            # canopy in the wide mask.
+                            x1b, y1b, x2b, y2b = (
+                                int(round(v)) for v in det.bbox_xyxy
+                            )
+                            pad = 60
+                            nx0 = max(0, x1b - pad)
+                            nx1 = min(w, x2b + pad)
+                            ny0 = max(0, y1b - pad)
+                            ny1 = min(h, y2b + pad)
+                            canopy_near_trunk = (
+                                (wide_u8 > 0)[ny0:ny1, nx0:nx1].sum()
+                            )
+                            if int(canopy_near_trunk) < 100:
+                                continue
+
                             if not tree_mask.any():
                                 tree_mask = None
                         except Exception as exc:
