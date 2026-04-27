@@ -1221,10 +1221,14 @@ def _propagate_image_mode(
                 # We then split the canopy across the frame's trunks
                 # via nearest-trunk assignment so touching trees
                 # stay separated.
-                canopy_mask_frame: Optional[np.ndarray] = None
+                # Pre-load depth_mm once per frame; build_tree_mask
+                # is called per-detection below (anchored on each
+                # trunk's pixel-x column) so each tree gets a mask
+                # that respects its own position, the way
+                # sprayer_pipeline does in single-tree frames.
+                depth_mm: Optional[np.ndarray] = None
                 target_depth_band: Optional[Tuple[int, int]] = None
                 try:
-                    from tree_mask import build_tree_mask
                     depth_m = loader.load_depth_m(frame_idx)
                     if depth_m is not None and np.isfinite(depth_m).any():
                         depth_mm = np.where(
@@ -1232,169 +1236,12 @@ def _propagate_image_mode(
                             (depth_m * 1000.0).astype(np.uint16),
                             np.zeros_like(depth_m, dtype=np.uint16),
                         )
-                        # ── Data-driven canopy band from PRGB ROI ──
-                        # The PRGB red box is drawn by the sprayer at
-                        # the tree it is currently spraying. Sample
-                        # depth inside the ROI -- the median of those
-                        # valid depths IS this frame's target tree
-                        # distance, and the IQR tells us how thick
-                        # the canopy is at this growth stage. No
-                        # hardcoded distance needed.
-                        target_depth_mm = None
-                        half_band_mm = None
-                        roi_for_band = loader.load_roi_mask(frame_idx)
-                        if (roi_for_band is not None
-                                and roi_for_band.any()):
-                            roi_depths = depth_mm[
-                                roi_for_band & (depth_mm > 0)
-                            ]
-                            if roi_depths.size >= 50:
-                                p25 = np.percentile(roi_depths, 25)
-                                p50 = np.percentile(roi_depths, 50)
-                                p75 = np.percentile(roi_depths, 75)
-                                iqr = float(max(0.0, p75 - p25))
-                                target_depth_mm = float(p50)
-                                half_band_mm = (
-                                    cfg.canopy_band_iqr_mult * iqr
-                                )
-                                half_band_mm = max(
-                                    half_band_mm,
-                                    cfg.canopy_band_min_half_m * 1000.0,
-                                )
-                                half_band_mm = min(
-                                    half_band_mm,
-                                    cfg.canopy_band_max_half_m * 1000.0,
-                                )
-                        # Fallback if ROI absent or too sparse:
-                        # global mode of valid depths in the upper
-                        # canopy strip (rows 100-300, full width).
-                        if target_depth_mm is None:
-                            strip = depth_mm[100:300, :]
-                            valid = strip[(strip > 600) & (strip < 6000)]
-                            if valid.size >= 200:
-                                target_depth_mm = float(
-                                    np.median(valid),
-                                )
-                                # Use min half-band as a safe default.
-                                half_band_mm = (
-                                    cfg.canopy_band_min_half_m * 1000.0
-                                )
-                        if target_depth_mm is not None:
-                            band_lo = max(
-                                1,
-                                int(target_depth_mm - half_band_mm),
-                            )
-                            band_hi = int(target_depth_mm + half_band_mm)
-                            in_band = (
-                                (depth_mm >= band_lo)
-                                & (depth_mm <= band_hi)
-                            )
-                            depth_mm = np.where(
-                                in_band, depth_mm,
-                                np.zeros_like(depth_mm),
-                            )
-                            target_depth_band = (band_lo, band_hi)
-                        else:
-                            target_depth_band = None
-
-                        # Diagnostic on the first 5 frames so we see
-                        # what target depth + band were chosen and
-                        # whether ROI was present.
-                        if n_canopy_built + n_canopy_empty + n_canopy_error < 5:
-                            roi_pix = (
-                                int(roi_for_band.sum())
-                                if roi_for_band is not None else 0
-                            )
-                            log.info(
-                                "Frame %d band: ROI_pix=%d, "
-                                "target_depth_mm=%s, band=%s, "
-                                "kept_depth_pix=%d",
-                                frame_idx, roi_pix,
-                                f"{target_depth_mm:.0f}"
-                                if target_depth_mm is not None else "None",
-                                target_depth_band,
-                                int((depth_mm > 0).sum()),
-                            )
-                        # Diagnostic on the first few frames so we can
-                        # see what depth values build_tree_mask actually
-                        # gets -- pinpoints the empty-mask cause.
-                        if n_canopy_built + n_canopy_empty + n_canopy_error < 3:
-                            valid_depth_pix = int((depth_mm > 0).sum())
-                            in_canopy_band = int(
-                                ((depth_mm >= 600) & (depth_mm <= 3000)).sum()
-                            )
-                            valid_vals = depth_mm[depth_mm > 0]
-                            log.info(
-                                "Frame %d depth: shape=%s, valid=%d, "
-                                "in [600, 3000] mm=%d, min=%d, max=%d",
-                                frame_idx, depth_mm.shape, valid_depth_pix,
-                                in_canopy_band,
-                                int(valid_vals.min()) if valid_vals.size else 0,
-                                int(depth_mm.max()),
-                            )
-                        # build_tree_mask returns uint8 (0 / 255).
-                        # Anchor on the FULL frame width, not the
-                        # sprayer's centered ROI columns. The
-                        # segmenter sees trees across the whole
-                        # frame as the camera moves down the row,
-                        # so the centred-ROI anchor (default
-                        # x ∈ [285, 354]) drops every tree that
-                        # isn't directly under the sprayer.
-                        canopy_u8 = build_tree_mask(
-                            depth_mm, rgb=rgb,
-                            roi_cols=(0, w - 1),
-                        )
-                        canopy_mask_frame = (canopy_u8 > 0)
-
-                        # Leaf-colour augmentation: HSV-green pixels
-                        # at canopy depth that build_tree_mask missed
-                        # are real leaves. The sprayer mask is tuned
-                        # for the dense-canopy spray case; sparse
-                        # saplings have leaves that fall outside its
-                        # ROI-anchor connectivity. Add foreground
-                        # green pixels back so leaf area is included.
-                        try:
-                            import cv2 as _cv2
-                            hsv = _cv2.cvtColor(
-                                rgb.astype(np.uint8), _cv2.COLOR_RGB2HSV,
-                            )
-                            H_g = hsv[:, :, 0]
-                            S_g = hsv[:, :, 1]
-                            V_g = hsv[:, :, 2]
-                            green = (
-                                (H_g >= 25) & (H_g <= 85)
-                                & (S_g > 40) & (V_g > 50)
-                            )
-                            in_band = (
-                                np.isfinite(depth_m)
-                                & (depth_m * 1000.0
-                                   >= float(cfg.trunk_min_depth_m * 1000))
-                                & (depth_m * 1000.0
-                                   <= float(cfg.trunk_max_depth_m * 1000))
-                            )
-                            leaves = green & in_band
-                            canopy_mask_frame = canopy_mask_frame | leaves
-                        except Exception as exc:
-                            log.debug(
-                                "Leaf augmentation failed frame %d: %s",
-                                frame_idx, exc,
-                            )
-
-                        if not canopy_mask_frame.any():
-                            canopy_mask_frame = None
-                            n_canopy_empty += 1
-                        else:
-                            n_canopy_built += 1
                 except Exception as exc:
-                    n_canopy_error += 1
                     log.warning(
-                        "build_tree_mask failed on frame %d: %s",
+                        "Depth load failed on frame %d: %s",
                         frame_idx, exc,
                     )
-                    canopy_mask_frame = None
-                if canopy_mask_frame is None and n_canopy_built == 0 and n_canopy_empty == 0 and n_canopy_error == 0:
-                    # Could not even attempt build_tree_mask (depth missing).
-                    n_canopy_error += 1
+                    depth_mm = None
 
                 for det in dets:
                     # ── Pass 1: trunk-tight mask via box prompt ──
@@ -1412,179 +1259,50 @@ def _propagate_image_mode(
                             continue
                         sam3_score = 1.0
 
-                    # Background-trunk filter (data-driven). A real
-                    # apple trunk has canopy near it AT the same
-                    # distance. A car / barn / fence post is at a
-                    # very different depth from the spray-target
-                    # trees. Two checks:
-                    #   (a) some canopy must live within ~80 px of
-                    #       the trunk (proximity)
-                    #   (b) the trunk's column must contain depth
-                    #       pixels inside the data-driven canopy
-                    #       band (distance match)
-                    # Either failing → reject as background.
-                    if canopy_mask_frame is not None:
-                        try:
-                            import cv2 as _cv2
-                            check_kernel = _cv2.getStructuringElement(
-                                _cv2.MORPH_ELLIPSE, (81, 81),
-                            )
-                            near_trunk = _cv2.dilate(
-                                trunk_mask.astype(np.uint8),
-                                check_kernel, iterations=1,
-                            ).astype(bool)
-                            if not (near_trunk
-                                    & canopy_mask_frame).any():
-                                continue
-                        except Exception:
-                            pass
-                    if target_depth_band is not None:
-                        # Sample depth inside the trunk's bbox column
-                        # (any valid pixel anywhere in the dilated
-                        # neighbourhood). If NONE of those depths sit
-                        # inside the data-driven canopy band, this
-                        # 'trunk' isn't at the spray target distance.
-                        x1b, y1b, x2b, y2b = (
-                            int(round(v)) for v in det.bbox_xyxy
-                        )
-                        x1s = max(0, x1b - 40)
-                        x2s = min(w, x2b + 40)
-                        y1s = max(0, y1b - 20)
-                        y2s = min(h, y2b + 20)
-                        if x2s > x1s and y2s > y1s:
-                            depth_mm_local = depth_mm[y1s:y2s, x1s:x2s]
-                            band_lo, band_hi = target_depth_band
-                            in_band_pix = (
-                                (depth_mm_local >= band_lo)
-                                & (depth_mm_local <= band_hi)
-                            )
-                            # Need at least 50 in-band pixels in the
-                            # trunk neighbourhood to call it a tree
-                            # at the target distance.
-                            if int(in_band_pix.sum()) < 50:
-                                continue
-
-                    # ── Pass 2: whole-tree mask via sprayer-pipeline
-                    #   compute_canopy_mask + nearest-trunk split. ──
-                    # This is the SAME canopy mask the user already
-                    # uses to filter flowers in analyze_days.py:
-                    # depth-thresholded, row-band-filtered, connected-
-                    # component cleaned. Far more reliable than SAM 3
-                    # on sparse-canopy saplings.
-                    #
-                    # If multiple trunks land in the same canopy CC,
-                    # we'd be merging touching trees -- so we split
-                    # the canopy by nearest-trunk in pixel space:
-                    # each canopy pixel belongs to whichever trunk
-                    # mask is closest to it.
+                    # ── Per-trunk vanilla build_tree_mask ──
+                    # Run the canonical sprayer_pipeline canopy mask
+                    # ONCE for THIS trunk, anchored on the trunk's
+                    # own pixel-x column. That tells build_tree_mask
+                    # "the tree of interest is in this column," same
+                    # contract sprayer_pipeline gives it -- the row-
+                    # banded ground filter, depth band, and CC
+                    # anchoring all work as designed because we're
+                    # using the function the way it was meant to be
+                    # used (one tree at a time, anchored on its
+                    # actual column position).
                     tree_mask: Optional[np.ndarray] = None
-                    if canopy_mask_frame is not None:
+                    if depth_mm is not None:
                         try:
-                            import cv2 as _cv2
-                            # Morphological reconstruction: seed =
-                            # trunk mask, mask = canopy. Dilate the
-                            # seed iteratively, intersecting with
-                            # canopy at each step, until it stops
-                            # growing. The result is the connected
-                            # canopy reachable from the trunk -- so
-                            # ground/grass pixels that aren't joined
-                            # to the trunk via real canopy don't get
-                            # included, and adjacent trees with their
-                            # own trunks each grow into their own
-                            # branch of any shared CC.
-                            seed = trunk_mask.astype(np.uint8)
-                            mask_u8 = canopy_mask_frame.astype(np.uint8)
-                            kernel = _cv2.getStructuringElement(
-                                _cv2.MORPH_ELLIPSE, (21, 21),
+                            from tree_mask import build_tree_mask
+                            x1b, _, x2b, _ = (
+                                int(round(v)) for v in det.bbox_xyxy
                             )
-                            grown = seed.copy()
-                            prev_sum = -1
-                            max_iters = 50  # ~500 px reach (full frame)
-                            for _ in range(max_iters):
-                                cur = _cv2.dilate(grown, kernel)
-                                cur = _cv2.bitwise_and(cur, mask_u8) | grown
-                                cur_sum = int(cur.sum())
-                                if cur_sum == prev_sum:
-                                    break
-                                grown = cur
-                                prev_sum = cur_sum
-
-                            tree_mask = (grown > 0)
-                            # Drop the trunk's own pixels from the
-                            # tree mask if requested -- but typically
-                            # we want to keep the trunk in the mask
-                            # since it IS part of the tree.
-                            if tree_mask.any():
-                                # Subtract canopy already claimed by
-                                # other trunks in this frame so two
-                                # trunks 30 px apart don't double-
-                                # count overlapping leaves.
-                                other_trunk_seeds = np.zeros_like(seed)
-                                for other in dets:
-                                    if other is det:
-                                        continue
-                                    other_box = _bbox_mask(
-                                        other.bbox_xyxy, h, w,
-                                    ).astype(np.uint8)
-                                    other_trunk_seeds = (
-                                        other_trunk_seeds | other_box
-                                    )
-                                if other_trunk_seeds.any():
-                                    other_grown = other_trunk_seeds.copy()
-                                    prev = -1
-                                    for _ in range(max_iters):
-                                        cur = _cv2.dilate(
-                                            other_grown, kernel,
-                                        )
-                                        cur = (
-                                            _cv2.bitwise_and(cur, mask_u8)
-                                            | other_grown
-                                        )
-                                        cs = int(cur.sum())
-                                        if cs == prev:
-                                            break
-                                        other_grown = cur
-                                        prev = cs
-                                    # Per-pixel arbitration: keep a
-                                    # canopy pixel for OUR tree when
-                                    # the trunk-distance to ours is
-                                    # smaller (Voronoi tiebreak inside
-                                    # the contested region only).
-                                    contested = (
-                                        (grown > 0) & (other_grown > 0)
-                                    )
-                                    if contested.any():
-                                        # Distance transform from each
-                                        # trunk gives per-pixel reach.
-                                        d_self = _cv2.distanceTransform(
-                                            (1 - seed).astype(np.uint8),
-                                            _cv2.DIST_L2, 3,
-                                        )
-                                        d_others = _cv2.distanceTransform(
-                                            (1 - other_trunk_seeds).astype(
-                                                np.uint8,
-                                            ),
-                                            _cv2.DIST_L2, 3,
-                                        )
-                                        loses = contested & (d_self > d_others)
-                                        tree_mask = tree_mask & ~loses
-
-                            if tree_mask is not None and tree_mask.any():
-                                n_tree_mask_ok += 1
-                            else:
+                            anchor_pad = 30  # let build_tree_mask see
+                                             # ~30 px on each side of
+                                             # the trunk for context
+                            cc0 = max(0, x1b - anchor_pad)
+                            cc1 = min(w - 1, x2b + anchor_pad)
+                            canopy_u8 = build_tree_mask(
+                                depth_mm, rgb=rgb,
+                                roi_cols=(cc0, cc1),
+                            )
+                            tree_mask = (canopy_u8 > 0) | trunk_mask
+                            if not tree_mask.any():
                                 tree_mask = None
-                                n_tree_mask_fail += 1
-                                n_fail_voronoi += 1
                         except Exception as exc:
-                            n_tree_mask_fail += 1
-                            n_fail_exception += 1
                             log.warning(
-                                "Canopy reconstruction failed on frame %d: %s",
+                                "build_tree_mask failed for det "
+                                "in frame %d: %s",
                                 frame_idx, exc,
                             )
+                            tree_mask = None
+                    if tree_mask is not None:
+                        n_tree_mask_ok += 1
+                        n_canopy_built += 1
                     else:
                         n_tree_mask_fail += 1
                         n_fail_no_canopy += 1
+                        n_canopy_empty += 1
 
                     track = TrunkTrack(track_id=next_track_id)
                     next_track_id += 1
