@@ -1348,11 +1348,39 @@ def project_tracks_to_world(
     n_skipped_no_depth = 0
     n_skipped_out_of_range = 0
     n_projected = 0
+    n_used_dilated = 0
     hfov = math.radians(cfg.camera_hfov_deg)
+
+    def _trunk_depth_m(depth: np.ndarray, mask: np.ndarray) -> Tuple[float, bool]:
+        """Median depth inside the trunk mask, with a dilation fallback.
+
+        RealSense returns no depth for thin verticals against bright
+        backgrounds, so a sapling's mask often has 0 valid pixels.
+        Fall back to the mask dilated by ~10 px (captures the foliage
+        right next to the trunk) and take p25 (the closest = trunk
+        vicinity, not the further canopy).
+        """
+        d = _depth_in_mask(depth, mask, cfg.depth_estimator)
+        if math.isfinite(d):
+            return d, False
+        # Dilate by 10 pixels with a simple cross/box kernel.
+        try:
+            import cv2 as _cv2
+            kernel = np.ones((21, 21), dtype=np.uint8)
+            dil = _cv2.dilate(
+                mask.astype(np.uint8), kernel, iterations=1,
+            ).astype(bool)
+        except Exception:
+            return d, False
+        d2 = _depth_in_mask(depth, dil, "p25")
+        return d2, math.isfinite(d2)
+
     for track in tqdm(tracks, desc="World projection"):
         for det in track.detections:
             depth = loader.load_depth_m(det.frame_idx)
-            d_m = _depth_in_mask(depth, det.mask, cfg.depth_estimator)
+            d_m, used_dilated = _trunk_depth_m(depth, det.mask)
+            if used_dilated:
+                n_used_dilated += 1
             if not math.isfinite(d_m):
                 n_skipped_no_depth += 1
                 continue
@@ -1389,11 +1417,11 @@ def project_tracks_to_world(
             det.world_lat = wlat
             det.world_lon = wlon
     log.info(
-        "World projection: %d projected, %d skipped no-GPS, "
-        "%d skipped no-depth, %d skipped out-of-range "
+        "World projection: %d projected (%d via dilated mask fallback), "
+        "%d skipped no-GPS, %d skipped no-depth, %d skipped out-of-range "
         "(trunk_depth_m=[%.1f, %.1f])",
-        n_projected, n_skipped_no_gps, n_skipped_no_depth,
-        n_skipped_out_of_range,
+        n_projected, n_used_dilated, n_skipped_no_gps,
+        n_skipped_no_depth, n_skipped_out_of_range,
         cfg.trunk_min_depth_m, cfg.trunk_max_depth_m,
     )
     return tracks
