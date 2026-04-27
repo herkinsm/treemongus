@@ -2901,6 +2901,25 @@ def _run_one_session(
             ),
         )
 
+    # Voxel + leaf-count + Beer-Lambert LAI via lai_voxel_estimator
+    # if enabled. Writes lai_per_tree.json into the session output.
+    lai_results = None
+    if getattr(args, "lai", False):
+        try:
+            from lai_voxel_estimator import (
+                LAIConfig, process_clusters_for_lai,
+            )
+            lai_cfg = LAIConfig()
+            lai_results = process_clusters_for_lai(
+                clusters, loader, cfg=lai_cfg,
+                output_dir=str(out_root / "lai"),
+                device=args.device,
+                write_yolo_labels=False,
+            )
+        except Exception as exc:
+            log.error("LAI estimation failed: %s", exc, exc_info=True)
+            lai_results = None
+
     # Per-cluster Beer-Lambert LAI from the per-frame tree masks.
     # For each frame the cluster has a tree_mask, compute canopy
     # fraction inside the tree's bounding column (the column the
@@ -2948,6 +2967,26 @@ def _run_one_session(
                 "lai_beer_lambert": (
                     round(c.lai_beer_lambert, 3)
                     if math.isfinite(c.lai_beer_lambert) else None
+                ),
+                **(
+                    {
+                        "lai_voxel": next(
+                            (round(r.voxel_lai, 3) for r in lai_results
+                             if r.tree_id == c.tree_id),
+                            None,
+                        ),
+                        "lai_leaf_count": next(
+                            (round(r.leaf_count_lai, 3) for r in lai_results
+                             if r.tree_id == c.tree_id
+                             and math.isfinite(r.leaf_count_lai)),
+                            None,
+                        ),
+                        "lai_calibrated": next(
+                            (round(r.calibrated_lai, 3) for r in lai_results
+                             if r.tree_id == c.tree_id),
+                            None,
+                        ),
+                    } if lai_results else {}
                 ),
             }
             for c in clusters
@@ -3058,6 +3097,11 @@ def _main() -> None:
                              "PRGB ROI marks the tree currently being "
                              "sprayed; trunks outside it are background. "
                              "Set to 0 to disable.")
+    parser.add_argument("--lai", action="store_true",
+                        help="Run lai_voxel_estimator after clustering: "
+                             "hierarchical SAM 3 sub-segmentation + voxel "
+                             "fusion + leaf count + Beer-Lambert. Writes "
+                             "lai_per_tree.json into <session>/lai/.")
     parser.add_argument("--allow-missing-modalities", action="store_true",
                         help="By default the loader drops any frame missing "
                              "depth, PRGB, or Info — mirrors analyze_days.py "
