@@ -1276,77 +1276,56 @@ def _propagate_image_mode(
                     if depth_mm is not None:
                         try:
                             from tree_mask import build_wide_tree_mask
-                            import cv2 as _cv2
                             wide_u8 = build_wide_tree_mask(
                                 depth_mm, rgb,
                                 isolate_target_tree=False,
                                 apply_gradient_ground_filter=True,
                                 apply_blue_cv_sky_filter=True,
                             )
+                            wide_bool = (wide_u8 > 0)
 
-                            # Pick the canopy CC that contains this
-                            # trunk's pixel column. Background trees
-                            # appear as DIFFERENT connected
-                            # components after build_wide_tree_mask
-                            # -- selecting only the CC whose pixels
-                            # overlap the trunk's column drops them
-                            # without depending on a hardcoded depth
-                            # threshold. Adjacent trees in the same
-                            # row each get their own CC (because
-                            # ground in between is rejected by the
-                            # gradient filter).
-                            n_cc, labels, stats, _ = (
-                                _cv2.connectedComponentsWithStats(
-                                    wide_u8, connectivity=8,
-                                )
-                            )
-                            x1b, y1b, x2b, y2b = (
+                            # Restrict the wide mask to a column band
+                            # around THIS trunk so adjacent trees (and
+                            # background trees) get their own slice.
+                            # No CC pick -- the whole wide mask
+                            # within the column is this tree's canopy
+                            # (build_wide_tree_mask already excluded
+                            # ground via gradient + bottom cutoff;
+                            # column restriction handles per-tree
+                            # spatial separation).
+                            x1b, _, x2b, _ = (
                                 int(round(v)) for v in det.bbox_xyxy
                             )
-                            col_pad = 30
-                            cc_x0 = max(0, x1b - col_pad)
-                            cc_x1 = min(w, x2b + col_pad)
-                            cc_y0 = max(0, y1b)
-                            cc_y1 = min(h, y2b)
-                            chosen_cc = 0
-                            if (cc_x1 > cc_x0 and cc_y1 > cc_y0
-                                    and n_cc > 1):
-                                roi_labels = labels[
-                                    cc_y0:cc_y1, cc_x0:cc_x1,
-                                ]
-                                cc_counts = np.bincount(
-                                    roi_labels.ravel(), minlength=n_cc,
-                                )
-                                cc_counts[0] = 0
-                                if cc_counts.any():
-                                    chosen_cc = int(cc_counts.argmax())
+                            col_pad = 80
+                            cb0 = max(0, x1b - col_pad)
+                            cb1 = min(w, x2b + col_pad)
+                            col_band = np.zeros_like(wide_bool)
+                            col_band[:, cb0:cb1] = True
+                            in_col = wide_bool & col_band
 
-                            if chosen_cc > 0:
-                                tree_cc = (labels == chosen_cc)
-                                # Depth-coherence post-filter: keep
-                                # pixels within ±400 mm of this CC's
-                                # median depth.
-                                valid = tree_cc & (depth_mm > 0)
-                                if valid.any():
-                                    med = float(np.median(depth_mm[valid]))
-                                    coh_lo = max(1, int(med - 400))
-                                    coh_hi = int(med + 400)
-                                    coherent = (
-                                        tree_cc
-                                        & (depth_mm >= coh_lo)
-                                        & (depth_mm <= coh_hi)
-                                    )
-                                    tree_mask = coherent | trunk_mask
-                                else:
-                                    tree_mask = tree_cc | trunk_mask
-                            else:
-                                # No canopy CC overlaps this trunk's
-                                # column -- it's a background false
-                                # positive (car, fence post, distant
-                                # structure that GDINO mis-labelled
-                                # as a trunk). Drop the detection
-                                # entirely so it never reaches DBSCAN.
+                            # Background-trunk filter: must have at
+                            # least 200 px of canopy in this trunk's
+                            # column for the detection to be a real
+                            # tree. Cars/posts produce nothing.
+                            if int(in_col.sum()) < 200:
                                 continue
+
+                            # Depth-coherence: use the median depth
+                            # inside this trunk's column-canopy as
+                            # the tree's distance, keep ±400 mm.
+                            valid = in_col & (depth_mm > 0)
+                            if valid.any():
+                                med = float(np.median(depth_mm[valid]))
+                                coh_lo = max(1, int(med - 400))
+                                coh_hi = int(med + 400)
+                                coherent = (
+                                    in_col
+                                    & (depth_mm >= coh_lo)
+                                    & (depth_mm <= coh_hi)
+                                )
+                                tree_mask = coherent | trunk_mask
+                            else:
+                                tree_mask = in_col | trunk_mask
 
                             if not tree_mask.any():
                                 tree_mask = None
