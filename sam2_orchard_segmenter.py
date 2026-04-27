@@ -2907,9 +2907,27 @@ def _run_one_session(
     if getattr(args, "lai", False):
         try:
             from lai_voxel_estimator import (
-                LAIConfig, process_clusters_for_lai,
+                LAIConfig, CameraIntrinsics, process_clusters_for_lai,
             )
-            lai_cfg = LAIConfig()
+            # LAIConfig defaults to D455 native 1280x720 intrinsics,
+            # but the All2023 dataset is RGB-stream 640x480 (half-res).
+            # Scale fx/fy/cx/cy proportionally to the actual frame
+            # size so backproject_to_world's meshgrid matches the
+            # mask/depth shape.
+            sample_rgb = loader.load_rgb(loader.frame_indices()[0])
+            ah, aw = sample_rgb.shape[:2]
+            default_w, default_h = 1280, 720
+            scale_x = aw / float(default_w)
+            scale_y = ah / float(default_h)
+            scaled_intr = CameraIntrinsics(
+                fx=644.0 * scale_x,
+                fy=644.0 * scale_y,
+                cx=644.0 * scale_x,
+                cy=360.0 * scale_y,
+                width=aw,
+                height=ah,
+            )
+            lai_cfg = LAIConfig(intrinsics=scaled_intr)
             lai_results = process_clusters_for_lai(
                 clusters, loader, cfg=lai_cfg,
                 output_dir=str(out_root / "lai"),
