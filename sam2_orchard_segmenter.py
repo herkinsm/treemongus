@@ -191,7 +191,8 @@ class SegmenterConfig:
     # passes by — DBSCAN can't reassemble them. RealSense D435 RGB
     # is ~69°; default 60° is a conservative pick that under-shoots
     # rather than over-shoots lateral spread.
-    camera_hfov_deg: float = 60.0
+    # RealSense D455F datasheet HFOV (sprayer_pipeline.config.CAMERA_HFOV_DEG).
+    camera_hfov_deg: float = 87.0
     # Use the median depth inside the trunk mask rather than the mean —
     # robust against the few aberrant depth pixels every D455 frame has.
     depth_estimator: str = "median"     # {"median", "mean", "p25"}
@@ -1169,16 +1170,18 @@ def _propagate_image_mode(
                 state = sam3_processor.set_image(pil_img)
 
                 # Pre-compute the sprayer-pipeline canopy mask once
-                # per frame. This is the depth-thresholded, row-band-
-                # filtered tree mask the user already uses for flower
-                # filtering — far more reliable for thin saplings than
-                # SAM 3 wrestling with sparse foliage. We'll split
-                # this canopy across the frame's trunks via
-                # nearest-trunk assignment so touching trees stay
-                # separated.
+                # per frame. This is the canonical build_tree_mask
+                # ported verbatim from sprayer_pipeline/tree_mask.py:
+                # depth-thresholded, row-band-filtered, sky/grass-
+                # excluded via RGB HSV, with anchor-on-ROI-columns
+                # and forward-branch recovery. Identical to the mask
+                # the user already trusts for flower filtering.
+                # We then split the canopy across the frame's trunks
+                # via nearest-trunk assignment so touching trees
+                # stay separated.
                 canopy_mask_frame: Optional[np.ndarray] = None
                 try:
-                    from analyze_days import compute_canopy_mask
+                    from tree_mask import build_tree_mask
                     depth_m = loader.load_depth_m(frame_idx)
                     if depth_m is not None and np.isfinite(depth_m).any():
                         depth_mm = np.where(
@@ -1186,16 +1189,14 @@ def _propagate_image_mode(
                             (depth_m * 1000.0).astype(np.uint16),
                             np.zeros_like(depth_m, dtype=np.uint16),
                         )
-                        canopy_mask_frame = compute_canopy_mask(
-                            depth_mm,
-                            min_mm=int(cfg.trunk_min_depth_m * 1000),
-                            max_mm=int(cfg.trunk_max_depth_m * 1000),
-                        )
+                        # build_tree_mask returns uint8 (0 / 255).
+                        canopy_u8 = build_tree_mask(depth_mm, rgb=rgb)
+                        canopy_mask_frame = (canopy_u8 > 0)
                         if not canopy_mask_frame.any():
                             canopy_mask_frame = None
                 except Exception as exc:
                     log.debug(
-                        "Canopy mask failed on frame %d: %s",
+                        "build_tree_mask failed on frame %d: %s",
                         frame_idx, exc,
                     )
                     canopy_mask_frame = None
@@ -2945,13 +2946,12 @@ def _main() -> None:
     parser.add_argument("--row-heading-deg", type=float, default=None,
                         help="Orchard row compass bearing. Auto-estimated from "
                              "GPS trail when omitted.")
-    parser.add_argument("--camera-hfov-deg", type=float, default=60.0,
-                        help="Camera horizontal FOV in degrees (default 60). "
-                             "Used to convert each detection's pixel-x into a "
-                             "true lateral world offset; without it every "
-                             "trunk in a frame projects to the same point and "
-                             "the same tree smears along the row as the "
-                             "camera passes by. RealSense D435 RGB is ~69°.")
+    parser.add_argument("--camera-hfov-deg", type=float, default=87.0,
+                        help="Camera horizontal FOV in degrees (default 87 "
+                             "= RealSense D455F datasheet, matches "
+                             "sprayer_pipeline.config.CAMERA_HFOV_DEG). Used "
+                             "to convert each detection's pixel-x into a "
+                             "true lateral world offset.")
     parser.add_argument("--trunk-min-depth-m", type=float, default=0.3,
                         help="Reject trunks whose mask depth is below this "
                              "many metres (default 0.3).")
