@@ -2920,21 +2920,18 @@ def compute_per_frame_lai(
 
     log.info("Per-frame LAI: loading SAM 3 (text-only canopy)")
     sam3_model = build_sam3_image_model()
-    # Tighter confidence threshold than the trunk pass: 0.05 is fine
-    # for box-prompted SAM 3, but text-only with generic prompts will
-    # over-include at low thresholds.
+    # 0.15 lets partial / edge-cut trees fire while still keeping
+    # noisy text-prompt detections out.
     processor = Sam3Processor(
-        sam3_model, device=device, confidence_threshold=0.20,
+        sam3_model, device=device, confidence_threshold=0.15,
     )
     autocast_dtype = (
         _torch.bfloat16 if device.startswith("cuda") else _torch.float32
     )
-    # Drop "tree" (too generic; matches grass) and "tree branch"
-    # (returns sparse strip-shaped instances). "apple tree" is
-    # specific enough that SAM 3 picks the real tree silhouette.
-    # "leaves" backfills foliage SAM 3's "apple tree" misses on
-    # sparse canopies.
-    prompts = ("apple tree", "leaves")
+    # 'apple tree' only. 'leaves' was matching grass; 'tree' was
+    # too generic. SAM 3's 'apple tree' instance includes the
+    # canopy as part of the tree.
+    prompts = ("apple tree",)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "lai_per_frame.csv"
@@ -2965,6 +2962,18 @@ def compute_per_frame_lai(
                 np.zeros_like(depth_m, dtype=np.uint16),
             ) if depth_m is not None else None
         )
+
+        # Data-driven canopy depth window from the PRGB ROI.
+        # The PRGB box marks the spray target tree; the median
+        # depth inside it IS this frame's target distance. Allow
+        # ±700 mm around that median so the canopy is the target
+        # tree only -- ground (closer/farther in foreground) and
+        # background trees (much farther) get filtered out.
+        target_med_mm = None
+        if depth_mm is not None:
+            roi_d = depth_mm[roi_mask & (depth_mm > 0)]
+            if roi_d.size >= 50:
+                target_med_mm = float(np.median(roi_d))
 
         # SAM 3 union across tree-related text prompts.
         # Per-instance grass filter: a single mask whose bbox spans
@@ -3015,7 +3024,15 @@ def compute_per_frame_lai(
 
         # Depth validation + gradient ground filter + bottom cutoff.
         if depth_mm is not None and canopy_union.any():
-            in_band = (depth_mm >= _CMM) & (depth_mm <= _CXMM)
+            # Prefer the data-driven target band from PRGB ROI;
+            # fall back to the wide [600, 3000] mm band when ROI
+            # depth is too sparse.
+            if target_med_mm is not None:
+                band_lo = max(1, int(target_med_mm - 700))
+                band_hi = int(target_med_mm + 700)
+            else:
+                band_lo, band_hi = _CMM, _CXMM
+            in_band = (depth_mm >= band_lo) & (depth_mm <= band_hi)
             no_depth_upper = (
                 (depth_mm == 0)
                 & (np.arange(h)[:, None] < 380)
