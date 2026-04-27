@@ -679,6 +679,7 @@ def backproject_to_world(
     target_classes: Tuple[int, ...] = (1,),       # default: leaves only
     lat0: float = 0.0,
     lon0: float = 0.0,
+    icp_corrections: Optional[Dict[int, np.ndarray]] = None,
 ) -> np.ndarray:
     """Convert classified pixels into a world-coordinate point cloud.
 
@@ -725,6 +726,11 @@ def backproject_to_world(
         ant_u = 0.0
         T, _ = _camera_to_world_se3(gps_lat, gps_lon, heading, cfg)
         T[:3, 3] += np.array([ant_e, ant_n, ant_u])
+        # Apply ICP refinement to this frame's pose if available.
+        if icp_corrections is not None:
+            corr = icp_corrections.get(frame_idx)
+            if corr is not None:
+                T = corr @ T
 
         for sm in sms:
             sel = sm.mask & np.isfinite(depth) & (depth > 0.1) & (depth < 20.0)
@@ -872,28 +878,12 @@ def aggregate_tree_pointcloud(
         target_classes=(1,),
         lat0=cluster.world_lat,
         lon0=cluster.world_lon,
+        icp_corrections=icp_corrections,
     )
     if pts4.size == 0:
         return np.zeros((0, 3), dtype=np.float32)
 
-    pts = pts4[:, :3]
-
-    # Apply ICP corrections if computed. We applied them per-frame
-    # to the camera->world transform, but here we have already-projected
-    # world points; for simplicity skip per-point correction and rely
-    # on the GPS-only projection (good enough at 2 cm voxel res for
-    # most of the tree). If ICP refinement is desired here, project
-    # frame-by-frame in this function instead and apply the correction
-    # before stacking.
-    if icp_corrections:
-        # Note: backproject_to_world above flattens across frames, so
-        # to apply per-frame ICP we'd need a per-point frame_idx map.
-        # That refactor is left as a follow-up; current implementation
-        # uses GPS-only registration which is typically within 5 cm.
-        log.debug("ICP corrections provided but per-point application "
-                  "not yet implemented in this aggregator; using GPS pose")
-
-    return pts.astype(np.float32)
+    return pts4[:, :3].astype(np.float32)
 
 
 # ============================================================================
