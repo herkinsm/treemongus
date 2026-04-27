@@ -781,16 +781,12 @@ def detect_trunks_grounding_dino(
     model.eval()
 
     detections_by_frame: Dict[int, List[TrunkDetection]] = {}
-    n_drop_score = n_drop_area = n_drop_aspect = 0
-    n_drop_depth = n_drop_roi = 0
+    n_drop_score = n_drop_area = n_drop_aspect = n_drop_roi = 0
 
     for frame_idx in tqdm(loader.frame_indices(), desc="GDINO trunk detect"):
         rgb = loader.load_rgb(frame_idx)
         h, w = rgb.shape[:2]
         frame_area = float(h * w)
-        depth = loader.load_depth_m(frame_idx) if (
-            cfg.trunk_min_depth_m > 0 or cfg.trunk_max_depth_m > 0
-        ) else None
         roi = loader.load_roi_mask(frame_idx) if (
             cfg.trunk_min_roi_overlap > 0
         ) else None
@@ -842,30 +838,6 @@ def detect_trunks_grounding_dino(
                 n_drop_aspect += 1
                 continue
 
-            # Depth gate: the *closest* pixels in the bbox should
-            # land in plausible trunk range. Median fails for thin
-            # saplings because the bbox is mostly background-through-
-            # branches; the 25th-percentile catches the trunk pixels
-            # themselves while still rejecting fully-background hits
-            # (where even p25 is far away).
-            if depth is not None:
-                xi1 = max(0, int(round(x1)))
-                yi1 = max(0, int(round(y1)))
-                xi2 = min(w, int(round(x2)))
-                yi2 = min(h, int(round(y2)))
-                if xi2 <= xi1 or yi2 <= yi1:
-                    continue
-                d_crop = depth[yi1:yi2, xi1:xi2]
-                d_valid = d_crop[np.isfinite(d_crop) & (d_crop > 0)]
-                if d_valid.size == 0:
-                    n_drop_depth += 1
-                    continue
-                d_near = float(np.percentile(d_valid, 25))
-                if (d_near < cfg.trunk_min_depth_m
-                        or d_near > cfg.trunk_max_depth_m):
-                    n_drop_depth += 1
-                    continue
-
             # ROI gate: bbox must overlap the PRGB ROI by at least
             # trunk_min_roi_overlap of the bbox area. The ROI marks
             # the tree currently being sprayed; trunks outside it
@@ -895,9 +867,9 @@ def detect_trunks_grounding_dino(
     n_total = sum(len(v) for v in detections_by_frame.values())
     log.info(
         "GDINO: %d trunk detections across %d frames "
-        "(dropped: area=%d aspect=%d depth=%d roi=%d)",
+        "(dropped: area=%d aspect=%d roi=%d)",
         n_total, len(detections_by_frame),
-        n_drop_area, n_drop_aspect, n_drop_depth, n_drop_roi,
+        n_drop_area, n_drop_aspect, n_drop_roi,
     )
     return detections_by_frame
 
@@ -1374,6 +1346,7 @@ def project_tracks_to_world(
 
     n_skipped_no_gps = 0
     n_skipped_no_depth = 0
+    n_skipped_out_of_range = 0
     n_projected = 0
     hfov = math.radians(cfg.camera_hfov_deg)
     for track in tqdm(tracks, desc="World projection"):
@@ -1382,6 +1355,13 @@ def project_tracks_to_world(
             d_m = _depth_in_mask(depth, det.mask, cfg.depth_estimator)
             if not math.isfinite(d_m):
                 n_skipped_no_depth += 1
+                continue
+            # Plausible-range gate using the actual SAM-refined trunk
+            # mask (much tighter than the GDINO bbox, so background-
+            # through-branches pixels don't dominate).
+            if (d_m < cfg.trunk_min_depth_m
+                    or d_m > cfg.trunk_max_depth_m):
+                n_skipped_out_of_range += 1
                 continue
             meta = loader.load_meta(det.frame_idx)
             if "gps_lat" not in meta or "gps_lon" not in meta:
@@ -1410,8 +1390,11 @@ def project_tracks_to_world(
             det.world_lon = wlon
     log.info(
         "World projection: %d projected, %d skipped no-GPS, "
-        "%d skipped no-depth",
+        "%d skipped no-depth, %d skipped out-of-range "
+        "(trunk_depth_m=[%.1f, %.1f])",
         n_projected, n_skipped_no_gps, n_skipped_no_depth,
+        n_skipped_out_of_range,
+        cfg.trunk_min_depth_m, cfg.trunk_max_depth_m,
     )
     return tracks
 
