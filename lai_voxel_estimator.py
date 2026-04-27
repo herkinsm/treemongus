@@ -342,15 +342,25 @@ def segment_tree_subregions(
     sub_prompts = ("leaf", "leaves", "branch", "apple", "fruit")
 
     # Get the per-frame silhouette masks for this tree from its tracks.
+    # Prefer the whole-tree (canopy) mask when available -- the trunk
+    # mask alone is too narrow for hierarchical sub-segmentation and
+    # produces nonsense gap fractions (all-gap or all-foliage in the
+    # tiny strip).
     silhouette_by_frame: Dict[int, np.ndarray] = {}
     for track in cluster.tracks:
         for det in track.detections:
-            if det.frame_idx in cluster.frame_pixels and det.mask is not None:
-                # If multiple tracks contribute to this frame, OR them.
-                m = silhouette_by_frame.get(det.frame_idx)
-                silhouette_by_frame[det.frame_idx] = (
-                    det.mask if m is None else (m | det.mask)
-                )
+            if det.frame_idx not in cluster.frame_pixels:
+                continue
+            sil = (det.tree_mask
+                   if (det.tree_mask is not None
+                       and det.tree_mask.any())
+                   else det.mask)
+            if sil is None:
+                continue
+            m = silhouette_by_frame.get(det.frame_idx)
+            silhouette_by_frame[det.frame_idx] = (
+                sil if m is None else (m | sil)
+            )
 
     for frame_idx, silhouette in tqdm(
         silhouette_by_frame.items(),
@@ -961,10 +971,17 @@ def gap_fraction_lai_per_frame(
             continue
         # Effective gap fraction: gaps relative to total silhouette.
         # Branches are NOT gaps -- they block light too -- so they
-        # count toward the foliage side.
-        p_gap = max(1e-3, min(0.99, n_gap / n_canopy))
+        # count toward the foliage side. The 0.05 floor (was 1e-3)
+        # caps the per-frame LAI at a physically plausible value:
+        # -ln(0.05)/0.4/0.78 = 9.6, vs the previous 1e-3 floor that
+        # produced 22.14 when classify_subregions returned all-
+        # foliage on a single-frame tree. Real orchards top out
+        # around LAI 6-8 for the densest dwarf-rootstock blocks.
+        p_gap = max(0.05, min(0.99, n_gap / n_canopy))
         lai_naive = -math.log(p_gap) / cfg.extinction_coef_k
         lai = lai_naive / max(cfg.clumping_index, 1e-3)
+        # Hard sanity clamp.
+        lai = min(lai, 9.0)
         out.append(float(lai))
     return out
 
