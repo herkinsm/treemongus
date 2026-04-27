@@ -2864,6 +2864,237 @@ def _walk_all2023_sessions(root: Path) -> List[Path]:
     return sessions
 
 
+def compute_per_frame_lai(
+    loader: "FrameLoader",
+    out_dir: Path,
+    device: str = "cuda",
+) -> Optional[Path]:
+    """Per-frame, per-ROI LAI from SAM 3 canopy masks.
+
+    Independent of the trunk / DBSCAN pipeline. For every frame
+    that has a PRGB ROI:
+
+      1. Build the canopy mask via SAM 3 with text prompts
+         "apple tree", "tree", "leaves", "tree branch" (union of
+         all detected instances).
+      2. Validate with depth: keep pixels in the canopy depth
+         band [600, 3000] mm, plus depth-dropout pixels in the
+         upper half (where SAM 3's visual evidence stands in for
+         missing depth on thin leaves).
+      3. Hard row-420 cutoff (matches sprayer_pipeline default).
+      4. Apply the 10 sprayer ROI rectangles from
+         tree_mask.ROI_RECTS (2 cols × 5 rows, fixed pixel
+         positions, same grid the flower counter uses).
+      5. Per zone: canopy_fraction = mask_pixels / zone_area,
+         LAI = -ln(1 - cf) / 0.5.
+
+    Frames lacking PRGB ROI are skipped (consistent with
+    analyze_days.py --skip-no-roi).
+
+    Output: <out_dir>/lai_per_frame.csv with one row per
+    processed frame, columns: session, frame_idx, image_path,
+    lai_z0..lai_z9, mean_lai, total_canopy_px.
+    """
+    import csv as _csv
+    import torch as _torch
+    from PIL import Image as _PILImage
+    from tqdm.auto import tqdm
+
+    try:
+        from sam3 import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+    except ImportError:
+        log.warning("sam3 not importable; per-frame LAI skipped")
+        return None
+
+    try:
+        from tree_mask import (
+            ROI_RECTS,
+            beer_lambert_lai,
+            CANOPY_DEPTH_MIN_MM as _CMM,
+            CANOPY_DEPTH_MAX_MM as _CXMM,
+        )
+    except ImportError:
+        log.warning("tree_mask not importable; per-frame LAI skipped")
+        return None
+
+    log.info("Per-frame LAI: loading SAM 3 (text-only canopy)")
+    sam3_model = build_sam3_image_model()
+    processor = Sam3Processor(
+        sam3_model, device=device, confidence_threshold=0.05,
+    )
+    autocast_dtype = (
+        _torch.bfloat16 if device.startswith("cuda") else _torch.float32
+    )
+    prompts = ("apple tree", "tree", "leaves", "tree branch")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "lai_per_frame.csv"
+
+    n_kept = n_skipped_no_roi = n_skipped_no_canopy = 0
+    rows: List[Dict] = []
+
+    session_name = (
+        loader._session_dir.name  # type: ignore[attr-defined]
+        if hasattr(loader, "_session_dir") else ""
+    )
+
+    for frame_idx in tqdm(loader.frame_indices(), desc="Per-frame LAI"):
+        # Skip frames without a PRGB ROI -- consistent with
+        # analyze_days.py --skip-no-roi.
+        roi_mask = loader.load_roi_mask(frame_idx)
+        if roi_mask is None or not roi_mask.any():
+            n_skipped_no_roi += 1
+            continue
+
+        rgb = loader.load_rgb(frame_idx)
+        h, w = rgb.shape[:2]
+        depth_m = loader.load_depth_m(frame_idx)
+        depth_mm = (
+            np.where(
+                np.isfinite(depth_m) & (depth_m > 0),
+                (depth_m * 1000.0).astype(np.uint16),
+                np.zeros_like(depth_m, dtype=np.uint16),
+            ) if depth_m is not None else None
+        )
+
+        # SAM 3 union across tree-related text prompts.
+        canopy_union = np.zeros((h, w), dtype=bool)
+        with _torch.autocast(
+            "cuda" if device.startswith("cuda") else "cpu",
+            dtype=autocast_dtype,
+        ):
+            state = processor.set_image(_PILImage.fromarray(rgb))
+            for tp in prompts:
+                processor.reset_all_prompts(state)
+                try:
+                    state = processor.set_text_prompt(
+                        prompt=tp, state=state,
+                    )
+                except Exception:
+                    continue
+                ms = state.get("masks")
+                if ms is None or len(ms) == 0:
+                    continue
+                arr = ms.detach().cpu()
+                if arr.dtype != _torch.bool:
+                    arr = arr.to(_torch.bool)
+                arr = arr.numpy()
+                if arr.ndim == 4:
+                    arr = arr.squeeze(1)
+                for i in range(arr.shape[0]):
+                    canopy_union |= arr[i].astype(bool)
+
+        # Depth validation + bottom cutoff.
+        if depth_mm is not None and canopy_union.any():
+            in_band = (depth_mm >= _CMM) & (depth_mm <= _CXMM)
+            no_depth_upper = (
+                (depth_mm == 0)
+                & (np.arange(h)[:, None] < 380)
+            )
+            canopy = canopy_union & (in_band | no_depth_upper)
+        else:
+            canopy = canopy_union
+        canopy[420:, :] = False
+
+        if not canopy.any():
+            n_skipped_no_canopy += 1
+            continue
+
+        # Camera intrinsics scaled to actual frame size (D455 native
+        # 1280x720 -> our 640x480 typically halves them). Used for
+        # the voxel branch only.
+        fx = 644.0 * (w / 1280.0)
+        fy = 644.0 * (h / 720.0)
+        cx = 644.0 * (w / 1280.0)
+        cy = 360.0 * (h / 720.0)
+        voxel_size_m = 0.02
+
+        # Per-zone Beer-Lambert (canopy fraction) + voxel LAI
+        # (3D point cloud single-view).
+        bl_lais: List[float] = []
+        vx_lais: List[float] = []
+        for (x0, y0, x1, y1) in ROI_RECTS:
+            sub = canopy[y0:y1 + 1, x0:x1 + 1]
+            cf = (
+                float(sub.sum()) / float(sub.size)
+                if sub.size else 0.0
+            )
+            bl_lais.append(beer_lambert_lai(cf))
+
+            # Voxel LAI: project canopy pixels in this zone to 3D
+            # via their depth, voxelize at 2 cm, divide leaf area
+            # (n_voxels * voxel_face_area) by the zone's ground
+            # area at the median depth.
+            vlai = 0.0
+            if depth_mm is not None and sub.any():
+                sub_depth = depth_mm[y0:y1 + 1, x0:x1 + 1]
+                valid = sub & (sub_depth > 0)
+                if valid.sum() >= 50:
+                    ys, xs = np.where(valid)
+                    z_m = sub_depth[ys, xs].astype(np.float32) / 1000.0
+                    x_full = (xs + x0).astype(np.float32)
+                    y_full = (ys + y0).astype(np.float32)
+                    X = (x_full - cx) / fx * z_m
+                    Y = (y_full - cy) / fy * z_m
+                    pts = np.stack([X, Y, z_m], axis=1)
+                    vox_idx = np.floor(pts / voxel_size_m).astype(np.int32)
+                    n_vox = int(
+                        np.unique(vox_idx, axis=0).shape[0]
+                    )
+                    leaf_area_m2 = n_vox * (voxel_size_m ** 2)
+                    z_med = float(np.median(z_m))
+                    if z_med > 0:
+                        zone_w_m = (x1 - x0) * z_med / fx
+                        zone_h_m = (y1 - y0) * z_med / fy
+                        zone_area_m2 = zone_w_m * zone_h_m
+                        if zone_area_m2 > 0:
+                            vlai = leaf_area_m2 / zone_area_m2
+            vx_lais.append(min(vlai, 9.0))   # cap at 9 like Beer-Lambert
+
+        try:
+            img_path = str(loader._imgs[frame_idx])  # type: ignore[attr-defined]
+        except Exception:
+            img_path = ""
+        row = {
+            "session": session_name,
+            "frame_idx": frame_idx,
+            "image_path": img_path,
+            "total_canopy_px": int(canopy.sum()),
+            "mean_lai_beer_lambert": round(float(np.mean(bl_lais)), 4),
+            "mean_lai_voxel": round(float(np.mean(vx_lais)), 4),
+        }
+        for zi, lv in enumerate(bl_lais):
+            row[f"lai_bl_z{zi}"] = round(float(lv), 4)
+        for zi, lv in enumerate(vx_lais):
+            row[f"lai_vx_z{zi}"] = round(float(lv), 4)
+        rows.append(row)
+        n_kept += 1
+
+    if not rows:
+        log.warning("Per-frame LAI: no rows produced")
+        return None
+
+    fields = (
+        ["session", "frame_idx", "image_path", "total_canopy_px",
+         "mean_lai_beer_lambert", "mean_lai_voxel"]
+        + [f"lai_bl_z{i}" for i in range(len(ROI_RECTS))]
+        + [f"lai_vx_z{i}" for i in range(len(ROI_RECTS))]
+    )
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        w_csv = _csv.DictWriter(fh, fieldnames=fields)
+        w_csv.writeheader()
+        for r in rows:
+            w_csv.writerow(r)
+
+    log.info(
+        "Per-frame LAI: %d rows written to %s "
+        "(%d skipped no-ROI, %d skipped no-canopy)",
+        n_kept, csv_path, n_skipped_no_roi, n_skipped_no_canopy,
+    )
+    return csv_path
+
+
 def _run_one_session(
     session_dir: Path,
     cfg: SegmenterConfig,
@@ -3036,6 +3267,18 @@ def _run_one_session(
     if not args.no_contact_sheets:
         build_contact_sheets(clusters, loader, str(out_root / "contact_sheets"), cfg)
 
+    # Per-frame LAI in the 10 sprayer ROI zones, independent of
+    # the trunk / cluster pipeline. Skips frames with no PRGB ROI.
+    if getattr(args, "per_frame_lai", True):
+        try:
+            compute_per_frame_lai(
+                loader,
+                out_root,
+                device=args.device,
+            )
+        except Exception as exc:
+            log.error("Per-frame LAI failed: %s", exc, exc_info=True)
+
     summary = {
         "session": session_name,
         "n_trees": len(clusters),
@@ -3191,6 +3434,15 @@ def _main() -> None:
                              "hierarchical SAM 3 sub-segmentation + voxel "
                              "fusion + leaf count + Beer-Lambert. Writes "
                              "lai_per_tree.json into <session>/lai/.")
+    parser.add_argument("--no-per-frame-lai", action="store_false",
+                        dest="per_frame_lai",
+                        help="Disable per-frame LAI (10 ROI zones, "
+                             "Beer-Lambert + single-view voxel) computed "
+                             "via SAM 3 canopy. By default this stage runs "
+                             "alongside the trunk pipeline and writes "
+                             "<session>/lai_per_frame.csv. Skips frames "
+                             "with no PRGB ROI.")
+    parser.set_defaults(per_frame_lai=True)
     parser.add_argument("--allow-missing-modalities", action="store_true",
                         help="By default the loader drops any frame missing "
                              "depth, PRGB, or Info — mirrors analyze_days.py "
