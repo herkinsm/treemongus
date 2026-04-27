@@ -142,6 +142,14 @@ class SegmenterConfig:
     # anything > 6 m is a background object (other rows, barns).
     trunk_min_depth_m: float = 0.3
     trunk_max_depth_m: float = 15.0
+    # When mask depth is unmeasurable (RealSense fails on thin trunks
+    # against bright sky / sparse foliage), fall back to this nominal
+    # perpendicular distance from camera to the sprayed row. The
+    # tree's projected world position then uses pixel-x angle *
+    # nominal_distance to compute the along-row offset, instead of
+    # actual depth. Set to 0 to disable the fallback (strict depth
+    # only, will discard most thin-trunk detections).
+    nominal_tree_distance_m: float = 1.5
     # Require the GDINO bbox to overlap the PRGB ROI by at least this
     # fraction of the bbox. The ROI marks the tree currently being
     # sprayed; trunks outside it are background. Set to 0 to disable.
@@ -1379,20 +1387,36 @@ def project_tracks_to_world(
         d2 = float(np.percentile(depth[valid], 10))
         return d2, math.isfinite(d2)
 
+    n_used_nominal = 0
     for track in tqdm(tracks, desc="World projection"):
         for det in track.detections:
             depth = loader.load_depth_m(det.frame_idx)
             d_m, used_dilated = _trunk_depth_m(depth, det.mask)
+            used_nominal = False
             if used_dilated:
                 n_used_dilated += 1
             if not math.isfinite(d_m):
-                n_skipped_no_depth += 1
-                continue
+                # Final fallback: nominal aisle distance. Sprayer-row
+                # geometry is roughly fixed, so this gives a usable
+                # perpendicular distance even when RealSense returns
+                # nothing for the trunk. The pixel-x angle still
+                # provides the along-row offset.
+                if cfg.nominal_tree_distance_m > 0:
+                    d_m = cfg.nominal_tree_distance_m
+                    used_nominal = True
+                    n_used_nominal += 1
+                else:
+                    n_skipped_no_depth += 1
+                    continue
             # Plausible-range gate using the actual SAM-refined trunk
             # mask (much tighter than the GDINO bbox, so background-
-            # through-branches pixels don't dominate).
-            if (d_m < cfg.trunk_min_depth_m
-                    or d_m > cfg.trunk_max_depth_m):
+            # through-branches pixels don't dominate). Skip the gate
+            # for nominal-distance fallbacks (we know the value is in
+            # range by construction).
+            if not used_nominal and (
+                d_m < cfg.trunk_min_depth_m
+                or d_m > cfg.trunk_max_depth_m
+            ):
                 n_skipped_out_of_range += 1
                 continue
             meta = loader.load_meta(det.frame_idx)
@@ -1421,11 +1445,13 @@ def project_tracks_to_world(
             det.world_lat = wlat
             det.world_lon = wlon
     log.info(
-        "World projection: %d projected (%d via dilated mask fallback), "
+        "World projection: %d projected "
+        "(%d dilated-mask, %d nominal-distance fallback %.1f m), "
         "%d skipped no-GPS, %d skipped no-depth, %d skipped out-of-range "
         "(trunk_depth_m=[%.1f, %.1f])",
-        n_projected, n_used_dilated, n_skipped_no_gps,
-        n_skipped_no_depth, n_skipped_out_of_range,
+        n_projected, n_used_dilated, n_used_nominal,
+        cfg.nominal_tree_distance_m,
+        n_skipped_no_gps, n_skipped_no_depth, n_skipped_out_of_range,
         cfg.trunk_min_depth_m, cfg.trunk_max_depth_m,
     )
     return tracks
@@ -2565,6 +2591,16 @@ def _main() -> None:
                              "effective range). Lower to e.g. 5 if the "
                              "camera is foreground-aimed; raise if it looks "
                              "sideways across the aisle.")
+    parser.add_argument("--nominal-tree-distance-m", type=float,
+                        default=1.5,
+                        help="Fallback perpendicular distance from camera "
+                             "to the sprayed row (default 1.5 m). Used when "
+                             "RealSense returns no depth for a thin trunk. "
+                             "Combined with the trunk's pixel-x angle this "
+                             "gives a usable world projection so the same "
+                             "tree across passes / front-back views still "
+                             "clusters together. Set to 0 to disable the "
+                             "fallback (strict depth-only mode).")
     parser.add_argument("--trunk-min-roi-overlap", type=float, default=0.10,
                         help="Reject trunk detections whose bbox overlaps "
                              "the (vertically-extended) PRGB ROI by less "
@@ -2608,6 +2644,7 @@ def _main() -> None:
         trunk_min_depth_m=args.trunk_min_depth_m,
         trunk_max_depth_m=args.trunk_max_depth_m,
         trunk_min_roi_overlap=args.trunk_min_roi_overlap,
+        nominal_tree_distance_m=args.nominal_tree_distance_m,
     )
 
     sessions = _walk_all2023_sessions(Path(args.root))
