@@ -470,20 +470,19 @@ def build_wide_tree_mask(
             sky_blue_cv[max_row:, :] = False
         fg = fg & ~sky_blue_cv
 
-    # Depth-gradient ground filter. Real canopy is depth-flat
-    # (gradient ≈ 0); ground has a steep depth-row gradient. The
-    # SIGN of the gradient depends on camera tilt:
-    #   - Down-tilted camera: depth INCREASES with row → grad > 0
-    #   - Horizontal camera: depth DECREASES with row → grad < 0
-    # Reject both signs (|grad| > threshold) so the filter works
-    # regardless of camera mount.
+    # Depth-gradient ground filter. Verbatim from
+    # sprayer_pipeline.tree_aggregate -- positive gradient only,
+    # since real apple canopy has leaves at varying depths and an
+    # |grad| filter would reject the canopy too. The sign-only
+    # filter catches systematic recede-with-row ground patterns
+    # without false-positive on noisy canopy gradients.
     if apply_gradient_ground_filter:
         gap = 5
         grad = np.zeros_like(depth_f)
         grad[:-gap, :] = depth_f[gap:, :] - depth_f[:-gap, :]
         valid = (depth_f > 0) & (np.roll(depth_f, -gap, axis=0) > 0)
         thr = float(gradient_threshold_mm_per_row)
-        ground_like = valid & (np.abs(grad) > thr * gap)
+        ground_like = valid & (grad > thr * gap)
         fg = fg & ~ground_like
 
     m = fg.astype(np.uint8) * 255

@@ -1325,8 +1325,7 @@ def _propagate_image_mode(
                                 tree_cc = (labels == chosen_cc)
                                 # Depth-coherence post-filter: keep
                                 # pixels within ±400 mm of this CC's
-                                # median depth -- a final guard
-                                # against any pixel that slipped in.
+                                # median depth.
                                 valid = tree_cc & (depth_mm > 0)
                                 if valid.any():
                                     med = float(np.median(depth_mm[valid]))
@@ -1341,7 +1340,13 @@ def _propagate_image_mode(
                                 else:
                                     tree_mask = tree_cc | trunk_mask
                             else:
-                                tree_mask = trunk_mask
+                                # No canopy CC overlaps this trunk's
+                                # column -- it's a background false
+                                # positive (car, fence post, distant
+                                # structure that GDINO mis-labelled
+                                # as a trunk). Drop the detection
+                                # entirely so it never reaches DBSCAN.
+                                continue
 
                             if not tree_mask.any():
                                 tree_mask = None
