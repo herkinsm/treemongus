@@ -2920,19 +2920,19 @@ def compute_per_frame_lai(
 
     log.info("Per-frame LAI: loading SAM 3 (text-only canopy)")
     sam3_model = build_sam3_image_model()
-    # Lower threshold (0.10) lets partial / edge-cut / occluded
-    # trees fire. Per-CC depth filter below catches false
-    # positives from low-confidence text detections.
     processor = Sam3Processor(
         sam3_model, device=device, confidence_threshold=0.10,
     )
     autocast_dtype = (
         _torch.bfloat16 if device.startswith("cuda") else _torch.float32
     )
-    # 'apple tree' only. 'leaves' was matching grass; 'tree' was
-    # too generic. SAM 3's 'apple tree' instance includes the
-    # canopy as part of the tree.
     prompts = ("apple tree",)
+
+    # Import build_wide_tree_mask for the spatial anchor step.
+    try:
+        from tree_mask import build_wide_tree_mask
+    except ImportError:
+        build_wide_tree_mask = None  # type: ignore[assignment]
 
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "lai_per_frame.csv"
@@ -2975,6 +2975,29 @@ def compute_per_frame_lai(
             roi_d = depth_mm[roi_mask & (depth_mm > 0)]
             if roi_d.size >= 50:
                 target_med_mm = float(np.median(roi_d))
+
+        # ── Spatial anchor: build_wide_tree_mask largest CC ──
+        # Sprayer-pipeline mechanism: keep only the single largest
+        # depth-validated foreground blob. Background trees /
+        # ground patches that aren't connected to the main canopy
+        # form smaller CCs and get dropped at the source. This is
+        # the same call sprayer_pipeline.main.py:1141 makes,
+        # except with isolate_target_tree=True which is what their
+        # config flag enables for the LAI estimator path.
+        anchor = None
+        if build_wide_tree_mask is not None and depth_mm is not None:
+            try:
+                anchor_u8 = build_wide_tree_mask(
+                    depth_mm, rgb, isolate_target_tree=True,
+                )
+                anchor = (anchor_u8 > 0)
+                if not anchor.any():
+                    anchor = None
+            except Exception as exc:
+                log.debug(
+                    "build_wide_tree_mask failed frame %d: %s",
+                    frame_idx, exc,
+                )
 
         # SAM 3 union across tree-related text prompts.
         # Per-instance grass filter: a single mask whose bbox spans
@@ -3022,6 +3045,29 @@ def compute_per_frame_lai(
                         if by2 > 380 and bw > 0.5 * w:
                             continue
                     canopy_union |= inst
+
+        # If we have a spatial anchor (largest foreground CC from
+        # build_wide_tree_mask), restrict SAM 3's contribution to
+        # the anchor's dilated neighbourhood. SAM 3 augments the
+        # anchor with leaves the depth filter missed; it doesn't
+        # introduce its own spatially-detached canopy claims.
+        if anchor is not None and canopy_union.any():
+            try:
+                import cv2 as _cv2
+                anchor_dilated = _cv2.dilate(
+                    anchor.astype(np.uint8),
+                    _cv2.getStructuringElement(
+                        _cv2.MORPH_ELLIPSE, (51, 51),
+                    ),
+                    iterations=1,
+                ).astype(bool)
+                # Union: anchor (depth-validated) + SAM 3 inside the
+                # anchor's region (catches missed leaves).
+                canopy_union = anchor | (canopy_union & anchor_dilated)
+            except Exception:
+                canopy_union = anchor | canopy_union
+        elif anchor is not None:
+            canopy_union = anchor
 
         # Depth validation + per-CC background filter + gradient
         # ground filter + bottom cutoff.
