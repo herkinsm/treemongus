@@ -136,6 +136,16 @@ class SegmenterConfig:
     max_box_area_frac: float = 0.20     # 20% of frame area
     # Trunks are tall and narrow — drop fat blobs (likely canopy).
     min_aspect_ratio: float = 1.5       # height / width
+    # Reject detections whose median bbox depth is out of plausible
+    # range. Flowers from analyze_days.py use 0.6-3.0 m for canopy;
+    # trunks can sit a bit further back as the camera approaches but
+    # anything > 6 m is a background object (other rows, barns).
+    trunk_min_depth_m: float = 0.5
+    trunk_max_depth_m: float = 6.0
+    # Require the GDINO bbox to overlap the PRGB ROI by at least this
+    # fraction of the bbox. The ROI marks the tree currently being
+    # sprayed; trunks outside it are background. Set to 0 to disable.
+    trunk_min_roi_overlap: float = 0.30
 
     # ── SAM2 (image mode = default, video mode = optional) ───────
     # Image mode runs SAM2 on each Grounding DINO bbox independently
@@ -757,11 +767,19 @@ def detect_trunks_grounding_dino(
     model.eval()
 
     detections_by_frame: Dict[int, List[TrunkDetection]] = {}
+    n_drop_score = n_drop_area = n_drop_aspect = 0
+    n_drop_depth = n_drop_roi = 0
 
     for frame_idx in tqdm(loader.frame_indices(), desc="GDINO trunk detect"):
         rgb = loader.load_rgb(frame_idx)
         h, w = rgb.shape[:2]
         frame_area = float(h * w)
+        depth = loader.load_depth_m(frame_idx) if (
+            cfg.trunk_min_depth_m > 0 or cfg.trunk_max_depth_m > 0
+        ) else None
+        roi = loader.load_roi_mask(frame_idx) if (
+            cfg.trunk_min_roi_overlap > 0
+        ) else None
 
         inputs = processor(
             images=rgb,
@@ -802,13 +820,53 @@ def detect_trunks_grounding_dino(
                 continue
             area = bw * bh
             area_frac = area / frame_area
-            if area_frac < cfg.min_box_area_frac:
-                continue
-            if area_frac > cfg.max_box_area_frac:
+            if area_frac < cfg.min_box_area_frac or area_frac > cfg.max_box_area_frac:
+                n_drop_area += 1
                 continue
             aspect = bh / bw
             if aspect < cfg.min_aspect_ratio:
+                n_drop_aspect += 1
                 continue
+
+            # Depth gate: median bbox depth must be in plausible
+            # trunk-distance range. Excludes far-background objects
+            # (next row, barn, sky) and impossibly-near artifacts.
+            if depth is not None:
+                xi1 = max(0, int(round(x1)))
+                yi1 = max(0, int(round(y1)))
+                xi2 = min(w, int(round(x2)))
+                yi2 = min(h, int(round(y2)))
+                if xi2 <= xi1 or yi2 <= yi1:
+                    continue
+                d_crop = depth[yi1:yi2, xi1:xi2]
+                d_valid = d_crop[np.isfinite(d_crop) & (d_crop > 0)]
+                if d_valid.size == 0:
+                    n_drop_depth += 1
+                    continue
+                d_med = float(np.median(d_valid))
+                if (d_med < cfg.trunk_min_depth_m
+                        or d_med > cfg.trunk_max_depth_m):
+                    n_drop_depth += 1
+                    continue
+
+            # ROI gate: bbox must overlap the PRGB ROI by at least
+            # trunk_min_roi_overlap of the bbox area. The ROI marks
+            # the tree currently being sprayed; trunks outside it
+            # are background.
+            if roi is not None and roi.any():
+                xi1 = max(0, int(round(x1)))
+                yi1 = max(0, int(round(y1)))
+                xi2 = min(w, int(round(x2)))
+                yi2 = min(h, int(round(y2)))
+                if xi2 <= xi1 or yi2 <= yi1:
+                    continue
+                roi_crop = roi[yi1:yi2, xi1:xi2]
+                box_pixels = (xi2 - xi1) * (yi2 - yi1)
+                overlap = float(roi_crop.sum()) / float(box_pixels)
+                if overlap < cfg.trunk_min_roi_overlap:
+                    n_drop_roi += 1
+                    continue
+
             kept.append(TrunkDetection(
                 frame_idx=frame_idx,
                 bbox_xyxy=(x1, y1, x2, y2),
@@ -818,8 +876,12 @@ def detect_trunks_grounding_dino(
         detections_by_frame[frame_idx] = kept
 
     n_total = sum(len(v) for v in detections_by_frame.values())
-    log.info("GDINO: %d trunk detections across %d frames",
-             n_total, len(detections_by_frame))
+    log.info(
+        "GDINO: %d trunk detections across %d frames "
+        "(dropped: area=%d aspect=%d depth=%d roi=%d)",
+        n_total, len(detections_by_frame),
+        n_drop_area, n_drop_aspect, n_drop_depth, n_drop_roi,
+    )
     return detections_by_frame
 
 
@@ -2462,6 +2524,21 @@ def _main() -> None:
                              "trunk in a frame projects to the same point and "
                              "the same tree smears along the row as the "
                              "camera passes by. RealSense D435 RGB is ~69°.")
+    parser.add_argument("--trunk-min-depth-m", type=float, default=0.5,
+                        help="Reject trunk detections whose median bbox "
+                             "depth is below this many metres (default 0.5).")
+    parser.add_argument("--trunk-max-depth-m", type=float, default=6.0,
+                        help="Reject trunk detections whose median bbox "
+                             "depth exceeds this many metres (default 6.0). "
+                             "Filters out background trunks in the next row, "
+                             "barns, etc.")
+    parser.add_argument("--trunk-min-roi-overlap", type=float, default=0.30,
+                        help="Reject trunk detections whose bbox overlaps "
+                             "the PRGB ROI by less than this fraction of "
+                             "the bbox area (default 0.30). The PRGB ROI "
+                             "marks the tree currently being sprayed; "
+                             "trunks outside it are background. Set to 0 "
+                             "to disable.")
     parser.add_argument("--allow-missing-modalities", action="store_true",
                         help="By default the loader drops any frame missing "
                              "depth, PRGB, or Info — mirrors analyze_days.py "
@@ -2494,6 +2571,9 @@ def _main() -> None:
         dbscan_eps_m=args.dbscan_eps_m,
         dbscan_min_samples=args.dbscan_min_samples,
         camera_hfov_deg=args.camera_hfov_deg,
+        trunk_min_depth_m=args.trunk_min_depth_m,
+        trunk_max_depth_m=args.trunk_max_depth_m,
+        trunk_min_roi_overlap=args.trunk_min_roi_overlap,
     )
 
     sessions = _walk_all2023_sessions(Path(args.root))
