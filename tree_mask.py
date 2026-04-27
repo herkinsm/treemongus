@@ -396,8 +396,143 @@ def beer_lambert_lai(canopy_fraction: float, k: float = BEER_LAMBERT_K) -> float
     return float(-np.log(gap) / max(1e-6, k))
 
 
+# ── Wide tree mask (verbatim port of sprayer_pipeline.tree_aggregate
+# .build_wide_tree_mask, the validated R²=0.564 LAI feature extractor)
+# ─────────────────────────────────────────────────────────────────────
+_BOTTOM_CUTOFF = 420
+
+
+def build_wide_tree_mask(
+    depth_mm: np.ndarray,
+    rgb: np.ndarray,
+    *,
+    isolate_target_tree: bool = False,
+    lateral_tolerance_frac: Optional[float] = None,
+    bottom_cutoff_row: int = _BOTTOM_CUTOFF,
+    apply_gradient_ground_filter: bool = True,
+    gradient_threshold_mm_per_row: float = 3.0,
+    apply_blue_cv_sky_filter: bool = True,
+) -> np.ndarray:
+    """Full-canopy mask, including the ground-depth-gradient filter that
+    works on horizontal-facing cameras. Verbatim port of
+    sprayer_pipeline.tree_aggregate.build_wide_tree_mask.
+
+    Pipeline:
+      1. Depth band [600, 3000] mm.
+      2. HSV sky exclusion + blue-channel CV sky filter (top rows).
+      3. Optional depth-gradient ground filter: pixel is rejected if
+         dDepth/dRow > threshold over a 5-row window. Real ground
+         on a horizontal camera has dDepth/dRow > 3-5 mm/row;
+         canopy is depth-flat. KEY for our use-case.
+      4. Morphology open 3x3, CC keep (largest if
+         isolate_target_tree else all CCs > 2000 px), dilate 11x11.
+      5. Optional lateral-tolerance band (central fraction of width).
+      6. Hard bottom cutoff at row 420.
+    """
+    if not _CV2_AVAILABLE:
+        raise RuntimeError("OpenCV (cv2) required for build_wide_tree_mask")
+    depth_f = depth_mm.astype(np.float32)
+    h, w = depth_f.shape
+
+    fg = (
+        (depth_f >= float(CANOPY_DEPTH_MIN_MM))
+        & (depth_f <= float(CANOPY_DEPTH_MAX_MM))
+    )
+
+    # HSV sky exclusion
+    hsv = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV)
+    H = hsv[:, :, 0]; S = hsv[:, :, 1]; V = hsv[:, :, 2]
+    sky_blue = (H >= 85) & (H <= 145) & (S > 8)
+    sky_bright = (V > 185) & (S < 15)
+    fg = fg & ~(sky_blue | sky_bright)
+
+    # Blue-channel CV sky filter (top rows only).
+    if apply_blue_cv_sky_filter:
+        blk = 48
+        max_row = 240
+        blue = rgb[:, :, 2].astype(np.float32)
+        red = rgb[:, :, 0].astype(np.float32)
+        k = (blk, blk)
+        mean_b = cv2.blur(blue, k)
+        mean_r = cv2.blur(red, k)
+        mean_b2 = cv2.blur(blue * blue, k)
+        var_b = np.clip(mean_b2 - mean_b * mean_b, 0.0, None)
+        std_b = np.sqrt(var_b)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cv_pct = np.where(mean_b > 1.0, 100.0 * std_b / mean_b, 0.0)
+        blue_dominates = mean_b > (mean_r + 3.0)
+        sky_blue_cv = (
+            (mean_b > 171.0)
+            & (cv_pct > 1.0) & (cv_pct < 10.0)
+            & blue_dominates
+        )
+        if 0 < max_row < h:
+            sky_blue_cv[max_row:, :] = False
+        fg = fg & ~sky_blue_cv
+
+    # Depth-gradient ground filter -- crucial for horizontal cameras.
+    # On a horizontal camera, ground depth INCREASES with image row
+    # (rows farther down see ground farther away). dDepth/dRow > 3 mm
+    # per row is ground; canopy is roughly depth-flat (gradient ≈ 0).
+    if apply_gradient_ground_filter:
+        gap = 5
+        grad = np.zeros_like(depth_f)
+        grad[:-gap, :] = depth_f[gap:, :] - depth_f[:-gap, :]
+        valid = (depth_f > 0) & (np.roll(depth_f, -gap, axis=0) > 0)
+        thr = float(gradient_threshold_mm_per_row)
+        ground_like = valid & (grad > thr * gap)
+        fg = fg & ~ground_like
+
+    m = fg.astype(np.uint8) * 255
+    m = cv2.morphologyEx(
+        m, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+
+    # CC keep
+    n_cc, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    keep = np.zeros_like(m)
+    if isolate_target_tree:
+        best_i, best_area = -1, 0
+        for i in range(1, n_cc):
+            a = int(stats[i, cv2.CC_STAT_AREA])
+            if a > best_area:
+                best_area = a
+                best_i = i
+        if best_i > 0 and best_area > 2000:
+            keep[labels == best_i] = 255
+    else:
+        for i in range(1, n_cc):
+            if stats[i, cv2.CC_STAT_AREA] > 2000:
+                keep[labels == i] = 255
+
+    keep = cv2.dilate(
+        keep,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+        iterations=1,
+    )
+    keep = cv2.bitwise_and(m, keep)
+
+    # Lateral tolerance band
+    if (lateral_tolerance_frac is not None
+            and 0 < float(lateral_tolerance_frac) < 1.0):
+        half_band = int(0.5 * float(lateral_tolerance_frac) * w)
+        xc = w // 2
+        left_edge = max(0, xc - half_band)
+        right_edge = min(w, xc + half_band)
+        keep[:, :left_edge] = 0
+        keep[:, right_edge:] = 0
+
+    # Hard bottom cutoff
+    if 0 < bottom_cutoff_row < h:
+        keep[bottom_cutoff_row:, :] = 0
+
+    return keep
+
+
 __all__ = [
     "build_tree_mask",
+    "build_wide_tree_mask",
     "zone_canopy_fractions",
     "beer_lambert_lai",
     "ROI_RECTS",

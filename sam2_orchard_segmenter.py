@@ -1259,65 +1259,72 @@ def _propagate_image_mode(
                             continue
                         sam3_score = 1.0
 
-                    # ── Per-trunk vanilla build_tree_mask ──
-                    # Run the canonical sprayer_pipeline canopy mask
-                    # ONCE for THIS trunk, anchored on the trunk's
-                    # own pixel-x column.
+                    # ── Per-trunk wide tree mask ──
+                    # Use sprayer_pipeline.tree_aggregate.
+                    # build_wide_tree_mask -- the function the
+                    # validated R²=0.564 LAI estimator uses. Its
+                    # depth-gradient ground filter (dDepth/dRow > 3
+                    # mm/row -> ground) is what kills the horizontal
+                    # ground band that build_tree_mask leaves in.
+                    # The hard row-420 bottom cutoff is also
+                    # standard. After build, restrict to the trunk's
+                    # column to isolate this specific tree, then
+                    # apply a depth-coherence cut so adjacent trees
+                    # at different distances stay separated even
+                    # when their canopies overlap in pixel space.
                     tree_mask: Optional[np.ndarray] = None
                     if depth_mm is not None:
                         try:
-                            from tree_mask import build_tree_mask
+                            from tree_mask import build_wide_tree_mask
+                            wide_u8 = build_wide_tree_mask(
+                                depth_mm, rgb,
+                                isolate_target_tree=False,
+                                apply_gradient_ground_filter=True,
+                                apply_blue_cv_sky_filter=True,
+                            )
+                            wide_bool = (wide_u8 > 0)
+
+                            # Restrict to this trunk's column band.
+                            # The wide mask spans the whole frame
+                            # (multiple trees); we keep only canopy
+                            # whose horizontal position is near
+                            # *this* trunk so adjacent trees in the
+                            # same canopy CC each get their own slice.
                             x1b, _, x2b, _ = (
                                 int(round(v)) for v in det.bbox_xyxy
                             )
-                            anchor_pad = 30
-                            cc0 = max(0, x1b - anchor_pad)
-                            cc1 = min(w - 1, x2b + anchor_pad)
-                            canopy_u8 = build_tree_mask(
-                                depth_mm, rgb=rgb,
-                                roi_cols=(cc0, cc1),
-                            )
-                            canopy_bool = (canopy_u8 > 0)
+                            col_pad = 80
+                            cc0 = max(0, x1b - col_pad)
+                            cc1 = min(w, x2b + col_pad)
+                            col_band = np.zeros_like(wide_bool)
+                            col_band[:, cc0:cc1] = True
+                            in_col = wide_bool & col_band
 
-                            # ── Depth-coherence post-filter ──
-                            # build_tree_mask's row-banded ground
-                            # filter only rejects depths FARTHER than
-                            # the trunk centre. On a horizontal-
-                            # facing camera the ground is at the
-                            # SAME depth as (or closer than) the
-                            # trunk, so it passes through and shows
-                            # up as a horizontal band at the bottom
-                            # of the mask. Fix: take the median
-                            # depth inside the build_tree_mask
-                            # output (that's the trunk + canopy's
-                            # actual depth) and drop any pixel
-                            # whose depth differs by more than
-                            # ±400 mm. Same tree's pixels cluster
-                            # within ~±300 mm; ground in front of
-                            # camera is closer, far background is
-                            # farther -- both get cut.
-                            valid_in_canopy = (
-                                canopy_bool & (depth_mm > 0)
-                            )
-                            if valid_in_canopy.any():
-                                tree_depths = depth_mm[valid_in_canopy]
-                                tree_med = float(np.median(tree_depths))
-                                coh_lo = max(1, int(tree_med - 400))
-                                coh_hi = int(tree_med + 400)
+                            # Depth-coherence post-filter: keep
+                            # pixels within ±400 mm of the median
+                            # depth inside the column-restricted
+                            # mask. Eliminates background trees at
+                            # different distance + any residual
+                            # ground that slipped through.
+                            valid = in_col & (depth_mm > 0)
+                            if valid.any():
+                                med = float(np.median(depth_mm[valid]))
+                                coh_lo = max(1, int(med - 400))
+                                coh_hi = int(med + 400)
                                 coherent = (
-                                    canopy_bool
+                                    in_col
                                     & (depth_mm >= coh_lo)
                                     & (depth_mm <= coh_hi)
                                 )
                                 tree_mask = coherent | trunk_mask
                             else:
-                                tree_mask = canopy_bool | trunk_mask
+                                tree_mask = in_col | trunk_mask
 
                             if not tree_mask.any():
                                 tree_mask = None
                         except Exception as exc:
                             log.warning(
-                                "build_tree_mask failed for det "
+                                "build_wide_tree_mask failed for det "
                                 "in frame %d: %s",
                                 frame_idx, exc,
                             )
