@@ -3212,9 +3212,64 @@ def compute_per_frame_lai(
         else:
             canopy = canopy_union
         # Hard cutoff at row 400 -- mirrors main.py's MAX_GROUND_ROW.
-        # Bottom 80 rows of a tractor-mounted frame are always
-        # ground; the row-banded ground filter handles 280-400.
         canopy[400:, :] = False
+
+        # Per-CC plane / ground rejection -- ports the
+        # extract_zone gates (roi.py:425-463). build_tree_mask's
+        # half-res dilation can pull ground into the mask along
+        # the canopy's edges; these per-CC checks catch ground
+        # plane CCs that survived. Applied to the FINAL canopy.
+        try:
+            import cv2 as _cv2
+            if depth_mm is not None and canopy.any():
+                u8 = canopy.astype(np.uint8) * 255
+                n_cc, labels, stats, _ = (
+                    _cv2.connectedComponentsWithStats(u8, connectivity=8)
+                )
+                drop = np.zeros(n_cc, dtype=bool)
+                for cc_id in range(1, n_cc):
+                    cc_pixels = (labels == cc_id) & (depth_mm > 0)
+                    n_px = int(cc_pixels.sum())
+                    if n_px < 50:
+                        continue
+                    ys_cc, xs_cc = np.where(cc_pixels)
+                    z_cc = depth_mm[ys_cc, xs_cc].astype(np.float32)
+                    # 1. Depth-spread guard: p90-p10 < 30 mm =
+                    # uniform plane (sprayer_pipeline default).
+                    p10, p90 = np.percentile(z_cc, [10, 90])
+                    if (p90 - p10) < 30.0:
+                        drop[cc_id] = True
+                        continue
+                    # 2. Row-depth correlation + within-row std:
+                    # |corr| > 0.85 AND within-row-std < 70 mm =
+                    # tilted ground plane.
+                    yf = ys_cc.astype(np.float32)
+                    yf -= yf.mean()
+                    zf = z_cc - z_cc.mean()
+                    denom = float(
+                        np.sqrt((yf * yf).sum())
+                        * np.sqrt((zf * zf).sum())
+                    )
+                    if denom > 0:
+                        corr = float((yf * zf).sum() / denom)
+                        if abs(corr) > 0.85:
+                            unique_rows = np.unique(ys_cc)
+                            row_stds = []
+                            for yr in unique_rows:
+                                z_at_row = z_cc[ys_cc == yr]
+                                if z_at_row.size >= 3:
+                                    row_stds.append(float(z_at_row.std()))
+                            mean_row_std = (
+                                float(np.mean(row_stds))
+                                if row_stds else 0.0
+                            )
+                            if mean_row_std < 70.0:
+                                drop[cc_id] = True
+                if drop.any():
+                    drop_mask = drop[labels]
+                    canopy = canopy & ~drop_mask
+        except Exception:
+            pass
 
         if not canopy.any():
             n_skipped_no_canopy += 1
