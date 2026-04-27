@@ -516,15 +516,29 @@ class All2023FrameLoader(FrameLoader):
             ).resize((w, h), _PILImage.BILINEAR)
             return np.asarray(pim, dtype=np.float32)
 
-        bmp = self._depth_dir / f"{base}-Depth.bmp"
-        if bmp.is_file():
-            raw = cv2.imread(str(bmp), cv2.IMREAD_ANYDEPTH)
-            if raw is not None:
-                return _resize_to_rgb(raw.astype(np.float32)) * self._DEPTH_MM_TO_M
+        # Prefer the .txt sidecar — that's the raw uint16 mm depth.
+        # The .bmp may be a colormap visualization (0-255 8-bit) that
+        # looks like depth but isn't, mirroring analyze_days.py's
+        # load_depth_mm guard.
         txt = self._depth_dir / f"{base}-Depth.txt"
         if txt.is_file():
             d = np.loadtxt(str(txt), dtype=np.float32)
             return _resize_to_rgb(d) * self._DEPTH_MM_TO_M
+        bmp = self._depth_dir / f"{base}-Depth.bmp"
+        if bmp.is_file():
+            raw = cv2.imread(str(bmp), cv2.IMREAD_UNCHANGED)
+            if raw is not None and raw.ndim == 2 and raw.dtype == np.uint16:
+                return _resize_to_rgb(raw.astype(np.float32)) * self._DEPTH_MM_TO_M
+            if not getattr(self, "_warned_bad_depth_bmp", False):
+                log.warning(
+                    "Depth .bmp at %s is %s %s — looks like the colormap "
+                    "visualization, not raw mm. Using .txt sidecar if "
+                    "present; otherwise depth is unavailable.",
+                    bmp.parent,
+                    None if raw is None else raw.shape,
+                    None if raw is None else raw.dtype,
+                )
+                self._warned_bad_depth_bmp = True
         # Missing depth → all NaN; projection skips this frame gracefully.
         log.warning("No depth file for frame %d (%s)", frame_idx, base)
         return np.full((h, w), float("nan"), dtype=np.float32)
