@@ -1276,49 +1276,72 @@ def _propagate_image_mode(
                     if depth_mm is not None:
                         try:
                             from tree_mask import build_wide_tree_mask
+                            import cv2 as _cv2
                             wide_u8 = build_wide_tree_mask(
                                 depth_mm, rgb,
                                 isolate_target_tree=False,
                                 apply_gradient_ground_filter=True,
                                 apply_blue_cv_sky_filter=True,
                             )
-                            wide_bool = (wide_u8 > 0)
 
-                            # Restrict to this trunk's column band.
-                            # The wide mask spans the whole frame
-                            # (multiple trees); we keep only canopy
-                            # whose horizontal position is near
-                            # *this* trunk so adjacent trees in the
-                            # same canopy CC each get their own slice.
-                            x1b, _, x2b, _ = (
+                            # Pick the canopy CC that contains this
+                            # trunk's pixel column. Background trees
+                            # appear as DIFFERENT connected
+                            # components after build_wide_tree_mask
+                            # -- selecting only the CC whose pixels
+                            # overlap the trunk's column drops them
+                            # without depending on a hardcoded depth
+                            # threshold. Adjacent trees in the same
+                            # row each get their own CC (because
+                            # ground in between is rejected by the
+                            # gradient filter).
+                            n_cc, labels, stats, _ = (
+                                _cv2.connectedComponentsWithStats(
+                                    wide_u8, connectivity=8,
+                                )
+                            )
+                            x1b, y1b, x2b, y2b = (
                                 int(round(v)) for v in det.bbox_xyxy
                             )
-                            col_pad = 80
-                            cc0 = max(0, x1b - col_pad)
-                            cc1 = min(w, x2b + col_pad)
-                            col_band = np.zeros_like(wide_bool)
-                            col_band[:, cc0:cc1] = True
-                            in_col = wide_bool & col_band
-
-                            # Depth-coherence post-filter: keep
-                            # pixels within ±400 mm of the median
-                            # depth inside the column-restricted
-                            # mask. Eliminates background trees at
-                            # different distance + any residual
-                            # ground that slipped through.
-                            valid = in_col & (depth_mm > 0)
-                            if valid.any():
-                                med = float(np.median(depth_mm[valid]))
-                                coh_lo = max(1, int(med - 400))
-                                coh_hi = int(med + 400)
-                                coherent = (
-                                    in_col
-                                    & (depth_mm >= coh_lo)
-                                    & (depth_mm <= coh_hi)
+                            col_pad = 30
+                            cc_x0 = max(0, x1b - col_pad)
+                            cc_x1 = min(w, x2b + col_pad)
+                            cc_y0 = max(0, y1b)
+                            cc_y1 = min(h, y2b)
+                            chosen_cc = 0
+                            if (cc_x1 > cc_x0 and cc_y1 > cc_y0
+                                    and n_cc > 1):
+                                roi_labels = labels[
+                                    cc_y0:cc_y1, cc_x0:cc_x1,
+                                ]
+                                cc_counts = np.bincount(
+                                    roi_labels.ravel(), minlength=n_cc,
                                 )
-                                tree_mask = coherent | trunk_mask
+                                cc_counts[0] = 0
+                                if cc_counts.any():
+                                    chosen_cc = int(cc_counts.argmax())
+
+                            if chosen_cc > 0:
+                                tree_cc = (labels == chosen_cc)
+                                # Depth-coherence post-filter: keep
+                                # pixels within ±400 mm of this CC's
+                                # median depth -- a final guard
+                                # against any pixel that slipped in.
+                                valid = tree_cc & (depth_mm > 0)
+                                if valid.any():
+                                    med = float(np.median(depth_mm[valid]))
+                                    coh_lo = max(1, int(med - 400))
+                                    coh_hi = int(med + 400)
+                                    coherent = (
+                                        tree_cc
+                                        & (depth_mm >= coh_lo)
+                                        & (depth_mm <= coh_hi)
+                                    )
+                                    tree_mask = coherent | trunk_mask
+                                else:
+                                    tree_mask = tree_cc | trunk_mask
                             else:
-                                tree_mask = in_col | trunk_mask
+                                tree_mask = trunk_mask
 
                             if not tree_mask.any():
                                 tree_mask = None

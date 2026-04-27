@@ -470,17 +470,20 @@ def build_wide_tree_mask(
             sky_blue_cv[max_row:, :] = False
         fg = fg & ~sky_blue_cv
 
-    # Depth-gradient ground filter -- crucial for horizontal cameras.
-    # On a horizontal camera, ground depth INCREASES with image row
-    # (rows farther down see ground farther away). dDepth/dRow > 3 mm
-    # per row is ground; canopy is roughly depth-flat (gradient ≈ 0).
+    # Depth-gradient ground filter. Real canopy is depth-flat
+    # (gradient ≈ 0); ground has a steep depth-row gradient. The
+    # SIGN of the gradient depends on camera tilt:
+    #   - Down-tilted camera: depth INCREASES with row → grad > 0
+    #   - Horizontal camera: depth DECREASES with row → grad < 0
+    # Reject both signs (|grad| > threshold) so the filter works
+    # regardless of camera mount.
     if apply_gradient_ground_filter:
         gap = 5
         grad = np.zeros_like(depth_f)
         grad[:-gap, :] = depth_f[gap:, :] - depth_f[:-gap, :]
         valid = (depth_f > 0) & (np.roll(depth_f, -gap, axis=0) > 0)
         thr = float(gradient_threshold_mm_per_row)
-        ground_like = valid & (grad > thr * gap)
+        ground_like = valid & (np.abs(grad) > thr * gap)
         fg = fg & ~ground_like
 
     m = fg.astype(np.uint8) * 255
