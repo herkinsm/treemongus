@@ -842,9 +842,12 @@ def detect_trunks_grounding_dino(
                 n_drop_aspect += 1
                 continue
 
-            # Depth gate: median bbox depth must be in plausible
-            # trunk-distance range. Excludes far-background objects
-            # (next row, barn, sky) and impossibly-near artifacts.
+            # Depth gate: the *closest* pixels in the bbox should
+            # land in plausible trunk range. Median fails for thin
+            # saplings because the bbox is mostly background-through-
+            # branches; the 25th-percentile catches the trunk pixels
+            # themselves while still rejecting fully-background hits
+            # (where even p25 is far away).
             if depth is not None:
                 xi1 = max(0, int(round(x1)))
                 yi1 = max(0, int(round(y1)))
@@ -857,9 +860,9 @@ def detect_trunks_grounding_dino(
                 if d_valid.size == 0:
                     n_drop_depth += 1
                     continue
-                d_med = float(np.median(d_valid))
-                if (d_med < cfg.trunk_min_depth_m
-                        or d_med > cfg.trunk_max_depth_m):
+                d_near = float(np.percentile(d_valid, 25))
+                if (d_near < cfg.trunk_min_depth_m
+                        or d_near > cfg.trunk_max_depth_m):
                     n_drop_depth += 1
                     continue
 
