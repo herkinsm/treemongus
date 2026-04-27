@@ -1183,33 +1183,47 @@ def _propagate_image_mode(
                             continue
                         sam3_score = 1.0
 
-                    # ── Pass 2: whole-tree mask via text + box prompt ──
-                    # SAM 3 lets us combine "apple tree" text with the
-                    # trunk box so it segments the specific tree
-                    # containing this trunk -- separating touching
-                    # trees by trunk identity rather than by canopy
-                    # boundary. Falls back to None if SAM 3 returns
-                    # nothing; downstream code handles either.
+                    # ── Pass 2: whole-tree mask via text-only prompt ──
+                    # We deliberately do NOT pass the trunk box as a
+                    # geometric prompt here -- SAM 3 constrains its
+                    # mask to the box area when both are given, which
+                    # clips the canopy. Instead, ask SAM 3 to segment
+                    # *all* trees in the frame via the text prompt,
+                    # then pick the instance whose mask contains the
+                    # most of our trunk pixels. That instance is the
+                    # specific tree this trunk belongs to, with the
+                    # full canopy intact and adjacent trees in the
+                    # frame as separate instances.
                     tree_mask: Optional[np.ndarray] = None
                     try:
                         sam3_processor.reset_all_prompts(state)
                         state = sam3_processor.set_text_prompt(
                             prompt=cfg.tree_text_prompt, state=state,
                         )
-                        state = sam3_processor.add_geometric_prompt(
-                            box=norm_box, label=True, state=state,
-                        )
-                        cand, _ = _pick_sam3_mask(
-                            state, det.bbox_xyxy, h, w,
-                        )
-                        if cand is not None and cand.any():
-                            # Sanity: tree mask must contain at least
-                            # part of the trunk, otherwise SAM 3
-                            # latched onto an unrelated object.
-                            if np.logical_and(
-                                cand, trunk_mask,
-                            ).sum() >= int(trunk_mask.sum() * 0.10):
-                                tree_mask = cand.astype(bool)
+                        all_masks = state.get("masks")
+                        if all_masks is not None and len(all_masks) > 0:
+                            arr = all_masks.detach().cpu()
+                            if arr.dtype != _torch.bool:
+                                arr = arr.to(_torch.bool)
+                            arr = arr.numpy()
+                            if arr.ndim == 4:
+                                arr = arr.squeeze(1)
+                            best_overlap = 0
+                            best_idx = -1
+                            trunk_px = int(trunk_mask.sum())
+                            for i in range(arr.shape[0]):
+                                inter = int(np.logical_and(
+                                    arr[i], trunk_mask,
+                                ).sum())
+                                if inter > best_overlap:
+                                    best_overlap = inter
+                                    best_idx = i
+                            # Require >=10% of trunk pixels inside the
+                            # picked tree mask, else SAM 3 didn't find
+                            # this tree among its detections.
+                            if (best_idx >= 0
+                                    and best_overlap >= max(1, int(trunk_px * 0.10))):
+                                tree_mask = arr[best_idx].astype(bool)
                                 n_tree_mask_ok += 1
                             else:
                                 n_tree_mask_fail += 1
