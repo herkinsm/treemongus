@@ -145,7 +145,7 @@ class SegmenterConfig:
     # Require the GDINO bbox to overlap the PRGB ROI by at least this
     # fraction of the bbox. The ROI marks the tree currently being
     # sprayed; trunks outside it are background. Set to 0 to disable.
-    trunk_min_roi_overlap: float = 0.30
+    trunk_min_roi_overlap: float = 0.10
 
     # ── SAM2 (image mode = default, video mode = optional) ───────
     # Image mode runs SAM2 on each Grounding DINO bbox independently
@@ -529,7 +529,21 @@ class All2023FrameLoader(FrameLoader):
         prgb_path = self._prgb_dir / f"{base}-RGB-PP.bmp"
         rgb = self.load_rgb(frame_idx)
         h, w = rgb.shape[:2]
-        return extract_roi_mask(prgb_path, (h, w))
+        roi = extract_roi_mask(prgb_path, (h, w))
+        if roi is None or not roi.any():
+            return roi
+        # Mirror analyze_days.py --prgb-extend-vertical: stretch the
+        # ROI to full image height. Trunks span vertically while the
+        # red sprayer ROI is short (~20% of frame); without this,
+        # trunks have low overlap fraction by construction.
+        cols = roi.any(axis=0)
+        if cols.any():
+            x_idx = np.where(cols)[0]
+            x1, x2 = int(x_idx.min()), int(x_idx.max()) + 1
+            tall = np.zeros_like(roi)
+            tall[:, x1:x2] = True
+            roi = tall
+        return roi
 
     # ── Internals ────────────────────────────────────────────────────
 
@@ -2532,13 +2546,14 @@ def _main() -> None:
                              "depth exceeds this many metres (default 6.0). "
                              "Filters out background trunks in the next row, "
                              "barns, etc.")
-    parser.add_argument("--trunk-min-roi-overlap", type=float, default=0.30,
+    parser.add_argument("--trunk-min-roi-overlap", type=float, default=0.10,
                         help="Reject trunk detections whose bbox overlaps "
-                             "the PRGB ROI by less than this fraction of "
-                             "the bbox area (default 0.30). The PRGB ROI "
-                             "marks the tree currently being sprayed; "
-                             "trunks outside it are background. Set to 0 "
-                             "to disable.")
+                             "the (vertically-extended) PRGB ROI by less "
+                             "than this fraction of the bbox area (default "
+                             "0.10, matches analyze_days.py default). The "
+                             "PRGB ROI marks the tree currently being "
+                             "sprayed; trunks outside it are background. "
+                             "Set to 0 to disable.")
     parser.add_argument("--allow-missing-modalities", action="store_true",
                         help="By default the loader drops any frame missing "
                              "depth, PRGB, or Info — mirrors analyze_days.py "
