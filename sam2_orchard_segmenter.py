@@ -1274,12 +1274,13 @@ def _propagate_image_mode(
                     if canopy_mask_frame is not None:
                         try:
                             import cv2 as _cv2
-                            # Find the canopy CC that best overlaps
-                            # the trunk's bounding box. Looking at the
-                            # bbox (not just the centroid) is robust
-                            # to RealSense returning 0 depth on the
-                            # trunk itself — the trunk's bbox always
-                            # straddles the surrounding canopy.
+                            # Find the canopy CC sitting closest to
+                            # the trunk. The trunk's own bbox usually
+                            # has NO canopy pixels (build_tree_mask
+                            # filters trunk-pixel depth as invalid),
+                            # so we widen the search horizontally by
+                            # 80 px on each side -- captures the leaf
+                            # canopy that flanks the trunk.
                             n_cc, labels, _stats, _ = (
                                 _cv2.connectedComponentsWithStats(
                                     canopy_mask_frame.astype(np.uint8),
@@ -1289,14 +1290,17 @@ def _propagate_image_mode(
                             x1b, y1b, x2b, y2b = (
                                 int(round(v)) for v in det.bbox_xyxy
                             )
-                            x1b = max(0, x1b); y1b = max(0, y1b)
-                            x2b = min(w, x2b); y2b = min(h, y2b)
-                            if x2b > x1b and y2b > y1b:
-                                bbox_labels = labels[y1b:y2b, x1b:x2b]
+                            search_pad = 80
+                            x1s = max(0, x1b - search_pad)
+                            x2s = min(w, x2b + search_pad)
+                            y1s = max(0, y1b)
+                            y2s = min(h, y2b)
+                            if x2s > x1s and y2s > y1s:
+                                bbox_labels = labels[y1s:y2s, x1s:x2s]
                                 cc_counts = np.bincount(
                                     bbox_labels.ravel(), minlength=n_cc,
                                 )
-                                cc_counts[0] = 0  # background never anchors
+                                cc_counts[0] = 0
                                 trunk_cc = (
                                     int(cc_counts.argmax())
                                     if cc_counts.any() else 0
