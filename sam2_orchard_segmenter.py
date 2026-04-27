@@ -1324,94 +1324,105 @@ def _propagate_image_mode(
                     if canopy_mask_frame is not None:
                         try:
                             import cv2 as _cv2
-                            # Find the canopy CC sitting closest to
-                            # the trunk. The trunk's own bbox usually
-                            # has NO canopy pixels (build_tree_mask
-                            # filters trunk-pixel depth as invalid),
-                            # so we widen the search horizontally by
-                            # 80 px on each side -- captures the leaf
-                            # canopy that flanks the trunk.
-                            n_cc, labels, _stats, _ = (
-                                _cv2.connectedComponentsWithStats(
-                                    canopy_mask_frame.astype(np.uint8),
-                                    connectivity=8,
-                                )
+                            # Morphological reconstruction: seed =
+                            # trunk mask, mask = canopy. Dilate the
+                            # seed iteratively, intersecting with
+                            # canopy at each step, until it stops
+                            # growing. The result is the connected
+                            # canopy reachable from the trunk -- so
+                            # ground/grass pixels that aren't joined
+                            # to the trunk via real canopy don't get
+                            # included, and adjacent trees with their
+                            # own trunks each grow into their own
+                            # branch of any shared CC.
+                            seed = trunk_mask.astype(np.uint8)
+                            mask_u8 = canopy_mask_frame.astype(np.uint8)
+                            kernel = _cv2.getStructuringElement(
+                                _cv2.MORPH_ELLIPSE, (15, 15),
                             )
-                            x1b, y1b, x2b, y2b = (
-                                int(round(v)) for v in det.bbox_xyxy
-                            )
-                            search_pad = 80
-                            x1s = max(0, x1b - search_pad)
-                            x2s = min(w, x2b + search_pad)
-                            y1s = max(0, y1b)
-                            y2s = min(h, y2b)
-                            if x2s > x1s and y2s > y1s:
-                                bbox_labels = labels[y1s:y2s, x1s:x2s]
-                                cc_counts = np.bincount(
-                                    bbox_labels.ravel(), minlength=n_cc,
-                                )
-                                cc_counts[0] = 0
-                                trunk_cc = (
-                                    int(cc_counts.argmax())
-                                    if cc_counts.any() else 0
-                                )
-                            else:
-                                trunk_cc = 0
+                            grown = seed.copy()
+                            prev_sum = -1
+                            max_iters = 25  # ~150 px reach
+                            for _ in range(max_iters):
+                                cur = _cv2.dilate(grown, kernel)
+                                cur = _cv2.bitwise_and(cur, mask_u8) | grown
+                                cur_sum = int(cur.sum())
+                                if cur_sum == prev_sum:
+                                    break
+                                grown = cur
+                                prev_sum = cur_sum
 
-                            if trunk_cc > 0:
-                                cc_mask = (labels == trunk_cc)
-                                # Voronoi split: keep canopy pixels
-                                # closer to OUR trunk centroid than to
-                                # any other trunk's centroid in this
-                                # frame.
-                                other_centroids = []
+                            tree_mask = (grown > 0)
+                            # Drop the trunk's own pixels from the
+                            # tree mask if requested -- but typically
+                            # we want to keep the trunk in the mask
+                            # since it IS part of the tree.
+                            if tree_mask.any():
+                                # Subtract canopy already claimed by
+                                # other trunks in this frame so two
+                                # trunks 30 px apart don't double-
+                                # count overlapping leaves.
+                                other_trunk_seeds = np.zeros_like(seed)
                                 for other in dets:
                                     if other is det:
                                         continue
-                                    ox1, oy1, ox2, oy2 = other.bbox_xyxy
-                                    other_centroids.append((
-                                        (oy1 + oy2) * 0.5,
-                                        (ox1 + ox2) * 0.5,
-                                    ))
-                                my_cy = (det.bbox_xyxy[1] + det.bbox_xyxy[3]) * 0.5
-                                my_cx = (det.bbox_xyxy[0] + det.bbox_xyxy[2]) * 0.5
-                                if not other_centroids:
-                                    tree_mask = cc_mask
-                                else:
-                                    cc_ys, cc_xs = np.where(cc_mask)
-                                    d_self = (
-                                        (cc_ys - my_cy) ** 2
-                                        + (cc_xs - my_cx) ** 2
+                                    other_box = _bbox_mask(
+                                        other.bbox_xyxy, h, w,
+                                    ).astype(np.uint8)
+                                    other_trunk_seeds = (
+                                        other_trunk_seeds | other_box
                                     )
-                                    d_others = np.full_like(
-                                        d_self, np.inf, dtype=np.float64,
+                                if other_trunk_seeds.any():
+                                    other_grown = other_trunk_seeds.copy()
+                                    prev = -1
+                                    for _ in range(max_iters):
+                                        cur = _cv2.dilate(
+                                            other_grown, kernel,
+                                        )
+                                        cur = (
+                                            _cv2.bitwise_and(cur, mask_u8)
+                                            | other_grown
+                                        )
+                                        cs = int(cur.sum())
+                                        if cs == prev:
+                                            break
+                                        other_grown = cur
+                                        prev = cs
+                                    # Per-pixel arbitration: keep a
+                                    # canopy pixel for OUR tree when
+                                    # the trunk-distance to ours is
+                                    # smaller (Voronoi tiebreak inside
+                                    # the contested region only).
+                                    contested = (
+                                        (grown > 0) & (other_grown > 0)
                                     )
-                                    for oc_y, oc_x in other_centroids:
-                                        d_other = (
-                                            (cc_ys - oc_y) ** 2
-                                            + (cc_xs - oc_x) ** 2
+                                    if contested.any():
+                                        # Distance transform from each
+                                        # trunk gives per-pixel reach.
+                                        d_self = _cv2.distanceTransform(
+                                            (1 - seed).astype(np.uint8),
+                                            _cv2.DIST_L2, 3,
                                         )
-                                        d_others = np.minimum(
-                                            d_others, d_other,
+                                        d_others = _cv2.distanceTransform(
+                                            (1 - other_trunk_seeds).astype(
+                                                np.uint8,
+                                            ),
+                                            _cv2.DIST_L2, 3,
                                         )
-                                    keep = d_self <= d_others
-                                    m = np.zeros_like(cc_mask)
-                                    m[cc_ys[keep], cc_xs[keep]] = True
-                                    tree_mask = m
-                                if tree_mask is not None and tree_mask.any():
-                                    n_tree_mask_ok += 1
-                                else:
-                                    tree_mask = None
-                                    n_tree_mask_fail += 1
-                                    n_fail_voronoi += 1
+                                        loses = contested & (d_self > d_others)
+                                        tree_mask = tree_mask & ~loses
+
+                            if tree_mask is not None and tree_mask.any():
+                                n_tree_mask_ok += 1
                             else:
+                                tree_mask = None
                                 n_tree_mask_fail += 1
-                                n_fail_no_cc += 1
+                                n_fail_voronoi += 1
                         except Exception as exc:
                             n_tree_mask_fail += 1
                             n_fail_exception += 1
                             log.warning(
-                                "Canopy split failed on frame %d: %s",
+                                "Canopy reconstruction failed on frame %d: %s",
                                 frame_idx, exc,
                             )
                     else:
