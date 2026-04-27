@@ -150,6 +150,11 @@ class SegmenterConfig:
     # actual depth. Set to 0 to disable the fallback (strict depth
     # only, will discard most thin-trunk detections).
     nominal_tree_distance_m: float = 1.5
+    # Text prompt for the SAM 3 second pass that segments the whole
+    # tree (canopy + trunk) containing the GDINO-detected trunk box.
+    # The combined text + box prompt lets SAM 3 separate touching
+    # trees by trunk identity instead of by canopy boundary.
+    tree_text_prompt: str = "apple tree"
     # Require the GDINO bbox to overlap the PRGB ROI by at least this
     # fraction of the bbox. The ROI marks the tree currently being
     # sprayed; trunks outside it are background. Set to 0 to disable.
@@ -241,6 +246,10 @@ class TrunkDetection:
     bbox_xyxy: Tuple[float, float, float, float]   # pixels, image coords
     score: float
     mask: Optional[np.ndarray] = None              # bool array, frame-shape
+    # Whole-tree (canopy + trunk) mask from a second SAM 3 pass with
+    # text prompt "apple tree". Falls back to None if SAM 3 is
+    # unavailable or returns nothing usable.
+    tree_mask: Optional[np.ndarray] = None
     depth_m: float = 0.0
     world_lat: float = 0.0
     world_lon: float = 0.0
@@ -1158,26 +1167,62 @@ def _propagate_image_mode(
             ):
                 state = sam3_processor.set_image(pil_img)
                 for det in dets:
+                    # ── Pass 1: trunk-tight mask via box prompt ──
                     sam3_processor.reset_all_prompts(state)
                     norm_box = _xyxy_to_norm_cxcywh(det.bbox_xyxy, h, w)
                     state = sam3_processor.add_geometric_prompt(
                         box=norm_box, label=True, state=state,
                     )
-                    m, sam3_score = _pick_sam3_mask(
+                    trunk_mask, sam3_score = _pick_sam3_mask(
                         state, det.bbox_xyxy, h, w,
                     )
-                    if m is None or not m.any():
-                        m = _bbox_mask(det.bbox_xyxy, h, w)
-                        if not m.any():
+                    if trunk_mask is None or not trunk_mask.any():
+                        trunk_mask = _bbox_mask(det.bbox_xyxy, h, w)
+                        if not trunk_mask.any():
                             continue
                         sam3_score = 1.0
+
+                    # ── Pass 2: whole-tree mask via text + box prompt ──
+                    # SAM 3 lets us combine "apple tree" text with the
+                    # trunk box so it segments the specific tree
+                    # containing this trunk -- separating touching
+                    # trees by trunk identity rather than by canopy
+                    # boundary. Falls back to None if SAM 3 returns
+                    # nothing; downstream code handles either.
+                    tree_mask: Optional[np.ndarray] = None
+                    try:
+                        sam3_processor.reset_all_prompts(state)
+                        state = sam3_processor.set_text_prompt(
+                            prompt=cfg.tree_text_prompt, state=state,
+                        )
+                        state = sam3_processor.add_geometric_prompt(
+                            box=norm_box, label=True, state=state,
+                        )
+                        cand, _ = _pick_sam3_mask(
+                            state, det.bbox_xyxy, h, w,
+                        )
+                        if cand is not None and cand.any():
+                            # Sanity: tree mask must contain at least
+                            # part of the trunk, otherwise SAM 3
+                            # latched onto an unrelated object.
+                            if np.logical_and(
+                                cand, trunk_mask,
+                            ).sum() >= int(trunk_mask.sum() * 0.10):
+                                tree_mask = cand.astype(bool)
+                    except Exception as exc:
+                        log.debug(
+                            "SAM 3 tree pass failed on frame %d: %s",
+                            frame_idx, exc,
+                        )
+
                     track = TrunkTrack(track_id=next_track_id)
                     next_track_id += 1
                     refined_det = TrunkDetection(
                         frame_idx=frame_idx,
                         bbox_xyxy=det.bbox_xyxy,
                         score=det.score * sam3_score,
-                        mask=m.astype(bool),
+                        mask=trunk_mask.astype(bool),
+                        tree_mask=tree_mask,
                         track_id=track.track_id,
                     )
                     track.detections.append(refined_det)
@@ -1391,7 +1436,14 @@ def project_tracks_to_world(
     for track in tqdm(tracks, desc="World projection"):
         for det in track.detections:
             depth = loader.load_depth_m(det.frame_idx)
-            d_m, used_dilated = _trunk_depth_m(depth, det.mask)
+            # Prefer the whole-tree mask for depth: thin-trunk pixels
+            # often have no depth, but the canopy has thousands of
+            # valid pixels at roughly the same distance.
+            depth_mask = (
+                det.tree_mask if det.tree_mask is not None
+                and det.tree_mask.any() else det.mask
+            )
+            d_m, used_dilated = _trunk_depth_m(depth, depth_mask)
             used_nominal = False
             if used_dilated:
                 n_used_dilated += 1
@@ -1795,6 +1847,137 @@ def attribute_flowers_via_roi(
     return totals
 
 
+def attribute_flowers_via_tree_mask(
+    clusters: List[TreeCluster],
+    loader: "FrameLoader",
+    dataset_root: Path,
+    flower_masks_dir: Path,
+    flower_slug: str,
+    flower_counts_by_frame: Dict[int, float],
+    cfg: SegmenterConfig,
+) -> Tuple[Dict[int, float], set]:
+    """Attribute each flower mask to the tree whose whole-tree mask contains it.
+
+    Strongest signal we can build: SAM 3 has segmented the entire
+    tree (canopy + trunk) per frame, so a flower whose centroid
+    lies inside a particular tree's mask is unambiguously *that*
+    tree's flower. No 3D projection, no nearest-neighbour
+    heuristic, no depth needed. Two touching trees naturally
+    separate because each has its own SAM 3 mask seeded from a
+    different trunk.
+
+    Frames where no cluster has a tree_mask, or no flower's
+    centroid lands inside any tree mask, fall through to the 3D
+    nearest-tree / ROI-overlap paths via the caller.
+
+    Returns
+    -------
+    (totals, frames_handled)
+        ``totals`` is ``{tree_id: flower_count}`` aggregated across
+        successfully tree-mask-attributed frames.
+        ``frames_handled`` is the set of frame indices fully
+        covered by this path.
+    """
+    if not clusters:
+        return {}, set()
+
+    # Build {frame_idx: [(tree_id, tree_mask), ...]}: for each
+    # frame, which clusters had a detection here, and what tree
+    # mask did SAM 3 produce.
+    frame_index: Dict[int, List[Tuple[int, np.ndarray]]] = {}
+    for c in clusters:
+        for track in c.tracks:
+            for det in track.detections:
+                if det.tree_mask is None or not det.tree_mask.any():
+                    continue
+                frame_index.setdefault(det.frame_idx, []).append(
+                    (c.tree_id, det.tree_mask),
+                )
+
+    totals: Dict[int, float] = {c.tree_id: 0.0 for c in clusters}
+    frames_handled: set = set()
+    n_no_index = n_no_npz = n_no_hit = n_handled = 0
+
+    for frame_idx, expected_total in flower_counts_by_frame.items():
+        if expected_total <= 0:
+            continue
+        tree_masks = frame_index.get(frame_idx)
+        if not tree_masks:
+            n_no_index += 1
+            continue
+        try:
+            img_path = loader._imgs[frame_idx]  # type: ignore[attr-defined]
+            rel = img_path.relative_to(dataset_root).with_suffix(".npz")
+        except Exception:
+            n_no_npz += 1
+            continue
+        npz_path = flower_masks_dir / flower_slug / rel
+        if not npz_path.is_file():
+            # Try sibling slugs (analyze_days.py multi-prompt may
+            # have stored under "apple_blossom" etc.).
+            found = None
+            if flower_masks_dir.is_dir():
+                for sub in flower_masks_dir.iterdir():
+                    cand = sub / rel
+                    if cand.is_file():
+                        found = cand
+                        break
+            if found is None:
+                n_no_npz += 1
+                continue
+            npz_path = found
+        try:
+            data = np.load(npz_path)
+            f_masks = data["masks"]
+        except Exception:
+            n_no_npz += 1
+            continue
+        if f_masks.ndim != 3 or len(f_masks) == 0:
+            n_no_npz += 1
+            continue
+
+        per_cluster: Dict[int, int] = {tid: 0 for tid, _ in tree_masks}
+        for fm in f_masks:
+            fm = np.asarray(fm, dtype=bool)
+            if not fm.any():
+                continue
+            ys, xs = np.where(fm)
+            cy = int(round(float(ys.mean())))
+            cx = int(round(float(xs.mean())))
+            best_tid = None
+            best_overlap = 0
+            for tid, tmask in tree_masks:
+                if 0 <= cy < tmask.shape[0] and 0 <= cx < tmask.shape[1]:
+                    if tmask[cy, cx]:
+                        # Use mask-pixel intersection size as a
+                        # tiebreaker if multiple tree masks contain
+                        # the centroid (rare overlap zone).
+                        ov = int(np.logical_and(fm, tmask).sum())
+                        if ov > best_overlap:
+                            best_overlap = ov
+                            best_tid = tid
+            if best_tid is not None:
+                per_cluster[best_tid] = per_cluster.get(best_tid, 0) + 1
+
+        n_attributed = sum(per_cluster.values())
+        if n_attributed == 0:
+            n_no_hit += 1
+            continue
+        scale = float(expected_total) / float(n_attributed)
+        for tid, n in per_cluster.items():
+            if n:
+                totals[tid] = totals.get(tid, 0.0) + n * scale
+        frames_handled.add(frame_idx)
+        n_handled += 1
+
+    log.info(
+        "Flower tree-mask attribution: %d frames handled, "
+        "%d no-tree-mask, %d no-mask-file, %d no-centroid-hit",
+        n_handled, n_no_index, n_no_npz, n_no_hit,
+    )
+    return totals, frames_handled
+
+
 def attribute_flowers_3d_nearest_tree(
     clusters: List[TreeCluster],
     loader: "FrameLoader",
@@ -1980,29 +2163,43 @@ def attribute_flowers(
     max_assign_distance_m: float = 3.0,
     min_trunk_roi_overlap_px: int = 50,
 ) -> Dict[int, float]:
-    """Assign flowers to trees: 3D nearest-tree first, ROI-overlap fallback.
+    """Assign flowers to trees in three layers, strongest first:
 
-    The 3D path runs only when ``flower_masks_dir`` and ``flower_slug``
-    are provided AND per-frame mask .npz files exist. Frames the 3D
-    path can't handle (missing masks, missing GPS/depth, zero in-range)
-    fall through to :func:`attribute_flowers_via_roi`.
+    1. tree-mask containment: a flower whose centroid lies inside
+       a SAM-3-segmented whole-tree mask is unambiguously that tree's.
+    2. 3D nearest-tree: project flower depth -> world coords -> nearest
+       cluster centroid (within ``max_assign_distance_m``).
+    3. PRGB-ROI overlap with dominance weights (legacy fallback).
 
-    Mutates ``cluster.flower_count`` on every cluster and returns the
-    same ``{tree_id: total}`` dict.
+    Each frame is handled by the first layer that finds a hit.
+    Mutates ``cluster.flower_count`` and returns ``{tree_id: total}``.
     """
+    totals_tm: Dict[int, float] = {}
+    frames_handled_tm: set = set()
+    if (flower_masks_dir is not None and flower_slug is not None
+            and dataset_root is not None):
+        totals_tm, frames_handled_tm = attribute_flowers_via_tree_mask(
+            clusters, loader, dataset_root, flower_masks_dir, flower_slug,
+            flower_counts_by_frame, cfg,
+        )
+
+    remaining = {
+        f: n for f, n in flower_counts_by_frame.items()
+        if f not in frames_handled_tm
+    }
+
     totals_3d: Dict[int, float] = {}
     frames_handled_3d: set = set()
     if (flower_masks_dir is not None and flower_slug is not None
             and dataset_root is not None):
         totals_3d, frames_handled_3d = attribute_flowers_3d_nearest_tree(
             clusters, loader, dataset_root, flower_masks_dir, flower_slug,
-            flower_counts_by_frame, cfg,
+            remaining, cfg,
             max_assign_distance_m=max_assign_distance_m,
         )
 
-    # Run ROI fallback only on frames the 3D path didn't handle.
     fallback_counts = {
-        f: n for f, n in flower_counts_by_frame.items()
+        f: n for f, n in remaining.items()
         if f not in frames_handled_3d
     }
     totals_roi = attribute_flowers_via_roi(
@@ -2011,6 +2208,8 @@ def attribute_flowers(
     )
 
     combined: Dict[int, float] = {c.tree_id: 0.0 for c in clusters}
+    for tid, n in totals_tm.items():
+        combined[tid] = combined.get(tid, 0.0) + n
     for tid, n in totals_3d.items():
         combined[tid] = combined.get(tid, 0.0) + n
     for tid, n in totals_roi.items():
