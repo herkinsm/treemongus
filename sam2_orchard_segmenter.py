@@ -314,6 +314,12 @@ class TreeCluster:
     # the per-frame tree_mask. Averaged over the frames where this
     # cluster has a tree_mask. NaN if no tree masks were available.
     lai_beer_lambert: float = 0.0
+    # Per-ROI Beer-Lambert LAI: list of 10 LAI values, one per
+    # sprayer ROI zone (2 cols x 5 rows = 10 zones, indexed
+    # zone = side * 5 + row, side 0=LEFT, side 1=RIGHT, row 0=top).
+    # Averaged across the cluster's frames; NaN entries where no
+    # tree mask covered that zone in any frame.
+    lai_per_roi: List[float] = field(default_factory=list)
 
     @property
     def n_frames(self) -> int:
@@ -1307,6 +1313,32 @@ def _propagate_image_mode(
                             continue
                         sam3_score = 1.0
 
+                    # Background-trunk filter: a real apple trunk has
+                    # canopy *somewhere near it* in the frame. A car,
+                    # barn, distant pole, etc., that GDINO labelled
+                    # as a trunk has NO canopy in the depth-validated
+                    # band around it. Dilate the trunk mask by ~80 px
+                    # and check intersection with the canopy mask --
+                    # if empty, reject this detection.
+                    if canopy_mask_frame is not None:
+                        try:
+                            import cv2 as _cv2
+                            check_kernel = _cv2.getStructuringElement(
+                                _cv2.MORPH_ELLIPSE, (81, 81),
+                            )
+                            near_trunk = _cv2.dilate(
+                                trunk_mask.astype(np.uint8),
+                                check_kernel, iterations=1,
+                            ).astype(bool)
+                            if not (near_trunk
+                                    & canopy_mask_frame).any():
+                                # No canopy anywhere near this trunk
+                                # -- it's a background false positive
+                                # (car, barn, fence post). Skip.
+                                continue
+                        except Exception:
+                            pass
+
                     # ── Pass 2: whole-tree mask via sprayer-pipeline
                     #   compute_canopy_mask + nearest-trunk split. ──
                     # This is the SAME canopy mask the user already
@@ -1338,11 +1370,11 @@ def _propagate_image_mode(
                             seed = trunk_mask.astype(np.uint8)
                             mask_u8 = canopy_mask_frame.astype(np.uint8)
                             kernel = _cv2.getStructuringElement(
-                                _cv2.MORPH_ELLIPSE, (15, 15),
+                                _cv2.MORPH_ELLIPSE, (21, 21),
                             )
                             grown = seed.copy()
                             prev_sum = -1
-                            max_iters = 25  # ~150 px reach
+                            max_iters = 50  # ~500 px reach (full frame)
                             for _ in range(max_iters):
                                 cur = _cv2.dilate(grown, kernel)
                                 cur = _cv2.bitwise_and(cur, mask_u8) | grown
@@ -3023,8 +3055,21 @@ def _run_one_session(
     # -ln(1 - cf)/k. Average across frames. Mirrors the sprayer-
     # pipeline beer-lambert formula in sprayer_pipeline/tree_mask.py.
     K_BEER = 0.5
+    try:
+        from tree_mask import (
+            zone_canopy_fractions as _zone_cfs,
+            beer_lambert_lai as _beer_lambert,
+            ROI_RECTS as _ROI_RECTS,
+        )
+    except ImportError:
+        _zone_cfs = None
+        _beer_lambert = None
+        _ROI_RECTS = []
     for cluster in clusters:
         cfs: List[float] = []
+        # Accumulate per-ROI canopy fraction across frames where
+        # this cluster has a tree mask.
+        per_roi_cfs: List[List[float]] = [[] for _ in _ROI_RECTS]
         for track in cluster.tracks:
             for det in track.detections:
                 if det.tree_mask is None or not det.tree_mask.any():
@@ -3037,12 +3082,24 @@ def _run_one_session(
                     continue
                 cf = float(col.sum()) / float(area)
                 cfs.append(cf)
+                # Per-ROI canopy fraction inside the 10 sprayer zones.
+                if _zone_cfs is not None:
+                    zcfs = _zone_cfs(det.tree_mask)
+                    for i, z in enumerate(zcfs):
+                        per_roi_cfs[i].append(z)
         if cfs:
             mean_cf = float(np.mean(cfs))
             gap = max(0.01, min(0.99, 1.0 - mean_cf))
             cluster.lai_beer_lambert = float(-math.log(gap) / K_BEER)
         else:
             cluster.lai_beer_lambert = float("nan")
+        # Per-ROI LAI = mean per-ROI cf across frames -> Beer-Lambert.
+        cluster.lai_per_roi = [
+            (float(_beer_lambert(float(np.mean(zs))))
+             if zs and _beer_lambert is not None
+             else float("nan"))
+            for zs in per_roi_cfs
+        ]
 
     if not args.no_contact_sheets:
         build_contact_sheets(clusters, loader, str(out_root / "contact_sheets"), cfg)
@@ -3064,6 +3121,10 @@ def _run_one_session(
                     round(c.lai_beer_lambert, 3)
                     if math.isfinite(c.lai_beer_lambert) else None
                 ),
+                "lai_per_roi": [
+                    (round(v, 3) if math.isfinite(v) else None)
+                    for v in (c.lai_per_roi or [])
+                ],
                 **(
                     {
                         "lai_voxel": next(

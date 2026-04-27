@@ -354,4 +354,52 @@ def build_tree_mask(
     return tree_mask
 
 
-__all__ = ["build_tree_mask"]
+# ── Sprayer ROI grid (10 zones, 2 cols x 5 rows) ─────────────────
+# Verbatim from sprayer_pipeline/config.py:ROI_RECTS at reference
+# layout (640x480 frame). Each tuple is (x0, y0, x1, y1).
+ROI_ROW_Y = [
+    (1, 94),
+    (97, 190),
+    (193, 286),
+    (289, 382),
+    (385, 478),
+]
+ROI_RECTS = [
+    (ROI_COL_X[side][0], ROI_ROW_Y[row][0],
+     ROI_COL_X[side][1], ROI_ROW_Y[row][1])
+    for side in range(2)
+    for row in range(5)
+]
+BEER_LAMBERT_K = 0.5
+
+
+def zone_canopy_fractions(
+    tree_mask: np.ndarray,
+    rects=ROI_RECTS,
+):
+    """Canopy fraction (0..1) for each rectangle in ``rects``."""
+    out = []
+    mask_bool = tree_mask > 0
+    for (x0, y0, x1, y1) in rects:
+        sub = mask_bool[y0:y1 + 1, x0:x1 + 1]
+        if sub.size == 0:
+            out.append(0.0)
+            continue
+        out.append(float(sub.sum()) / float(sub.size))
+    return out
+
+
+def beer_lambert_lai(canopy_fraction: float, k: float = BEER_LAMBERT_K) -> float:
+    """LAI = -ln(1 - cf) / k, clamped to avoid blow-up at cf in {0, 1}."""
+    gap = 1.0 - float(canopy_fraction)
+    gap = max(0.01, min(0.99, gap))
+    return float(-np.log(gap) / max(1e-6, k))
+
+
+__all__ = [
+    "build_tree_mask",
+    "zone_canopy_fractions",
+    "beer_lambert_lai",
+    "ROI_RECTS",
+    "BEER_LAMBERT_K",
+]
