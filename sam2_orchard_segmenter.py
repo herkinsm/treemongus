@@ -2928,11 +2928,14 @@ def compute_per_frame_lai(
     )
     prompts = ("apple tree",)
 
-    # Import build_wide_tree_mask for the spatial anchor step.
+    # Import build_tree_mask -- the function whose ROI-column
+    # anchor (rows 20:280 within roi_cols ± 120 px) is the actual
+    # mechanism that excludes background trees and ground in the
+    # sprayer pipeline. Pass the PRGB ROI's column as roi_cols.
     try:
-        from tree_mask import build_wide_tree_mask
+        from tree_mask import build_tree_mask
     except ImportError:
-        build_wide_tree_mask = None  # type: ignore[assignment]
+        build_tree_mask = None  # type: ignore[assignment]
 
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "lai_per_frame.csv"
@@ -2976,50 +2979,38 @@ def compute_per_frame_lai(
             if roi_d.size >= 50:
                 target_med_mm = float(np.median(roi_d))
 
-        # ── Spatial anchor: build_wide_tree_mask + per-CC depth ──
-        # isolate_target_tree=False (keep ALL CCs > 2000 px) so
-        # partial canopies aren't dropped just because they're
-        # smaller than ground patches or background trees. Then
-        # filter CCs by median depth: a foreground tree's CC has
-        # median depth ≈ target_depth (PRGB ROI's median).
-        # Background trees have median 500+ mm farther; ground
-        # patches at canopy depth are filtered separately by
-        # build_wide_tree_mask's >2000-px requirement and the
-        # smoothness check below.
+        # ── Spatial anchor: build_tree_mask with PRGB-ROI roi_cols ──
+        # The mechanism that rejects background in sprayer_pipeline:
+        # the anchor band at rows 20:280 within the ROI column
+        # (±120 px). A CC is kept only if it has >10 pixels in
+        # that upper-half band. This:
+        #   - excludes ground (ground lives in rows >280)
+        #   - excludes background trees in OTHER columns
+        #   - includes the spray-target tree (its canopy extends
+        #     into the upper band of the ROI column)
+        #   - includes partial trees regardless of size, as long
+        #     as they reach the upper-band of the ROI column
         anchor = None
-        if (build_wide_tree_mask is not None and depth_mm is not None
-                and target_med_mm is not None):
+        if (build_tree_mask is not None and depth_mm is not None):
+            # Pass the PRGB ROI's actual column as roi_cols.
+            roi_cols_arr = (roi_mask.any(axis=0))
+            xs = np.where(roi_cols_arr)[0]
+            if xs.size:
+                roi_x0 = int(xs.min())
+                roi_x1 = int(xs.max())
+            else:
+                roi_x0, roi_x1 = w // 2 - 30, w // 2 + 30
             try:
-                import cv2 as _cv2
-                wide_u8 = build_wide_tree_mask(
-                    depth_mm, rgb, isolate_target_tree=False,
+                anchor_u8 = build_tree_mask(
+                    depth_mm, rgb,
+                    roi_cols=(roi_x0, roi_x1),
                 )
-                wide_bool = (wide_u8 > 0)
-                if wide_bool.any():
-                    n_cc, labels, stats, _ = (
-                        _cv2.connectedComponentsWithStats(
-                            wide_u8, connectivity=8,
-                        )
-                    )
-                    keep_lut = np.zeros(n_cc, dtype=bool)
-                    # Per-CC median-depth filter. Foreground tree
-                    # at target depth -> median ≈ target_med_mm,
-                    # kept regardless of CC size (partial trees OK).
-                    # Background trees at target+500 mm or more
-                    # have median outside ±400 mm -> dropped.
-                    for cc_id in range(1, n_cc):
-                        cc_mask_i = (labels == cc_id)
-                        cc_depths = depth_mm[cc_mask_i & (depth_mm > 0)]
-                        if cc_depths.size < 50:
-                            continue
-                        cc_med = float(np.median(cc_depths))
-                        if abs(cc_med - target_med_mm) <= 400:
-                            keep_lut[cc_id] = True
-                    if keep_lut.any():
-                        anchor = keep_lut[labels]
+                anchor = (anchor_u8 > 0)
+                if not anchor.any():
+                    anchor = None
             except Exception as exc:
                 log.debug(
-                    "build_wide_tree_mask failed frame %d: %s",
+                    "build_tree_mask failed frame %d: %s",
                     frame_idx, exc,
                 )
 
