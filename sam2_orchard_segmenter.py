@@ -3022,28 +3022,53 @@ def compute_per_frame_lai(
                             continue
                     canopy_union |= inst
 
-        # Depth validation + gradient ground filter + bottom cutoff.
+        # Depth validation + per-CC background filter + gradient
+        # ground filter + bottom cutoff.
         if depth_mm is not None and canopy_union.any():
-            # Prefer the data-driven target band from PRGB ROI;
-            # fall back to the wide [600, 3000] mm band when ROI
-            # depth is too sparse.
             if target_med_mm is not None:
                 band_lo = max(1, int(target_med_mm - 700))
                 band_hi = int(target_med_mm + 700)
             else:
                 band_lo, band_hi = _CMM, _CXMM
             in_band = (depth_mm >= band_lo) & (depth_mm <= band_hi)
-            no_depth_upper = (
-                (depth_mm == 0)
-                & (np.arange(h)[:, None] < 380)
-            )
-            canopy = canopy_union & (in_band | no_depth_upper)
+            canopy = canopy_union & in_band
 
-            # Gradient ground filter (sprayer_pipeline approach):
-            # ground has |dDepth/dRow| > threshold over a 5-row
-            # window. Apply only in the LOWER half (rows >= 240)
-            # where ground appears -- the upper canopy has noisy
-            # leaf-level gradient that we don't want to reject.
+            # Per-CC background filter on the *original* SAM 3
+            # union (before depth filtering). For each connected
+            # component in the union, compute the fraction of its
+            # pixels that have VALID in-band depth. Foreground
+            # canopy has most pixels in-band (>50%). Background
+            # trees beyond RealSense range have depth=0 throughout,
+            # so the in-band fraction is ~0 and the CC gets dropped.
+            try:
+                import cv2 as _cv2
+                u_u8 = canopy_union.astype(np.uint8)
+                n_cc, labels, stats, _ = (
+                    _cv2.connectedComponentsWithStats(u_u8, connectivity=8)
+                )
+                if n_cc > 1:
+                    keep_lut = np.zeros(n_cc, dtype=bool)
+                    flat_labels = labels.ravel()
+                    flat_in_band = in_band.ravel()
+                    cc_total = np.bincount(flat_labels, minlength=n_cc)
+                    cc_in_band = np.bincount(
+                        flat_labels, weights=flat_in_band.astype(np.int32),
+                        minlength=n_cc,
+                    )
+                    cc_total[0] = 1   # avoid div-by-zero on background
+                    in_band_frac = cc_in_band / cc_total
+                    for cc_id in range(1, n_cc):
+                        if in_band_frac[cc_id] >= 0.50:
+                            keep_lut[cc_id] = True
+                    if keep_lut.any():
+                        # Restrict canopy union to kept CCs, then re-apply
+                        # the in-band per-pixel mask.
+                        keep_mask = keep_lut[labels]
+                        canopy = (canopy_union & keep_mask) & in_band
+            except Exception:
+                pass
+
+            # Gradient ground filter on the lower half.
             try:
                 gap = 5
                 grad = np.zeros_like(depth_mm, dtype=np.float32)
@@ -3056,9 +3081,9 @@ def compute_per_frame_lai(
                     & (np.roll(depth_mm, -gap, axis=0) > 0)
                 )
                 ground_like = valid_pair & (np.abs(grad) > 5.0 * gap)
-                lower_band = np.zeros_like(canopy)
-                lower_band[240:, :] = True
-                canopy = canopy & ~(ground_like & lower_band)
+                lower_band_arr = np.zeros_like(canopy)
+                lower_band_arr[240:, :] = True
+                canopy = canopy & ~(ground_like & lower_band_arr)
             except Exception:
                 pass
         else:
