@@ -2967,6 +2967,22 @@ def compute_per_frame_lai(
             ) if depth_m is not None else None
         )
 
+        # Sprayer-pipeline preprocessing: fill small (1-3 px) depth
+        # holes via 3x3 median blur. RealSense drops to 0 on smooth
+        # leaves / specular highlights; this fills those without
+        # inventing depth in genuinely empty regions.
+        if depth_mm is not None:
+            try:
+                import cv2 as _cv2
+                src = np.ascontiguousarray(depth_mm)
+                blurred = _cv2.medianBlur(src, 3)
+                fill_mask = (src == 0) & (blurred > 0)
+                if fill_mask.any():
+                    depth_mm = src.copy()
+                    depth_mm[fill_mask] = blurred[fill_mask]
+            except Exception:
+                pass
+
         # Data-driven canopy depth window from the PRGB ROI.
         # The PRGB box marks the spray target tree; the median
         # depth inside it IS this frame's target distance. Allow
@@ -3005,9 +3021,24 @@ def compute_per_frame_lai(
                     depth_mm, rgb,
                     roi_cols=(roi_x0, roi_x1),
                 )
-                anchor = (anchor_u8 > 0)
-                if not anchor.any():
+                # TREE_MASK_MAX_FRAME_FRACTION sanity guard
+                # (sprayer_pipeline default = 0.50). Real tree
+                # canopies are 5-25% of the frame; anything bigger
+                # means the mask leaked into ground/scene. Force
+                # it empty so this frame contributes no LAI rather
+                # than wrong LAI.
+                mask_frac = float((anchor_u8 > 0).sum()) / float(anchor_u8.size)
+                if mask_frac > 0.50:
+                    log.debug(
+                        "Frame %d build_tree_mask covered %.1f%% of "
+                        "frame -- forcing empty (likely ground leak)",
+                        frame_idx, 100 * mask_frac,
+                    )
                     anchor = None
+                else:
+                    anchor = (anchor_u8 > 0)
+                    if not anchor.any():
+                        anchor = None
             except Exception as exc:
                 log.debug(
                     "build_tree_mask failed frame %d: %s",
@@ -3180,7 +3211,10 @@ def compute_per_frame_lai(
                 pass
         else:
             canopy = canopy_union
-        canopy[420:, :] = False
+        # Hard cutoff at row 400 -- mirrors main.py's MAX_GROUND_ROW.
+        # Bottom 80 rows of a tractor-mounted frame are always
+        # ground; the row-banded ground filter handles 280-400.
+        canopy[400:, :] = False
 
         if not canopy.any():
             n_skipped_no_canopy += 1
