@@ -1293,11 +1293,28 @@ def _propagate_image_mode(
                                 in_band, depth_mm,
                                 np.zeros_like(depth_mm),
                             )
-                            # Stash for the per-detection trunk-in-
-                            # band check below.
                             target_depth_band = (band_lo, band_hi)
                         else:
                             target_depth_band = None
+
+                        # Diagnostic on the first 5 frames so we see
+                        # what target depth + band were chosen and
+                        # whether ROI was present.
+                        if n_canopy_built + n_canopy_empty + n_canopy_error < 5:
+                            roi_pix = (
+                                int(roi_for_band.sum())
+                                if roi_for_band is not None else 0
+                            )
+                            log.info(
+                                "Frame %d band: ROI_pix=%d, "
+                                "target_depth_mm=%s, band=%s, "
+                                "kept_depth_pix=%d",
+                                frame_idx, roi_pix,
+                                f"{target_depth_mm:.0f}"
+                                if target_depth_mm is not None else "None",
+                                target_depth_band,
+                                int((depth_mm > 0).sum()),
+                            )
                         # Diagnostic on the first few frames so we can
                         # see what depth values build_tree_mask actually
                         # gets -- pinpoints the empty-mask cause.
