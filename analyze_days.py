@@ -1876,6 +1876,43 @@ def main():
                                 0.0,
                                 region=tile_region,
                             )
+                        # When --show-roi is on, also overlay the 10-zone
+                        # sprayer ROI grid (2 cols x 5 rows) on the PRGB
+                        # ROI's bounding box. Renders as cyan dashed
+                        # rectangles same as tile_rects.
+                        if (args.show_roi and roi_mask_img is not None
+                                and roi_mask_img.any()):
+                            roi_ys, roi_xs = np.where(roi_mask_img)
+                            rx0 = int(roi_xs.min())
+                            rx1 = int(roi_xs.max())
+                            ry0 = int(roi_ys.min())
+                            ry1 = int(roi_ys.max())
+                            roi_w_px = rx1 - rx0 + 1
+                            roi_h_px = ry1 - ry0 + 1
+                            zone_rects = []
+                            for col in range(2):
+                                cell_w = roi_w_px // 2
+                                cx0 = rx0 + col * cell_w
+                                cx1 = (
+                                    rx1 if col == 1 else cx0 + cell_w - 1
+                                )
+                                for row in range(5):
+                                    cell_h = roi_h_px // 5
+                                    cy0 = ry0 + row * cell_h
+                                    cy1 = (
+                                        ry1 if row == 4 else cy0 + cell_h - 1
+                                    )
+                                    zone_rects.append(
+                                        (cx0, cy0,
+                                         max(1, cx1 - cx0),
+                                         max(1, cy1 - cy0))
+                                    )
+                            if tile_rects_for_overlay is None:
+                                tile_rects_for_overlay = zone_rects
+                            else:
+                                tile_rects_for_overlay = (
+                                    list(tile_rects_for_overlay) + zone_rects
+                                )
                         roi_mask_for_overlay = (
                             roi_mask_img if args.show_roi else None
                         )
