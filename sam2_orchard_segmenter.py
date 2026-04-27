@@ -2920,13 +2920,21 @@ def compute_per_frame_lai(
 
     log.info("Per-frame LAI: loading SAM 3 (text-only canopy)")
     sam3_model = build_sam3_image_model()
+    # Tighter confidence threshold than the trunk pass: 0.05 is fine
+    # for box-prompted SAM 3, but text-only with generic prompts will
+    # over-include at low thresholds.
     processor = Sam3Processor(
-        sam3_model, device=device, confidence_threshold=0.05,
+        sam3_model, device=device, confidence_threshold=0.20,
     )
     autocast_dtype = (
         _torch.bfloat16 if device.startswith("cuda") else _torch.float32
     )
-    prompts = ("apple tree", "tree", "leaves", "tree branch")
+    # Drop "tree" (too generic; matches grass) and "tree branch"
+    # (returns sparse strip-shaped instances). "apple tree" is
+    # specific enough that SAM 3 picks the real tree silhouette.
+    # "leaves" backfills foliage SAM 3's "apple tree" misses on
+    # sparse canopies.
+    prompts = ("apple tree", "leaves")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "lai_per_frame.csv"
@@ -2959,6 +2967,10 @@ def compute_per_frame_lai(
         )
 
         # SAM 3 union across tree-related text prompts.
+        # Per-instance grass filter: a single mask whose bbox spans
+        # the bottom of the frame (y2 > 380) and is wide (w > w/2)
+        # is grass-tagged-as-tree. Reject those instances; keep
+        # individual canopy instances that don't span the ground.
         canopy_union = np.zeros((h, w), dtype=bool)
         with _torch.autocast(
             "cuda" if device.startswith("cuda") else "cpu",
@@ -2974,6 +2986,7 @@ def compute_per_frame_lai(
                 except Exception:
                     continue
                 ms = state.get("masks")
+                bs = state.get("boxes")
                 if ms is None or len(ms) == 0:
                     continue
                 arr = ms.detach().cpu()
@@ -2982,10 +2995,25 @@ def compute_per_frame_lai(
                 arr = arr.numpy()
                 if arr.ndim == 4:
                     arr = arr.squeeze(1)
+                if bs is not None:
+                    barr = bs.detach().cpu()
+                    if barr.dtype in (_torch.bfloat16, _torch.float16):
+                        barr = barr.to(_torch.float32)
+                    barr = barr.numpy()
+                else:
+                    barr = None
                 for i in range(arr.shape[0]):
-                    canopy_union |= arr[i].astype(bool)
+                    inst = arr[i].astype(bool)
+                    # Reject grass-shaped instances: bbox spans the
+                    # ground band AND is wide (>50% frame width).
+                    if barr is not None and i < barr.shape[0]:
+                        bx1, by1, bx2, by2 = barr[i]
+                        bw = float(bx2 - bx1)
+                        if by2 > 380 and bw > 0.5 * w:
+                            continue
+                    canopy_union |= inst
 
-        # Depth validation + bottom cutoff.
+        # Depth validation + gradient ground filter + bottom cutoff.
         if depth_mm is not None and canopy_union.any():
             in_band = (depth_mm >= _CMM) & (depth_mm <= _CXMM)
             no_depth_upper = (
@@ -2993,6 +3021,29 @@ def compute_per_frame_lai(
                 & (np.arange(h)[:, None] < 380)
             )
             canopy = canopy_union & (in_band | no_depth_upper)
+
+            # Gradient ground filter (sprayer_pipeline approach):
+            # ground has |dDepth/dRow| > threshold over a 5-row
+            # window. Apply only in the LOWER half (rows >= 240)
+            # where ground appears -- the upper canopy has noisy
+            # leaf-level gradient that we don't want to reject.
+            try:
+                gap = 5
+                grad = np.zeros_like(depth_mm, dtype=np.float32)
+                grad[:-gap, :] = (
+                    depth_mm[gap:, :].astype(np.float32)
+                    - depth_mm[:-gap, :].astype(np.float32)
+                )
+                valid_pair = (
+                    (depth_mm > 0)
+                    & (np.roll(depth_mm, -gap, axis=0) > 0)
+                )
+                ground_like = valid_pair & (np.abs(grad) > 5.0 * gap)
+                lower_band = np.zeros_like(canopy)
+                lower_band[240:, :] = True
+                canopy = canopy & ~(ground_like & lower_band)
+            except Exception:
+                pass
         else:
             canopy = canopy_union
         canopy[420:, :] = False
