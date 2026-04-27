@@ -1272,61 +1272,23 @@ def _propagate_image_mode(
                     # apply a depth-coherence cut so adjacent trees
                     # at different distances stay separated even
                     # when their canopies overlap in pixel space.
+                    # Use build_wide_tree_mask exactly the way
+                    # sprayer_pipeline.main.py uses it: pass the
+                    # frame's depth + RGB, take the whole output as
+                    # the tree mask. No CC pick, no column band, no
+                    # depth-coherence filter -- the function's own
+                    # depth band, gradient ground filter, sky
+                    # exclusion, and row-420 cutoff are what it ships
+                    # with and what the validated R²=0.564 LAI
+                    # estimator uses.
                     tree_mask: Optional[np.ndarray] = None
                     if depth_mm is not None:
                         try:
                             from tree_mask import build_wide_tree_mask
                             wide_u8 = build_wide_tree_mask(
                                 depth_mm, rgb,
-                                isolate_target_tree=False,
-                                apply_gradient_ground_filter=True,
-                                apply_blue_cv_sky_filter=True,
                             )
-                            wide_bool = (wide_u8 > 0)
-
-                            # Restrict the wide mask to a column band
-                            # around THIS trunk so adjacent trees (and
-                            # background trees) get their own slice.
-                            # No CC pick -- the whole wide mask
-                            # within the column is this tree's canopy
-                            # (build_wide_tree_mask already excluded
-                            # ground via gradient + bottom cutoff;
-                            # column restriction handles per-tree
-                            # spatial separation).
-                            x1b, _, x2b, _ = (
-                                int(round(v)) for v in det.bbox_xyxy
-                            )
-                            col_pad = 80
-                            cb0 = max(0, x1b - col_pad)
-                            cb1 = min(w, x2b + col_pad)
-                            col_band = np.zeros_like(wide_bool)
-                            col_band[:, cb0:cb1] = True
-                            in_col = wide_bool & col_band
-
-                            # Background-trunk filter: must have at
-                            # least 200 px of canopy in this trunk's
-                            # column for the detection to be a real
-                            # tree. Cars/posts produce nothing.
-                            if int(in_col.sum()) < 200:
-                                continue
-
-                            # Depth-coherence: use the median depth
-                            # inside this trunk's column-canopy as
-                            # the tree's distance, keep ±400 mm.
-                            valid = in_col & (depth_mm > 0)
-                            if valid.any():
-                                med = float(np.median(depth_mm[valid]))
-                                coh_lo = max(1, int(med - 400))
-                                coh_hi = int(med + 400)
-                                coherent = (
-                                    in_col
-                                    & (depth_mm >= coh_lo)
-                                    & (depth_mm <= coh_hi)
-                                )
-                                tree_mask = coherent | trunk_mask
-                            else:
-                                tree_mask = in_col | trunk_mask
-
+                            tree_mask = (wide_u8 > 0) | trunk_mask
                             if not tree_mask.any():
                                 tree_mask = None
                         except Exception as exc:
