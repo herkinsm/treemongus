@@ -866,13 +866,46 @@ def aggregate_tree_pointcloud(
     noise; the same leaf observed across 8-15 frames as the tractor
     passes is a tight 3D cluster that voxelizes correctly.
     """
+    # Prefer projecting the whole canopy silhouette per frame --
+    # SAM 3 with text "leaf" returns coarse all-leaves masks rather
+    # than per-leaf instances, so the leaf-class sub-mask path
+    # produces 0 points on sparse-canopy data. The silhouette is
+    # depth-validated by build_tree_mask, so every silhouette pixel
+    # with valid depth is real canopy and contributes a real point.
+    silhouette_subs: List[SubMask] = []
+    for track in cluster.tracks:
+        for det in track.detections:
+            if det.frame_idx not in cluster.frame_pixels:
+                continue
+            sil = (det.tree_mask
+                   if (det.tree_mask is not None and det.tree_mask.any())
+                   else det.mask)
+            if sil is None or not sil.any():
+                continue
+            silhouette_subs.append(SubMask(
+                frame_idx=det.frame_idx,
+                mask=sil,
+                class_id=1,                # treat as foliage
+                confidence=1.0,
+            ))
+
+    if silhouette_subs:
+        pts4 = backproject_to_world(
+            silhouette_subs, loader, cfg,
+            target_classes=(1,),
+            lat0=cluster.world_lat,
+            lon0=cluster.world_lon,
+            icp_corrections=icp_corrections,
+        )
+        if pts4.size > 0:
+            return pts4[:, :3].astype(np.float32)
+
+    # Fallback: classified leaf sub-masks (original path).
     flat_subs: List[SubMask] = []
     for fid, sms in submasks_by_frame.items():
-        flat_subs.extend(sm for sm in sms if sm.class_id == 1)   # leaves only
-
+        flat_subs.extend(sm for sm in sms if sm.class_id == 1)
     if not flat_subs:
         return np.zeros((0, 3), dtype=np.float32)
-
     pts4 = backproject_to_world(
         flat_subs, loader, cfg,
         target_classes=(1,),
@@ -882,7 +915,6 @@ def aggregate_tree_pointcloud(
     )
     if pts4.size == 0:
         return np.zeros((0, 3), dtype=np.float32)
-
     return pts4[:, :3].astype(np.float32)
 
 
