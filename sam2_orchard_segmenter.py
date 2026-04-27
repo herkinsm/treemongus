@@ -1196,6 +1196,23 @@ def _propagate_image_mode(
                             (depth_m * 1000.0).astype(np.uint16),
                             np.zeros_like(depth_m, dtype=np.uint16),
                         )
+                        # Diagnostic on the first few frames so we can
+                        # see what depth values build_tree_mask actually
+                        # gets -- pinpoints the empty-mask cause.
+                        if n_canopy_built + n_canopy_empty + n_canopy_error < 3:
+                            valid_depth_pix = int((depth_mm > 0).sum())
+                            in_canopy_band = int(
+                                ((depth_mm >= 600) & (depth_mm <= 3000)).sum()
+                            )
+                            valid_vals = depth_mm[depth_mm > 0]
+                            log.info(
+                                "Frame %d depth: shape=%s, valid=%d, "
+                                "in [600, 3000] mm=%d, min=%d, max=%d",
+                                frame_idx, depth_mm.shape, valid_depth_pix,
+                                in_canopy_band,
+                                int(valid_vals.min()) if valid_vals.size else 0,
+                                int(depth_mm.max()),
+                            )
                         # build_tree_mask returns uint8 (0 / 255).
                         # Anchor on the FULL frame width, not the
                         # sprayer's centered ROI columns. The
