@@ -309,6 +309,11 @@ class TreeCluster:
     flagged_reason: Optional[str] = None
     # Filled by attribute_flowers_via_roi(); total flowers attributed to this tree.
     flower_count: float = 0.0
+    # Beer-Lambert LAI per cluster: -ln(gap_fraction)/k where gap is
+    # the fraction of pixels in the tree's bounding column NOT inside
+    # the per-frame tree_mask. Averaged over the frames where this
+    # cluster has a tree_mask. NaN if no tree masks were available.
+    lai_beer_lambert: float = 0.0
 
     @property
     def n_frames(self) -> int:
@@ -1192,6 +1197,41 @@ def _propagate_image_mode(
                         # build_tree_mask returns uint8 (0 / 255).
                         canopy_u8 = build_tree_mask(depth_mm, rgb=rgb)
                         canopy_mask_frame = (canopy_u8 > 0)
+
+                        # Leaf-colour augmentation: HSV-green pixels
+                        # at canopy depth that build_tree_mask missed
+                        # are real leaves. The sprayer mask is tuned
+                        # for the dense-canopy spray case; sparse
+                        # saplings have leaves that fall outside its
+                        # ROI-anchor connectivity. Add foreground
+                        # green pixels back so leaf area is included.
+                        try:
+                            import cv2 as _cv2
+                            hsv = _cv2.cvtColor(
+                                rgb.astype(np.uint8), _cv2.COLOR_RGB2HSV,
+                            )
+                            H_g = hsv[:, :, 0]
+                            S_g = hsv[:, :, 1]
+                            V_g = hsv[:, :, 2]
+                            green = (
+                                (H_g >= 25) & (H_g <= 85)
+                                & (S_g > 40) & (V_g > 50)
+                            )
+                            in_band = (
+                                np.isfinite(depth_m)
+                                & (depth_m * 1000.0
+                                   >= float(cfg.trunk_min_depth_m * 1000))
+                                & (depth_m * 1000.0
+                                   <= float(cfg.trunk_max_depth_m * 1000))
+                            )
+                            leaves = green & in_band
+                            canopy_mask_frame = canopy_mask_frame | leaves
+                        except Exception as exc:
+                            log.debug(
+                                "Leaf augmentation failed frame %d: %s",
+                                frame_idx, exc,
+                            )
+
                         if not canopy_mask_frame.any():
                             canopy_mask_frame = None
                 except Exception as exc:
@@ -1232,77 +1272,82 @@ def _propagate_image_mode(
                     # mask is closest to it.
                     tree_mask: Optional[np.ndarray] = None
                     if canopy_mask_frame is not None:
-                        # Find canopy pixels in/near this trunk's
-                        # connected component.
                         try:
                             import cv2 as _cv2
-                            n_cc, labels, stats, _ = (
+                            # Find the canopy CC that best overlaps
+                            # the trunk's bounding box. Looking at the
+                            # bbox (not just the centroid) is robust
+                            # to RealSense returning 0 depth on the
+                            # trunk itself — the trunk's bbox always
+                            # straddles the surrounding canopy.
+                            n_cc, labels, _stats, _ = (
                                 _cv2.connectedComponentsWithStats(
                                     canopy_mask_frame.astype(np.uint8),
                                     connectivity=8,
                                 )
                             )
-                            # CC label of the trunk centroid.
-                            ys, xs = np.where(trunk_mask)
-                            if ys.size > 0:
-                                cy = int(np.median(ys))
-                                cx = int(np.median(xs))
-                                trunk_cc = int(labels[cy, cx])
-                                if trunk_cc > 0:
-                                    cc_mask = (labels == trunk_cc)
-                                    # Distance-transform-based split:
-                                    # for each pixel in the CC, find
-                                    # nearest trunk by checking against
-                                    # all other trunks' centroids in
-                                    # this frame.
-                                    other_centroids = []
-                                    for other in dets:
-                                        if other is det:
-                                            continue
-                                        ox1, oy1, ox2, oy2 = other.bbox_xyxy
-                                        other_centroids.append((
-                                            (oy1 + oy2) * 0.5,
-                                            (ox1 + ox2) * 0.5,
-                                        ))
-                                    if not other_centroids:
-                                        # Only trunk in CC — keep all.
-                                        tree_mask = cc_mask
-                                    else:
-                                        # Nearest-trunk Voronoi within
-                                        # this CC: keep canopy pixels
-                                        # whose nearest trunk centroid
-                                        # is OUR trunk.
-                                        my_cy = (det.bbox_xyxy[1]
-                                                 + det.bbox_xyxy[3]) * 0.5
-                                        my_cx = (det.bbox_xyxy[0]
-                                                 + det.bbox_xyxy[2]) * 0.5
-                                        cc_ys, cc_xs = np.where(cc_mask)
-                                        d_self = (
-                                            (cc_ys - my_cy) ** 2
-                                            + (cc_xs - my_cx) ** 2
-                                        )
-                                        d_others = np.full_like(
-                                            d_self, np.inf,
-                                            dtype=np.float64,
-                                        )
-                                        for oc_y, oc_x in other_centroids:
-                                            d_other = (
-                                                (cc_ys - oc_y) ** 2
-                                                + (cc_xs - oc_x) ** 2
-                                            )
-                                            d_others = np.minimum(
-                                                d_others, d_other,
-                                            )
-                                        keep = d_self <= d_others
-                                        m = np.zeros_like(cc_mask)
-                                        m[cc_ys[keep], cc_xs[keep]] = True
-                                        tree_mask = m
-                                    if tree_mask is not None and tree_mask.any():
-                                        n_tree_mask_ok += 1
-                                    else:
-                                        tree_mask = None
-                                        n_tree_mask_fail += 1
+                            x1b, y1b, x2b, y2b = (
+                                int(round(v)) for v in det.bbox_xyxy
+                            )
+                            x1b = max(0, x1b); y1b = max(0, y1b)
+                            x2b = min(w, x2b); y2b = min(h, y2b)
+                            if x2b > x1b and y2b > y1b:
+                                bbox_labels = labels[y1b:y2b, x1b:x2b]
+                                cc_counts = np.bincount(
+                                    bbox_labels.ravel(), minlength=n_cc,
+                                )
+                                cc_counts[0] = 0  # background never anchors
+                                trunk_cc = (
+                                    int(cc_counts.argmax())
+                                    if cc_counts.any() else 0
+                                )
+                            else:
+                                trunk_cc = 0
+
+                            if trunk_cc > 0:
+                                cc_mask = (labels == trunk_cc)
+                                # Voronoi split: keep canopy pixels
+                                # closer to OUR trunk centroid than to
+                                # any other trunk's centroid in this
+                                # frame.
+                                other_centroids = []
+                                for other in dets:
+                                    if other is det:
+                                        continue
+                                    ox1, oy1, ox2, oy2 = other.bbox_xyxy
+                                    other_centroids.append((
+                                        (oy1 + oy2) * 0.5,
+                                        (ox1 + ox2) * 0.5,
+                                    ))
+                                my_cy = (det.bbox_xyxy[1] + det.bbox_xyxy[3]) * 0.5
+                                my_cx = (det.bbox_xyxy[0] + det.bbox_xyxy[2]) * 0.5
+                                if not other_centroids:
+                                    tree_mask = cc_mask
                                 else:
+                                    cc_ys, cc_xs = np.where(cc_mask)
+                                    d_self = (
+                                        (cc_ys - my_cy) ** 2
+                                        + (cc_xs - my_cx) ** 2
+                                    )
+                                    d_others = np.full_like(
+                                        d_self, np.inf, dtype=np.float64,
+                                    )
+                                    for oc_y, oc_x in other_centroids:
+                                        d_other = (
+                                            (cc_ys - oc_y) ** 2
+                                            + (cc_xs - oc_x) ** 2
+                                        )
+                                        d_others = np.minimum(
+                                            d_others, d_other,
+                                        )
+                                    keep = d_self <= d_others
+                                    m = np.zeros_like(cc_mask)
+                                    m[cc_ys[keep], cc_xs[keep]] = True
+                                    tree_mask = m
+                                if tree_mask is not None and tree_mask.any():
+                                    n_tree_mask_ok += 1
+                                else:
+                                    tree_mask = None
                                     n_tree_mask_fail += 1
                             else:
                                 n_tree_mask_fail += 1
@@ -2856,6 +2901,34 @@ def _run_one_session(
             ),
         )
 
+    # Per-cluster Beer-Lambert LAI from the per-frame tree masks.
+    # For each frame the cluster has a tree_mask, compute canopy
+    # fraction inside the tree's bounding column (the column the
+    # tree occupies, full vertical extent) and convert via
+    # -ln(1 - cf)/k. Average across frames. Mirrors the sprayer-
+    # pipeline beer-lambert formula in sprayer_pipeline/tree_mask.py.
+    K_BEER = 0.5
+    for cluster in clusters:
+        cfs: List[float] = []
+        for track in cluster.tracks:
+            for det in track.detections:
+                if det.tree_mask is None or not det.tree_mask.any():
+                    continue
+                ys, xs = np.where(det.tree_mask)
+                x_lo, x_hi = int(xs.min()), int(xs.max()) + 1
+                col = det.tree_mask[:, x_lo:x_hi]
+                area = col.size
+                if area == 0:
+                    continue
+                cf = float(col.sum()) / float(area)
+                cfs.append(cf)
+        if cfs:
+            mean_cf = float(np.mean(cfs))
+            gap = max(0.01, min(0.99, 1.0 - mean_cf))
+            cluster.lai_beer_lambert = float(-math.log(gap) / K_BEER)
+        else:
+            cluster.lai_beer_lambert = float("nan")
+
     if not args.no_contact_sheets:
         build_contact_sheets(clusters, loader, str(out_root / "contact_sheets"), cfg)
 
@@ -2872,6 +2945,10 @@ def _run_one_session(
                 "last_frame": c.last_frame,
                 "flagged_reason": c.flagged_reason,
                 "flower_count": round(c.flower_count, 1),
+                "lai_beer_lambert": (
+                    round(c.lai_beer_lambert, 3)
+                    if math.isfinite(c.lai_beer_lambert) else None
+                ),
             }
             for c in clusters
         ],
@@ -2883,10 +2960,12 @@ def _run_one_session(
     for c in clusters:
         flag = f"  [{c.flagged_reason}]" if c.flagged_reason else ""
         flowers = f"  flowers={c.flower_count:.0f}" if c.flower_count else ""
+        lai = (f"  LAI={c.lai_beer_lambert:.2f}"
+               if math.isfinite(c.lai_beer_lambert) else "")
         print(f"  Tree {c.tree_id:3d}: "
               f"({c.world_lat:.7f}, {c.world_lon:.7f})  "
               f"frames {c.first_frame}-{c.last_frame} "
-              f"(n={c.n_frames}){flowers}{flag}")
+              f"(n={c.n_frames}){flowers}{lai}{flag}")
 
 
 # ============================================================================
