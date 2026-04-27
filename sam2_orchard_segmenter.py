@@ -150,6 +150,21 @@ class SegmenterConfig:
     # actual depth. Set to 0 to disable the fallback (strict depth
     # only, will discard most thin-trunk detections).
     nominal_tree_distance_m: float = 1.5
+    # Canopy depth band is computed *per-frame* from the PRGB ROI's
+    # actual depth distribution, not a hardcoded number. These are
+    # the safety bounds applied around the data-driven target depth:
+    #
+    #   target_depth_m = median of valid depths inside PRGB ROI
+    #   half_band_m = max(canopy_band_min_half_m,
+    #                     iqr_of_roi_depths * canopy_band_iqr_mult)
+    #   half_band_m = min(half_band_m, canopy_band_max_half_m)
+    #
+    # so the band is wide enough for the actual canopy thickness
+    # (IQR captures depth spread of leaves at varying distances)
+    # but capped to keep ground / background out.
+    canopy_band_min_half_m: float = 0.30   # ≥ 0.6 m total band
+    canopy_band_max_half_m: float = 1.20   # ≤ 2.4 m total band
+    canopy_band_iqr_mult: float = 2.0      # band ~= 4·IQR around median
     # Text prompt for the SAM 3 second pass that segments the whole
     # tree (canopy + trunk) containing the GDINO-detected trunk box.
     # The combined text + box prompt lets SAM 3 separate touching
@@ -1207,6 +1222,7 @@ def _propagate_image_mode(
                 # via nearest-trunk assignment so touching trees
                 # stay separated.
                 canopy_mask_frame: Optional[np.ndarray] = None
+                target_depth_band: Optional[Tuple[int, int]] = None
                 try:
                     from tree_mask import build_tree_mask
                     depth_m = loader.load_depth_m(frame_idx)
@@ -1216,6 +1232,72 @@ def _propagate_image_mode(
                             (depth_m * 1000.0).astype(np.uint16),
                             np.zeros_like(depth_m, dtype=np.uint16),
                         )
+                        # ── Data-driven canopy band from PRGB ROI ──
+                        # The PRGB red box is drawn by the sprayer at
+                        # the tree it is currently spraying. Sample
+                        # depth inside the ROI -- the median of those
+                        # valid depths IS this frame's target tree
+                        # distance, and the IQR tells us how thick
+                        # the canopy is at this growth stage. No
+                        # hardcoded distance needed.
+                        target_depth_mm = None
+                        half_band_mm = None
+                        roi_for_band = loader.load_roi_mask(frame_idx)
+                        if (roi_for_band is not None
+                                and roi_for_band.any()):
+                            roi_depths = depth_mm[
+                                roi_for_band & (depth_mm > 0)
+                            ]
+                            if roi_depths.size >= 50:
+                                p25 = np.percentile(roi_depths, 25)
+                                p50 = np.percentile(roi_depths, 50)
+                                p75 = np.percentile(roi_depths, 75)
+                                iqr = float(max(0.0, p75 - p25))
+                                target_depth_mm = float(p50)
+                                half_band_mm = (
+                                    cfg.canopy_band_iqr_mult * iqr
+                                )
+                                half_band_mm = max(
+                                    half_band_mm,
+                                    cfg.canopy_band_min_half_m * 1000.0,
+                                )
+                                half_band_mm = min(
+                                    half_band_mm,
+                                    cfg.canopy_band_max_half_m * 1000.0,
+                                )
+                        # Fallback if ROI absent or too sparse:
+                        # global mode of valid depths in the upper
+                        # canopy strip (rows 100-300, full width).
+                        if target_depth_mm is None:
+                            strip = depth_mm[100:300, :]
+                            valid = strip[(strip > 600) & (strip < 6000)]
+                            if valid.size >= 200:
+                                target_depth_mm = float(
+                                    np.median(valid),
+                                )
+                                # Use min half-band as a safe default.
+                                half_band_mm = (
+                                    cfg.canopy_band_min_half_m * 1000.0
+                                )
+                        if target_depth_mm is not None:
+                            band_lo = max(
+                                1,
+                                int(target_depth_mm - half_band_mm),
+                            )
+                            band_hi = int(target_depth_mm + half_band_mm)
+                            in_band = (
+                                (depth_mm >= band_lo)
+                                & (depth_mm <= band_hi)
+                            )
+                            depth_mm = np.where(
+                                in_band, depth_mm,
+                                np.zeros_like(depth_mm),
+                            )
+                            # Stash for the per-detection trunk-in-
+                            # band check below.
+                            target_depth_band = (band_lo, band_hi)
+                        else:
+                            target_depth_band = None
                         # Diagnostic on the first few frames so we can
                         # see what depth values build_tree_mask actually
                         # gets -- pinpoints the empty-mask cause.
@@ -1313,13 +1395,17 @@ def _propagate_image_mode(
                             continue
                         sam3_score = 1.0
 
-                    # Background-trunk filter: a real apple trunk has
-                    # canopy *somewhere near it* in the frame. A car,
-                    # barn, distant pole, etc., that GDINO labelled
-                    # as a trunk has NO canopy in the depth-validated
-                    # band around it. Dilate the trunk mask by ~80 px
-                    # and check intersection with the canopy mask --
-                    # if empty, reject this detection.
+                    # Background-trunk filter (data-driven). A real
+                    # apple trunk has canopy near it AT the same
+                    # distance. A car / barn / fence post is at a
+                    # very different depth from the spray-target
+                    # trees. Two checks:
+                    #   (a) some canopy must live within ~80 px of
+                    #       the trunk (proximity)
+                    #   (b) the trunk's column must contain depth
+                    #       pixels inside the data-driven canopy
+                    #       band (distance match)
+                    # Either failing → reject as background.
                     if canopy_mask_frame is not None:
                         try:
                             import cv2 as _cv2
@@ -1332,12 +1418,34 @@ def _propagate_image_mode(
                             ).astype(bool)
                             if not (near_trunk
                                     & canopy_mask_frame).any():
-                                # No canopy anywhere near this trunk
-                                # -- it's a background false positive
-                                # (car, barn, fence post). Skip.
                                 continue
                         except Exception:
                             pass
+                    if target_depth_band is not None:
+                        # Sample depth inside the trunk's bbox column
+                        # (any valid pixel anywhere in the dilated
+                        # neighbourhood). If NONE of those depths sit
+                        # inside the data-driven canopy band, this
+                        # 'trunk' isn't at the spray target distance.
+                        x1b, y1b, x2b, y2b = (
+                            int(round(v)) for v in det.bbox_xyxy
+                        )
+                        x1s = max(0, x1b - 40)
+                        x2s = min(w, x2b + 40)
+                        y1s = max(0, y1b - 20)
+                        y2s = min(h, y2b + 20)
+                        if x2s > x1s and y2s > y1s:
+                            depth_mm_local = depth_mm[y1s:y2s, x1s:x2s]
+                            band_lo, band_hi = target_depth_band
+                            in_band_pix = (
+                                (depth_mm_local >= band_lo)
+                                & (depth_mm_local <= band_hi)
+                            )
+                            # Need at least 50 in-band pixels in the
+                            # trunk neighbourhood to call it a tree
+                            # at the target distance.
+                            if int(in_band_pix.sum()) < 50:
+                                continue
 
                     # ── Pass 2: whole-tree mask via sprayer-pipeline
                     #   compute_canopy_mask + nearest-trunk split. ──
@@ -3236,6 +3344,13 @@ def _main() -> None:
                              "effective range). Lower to e.g. 5 if the "
                              "camera is foreground-aimed; raise if it looks "
                              "sideways across the aisle.")
+    parser.add_argument("--canopy-half-band-m", type=float, default=0.7,
+                        help="Half-width of the canopy-depth band centred "
+                             "on --nominal-tree-distance-m (default 0.7 m). "
+                             "Pixels outside [nom-half, nom+half] are "
+                             "excluded from the canopy mask -- filters out "
+                             "ground (close), background trees / cars "
+                             "(far). Widen for varying tree distances.")
     parser.add_argument("--nominal-tree-distance-m", type=float,
                         default=1.5,
                         help="Fallback perpendicular distance from camera "
@@ -3295,6 +3410,7 @@ def _main() -> None:
         trunk_max_depth_m=args.trunk_max_depth_m,
         trunk_min_roi_overlap=args.trunk_min_roi_overlap,
         nominal_tree_distance_m=args.nominal_tree_distance_m,
+        canopy_half_band_m=args.canopy_half_band_m,
     )
 
     sessions = _walk_all2023_sessions(Path(args.root))
