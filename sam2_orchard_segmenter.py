@@ -140,8 +140,8 @@ class SegmenterConfig:
     # range. Flowers from analyze_days.py use 0.6-3.0 m for canopy;
     # trunks can sit a bit further back as the camera approaches but
     # anything > 6 m is a background object (other rows, barns).
-    trunk_min_depth_m: float = 0.5
-    trunk_max_depth_m: float = 6.0
+    trunk_min_depth_m: float = 0.3
+    trunk_max_depth_m: float = 15.0
     # Require the GDINO bbox to overlap the PRGB ROI by at least this
     # fraction of the bbox. The ROI marks the tree currently being
     # sprayed; trunks outside it are background. Set to 0 to disable.
@@ -1352,18 +1352,18 @@ def project_tracks_to_world(
     hfov = math.radians(cfg.camera_hfov_deg)
 
     def _trunk_depth_m(depth: np.ndarray, mask: np.ndarray) -> Tuple[float, bool]:
-        """Median depth inside the trunk mask, with a dilation fallback.
+        """Robust trunk-depth estimate with a dilation fallback.
 
         RealSense returns no depth for thin verticals against bright
         backgrounds, so a sapling's mask often has 0 valid pixels.
         Fall back to the mask dilated by ~10 px (captures the foliage
-        right next to the trunk) and take p25 (the closest = trunk
-        vicinity, not the further canopy).
+        right next to the trunk). Use p10 of those depths so we lock
+        onto the closest = trunk-vicinity pixels, not background
+        seen through the canopy.
         """
         d = _depth_in_mask(depth, mask, cfg.depth_estimator)
         if math.isfinite(d):
             return d, False
-        # Dilate by 10 pixels with a simple cross/box kernel.
         try:
             import cv2 as _cv2
             kernel = np.ones((21, 21), dtype=np.uint8)
@@ -1372,7 +1372,11 @@ def project_tracks_to_world(
             ).astype(bool)
         except Exception:
             return d, False
-        d2 = _depth_in_mask(depth, dil, "p25")
+        # Compute p10 manually — _depth_in_mask only knows median/mean/p25.
+        valid = dil & np.isfinite(depth) & (depth > 0.1) & (depth < 20.0)
+        if not valid.any():
+            return float("nan"), False
+        d2 = float(np.percentile(depth[valid], 10))
         return d2, math.isfinite(d2)
 
     for track in tqdm(tracks, desc="World projection"):
@@ -2552,14 +2556,15 @@ def _main() -> None:
                              "trunk in a frame projects to the same point and "
                              "the same tree smears along the row as the "
                              "camera passes by. RealSense D435 RGB is ~69°.")
-    parser.add_argument("--trunk-min-depth-m", type=float, default=0.5,
-                        help="Reject trunk detections whose median bbox "
-                             "depth is below this many metres (default 0.5).")
-    parser.add_argument("--trunk-max-depth-m", type=float, default=6.0,
-                        help="Reject trunk detections whose median bbox "
-                             "depth exceeds this many metres (default 6.0). "
-                             "Filters out background trunks in the next row, "
-                             "barns, etc.")
+    parser.add_argument("--trunk-min-depth-m", type=float, default=0.3,
+                        help="Reject trunks whose mask depth is below this "
+                             "many metres (default 0.3).")
+    parser.add_argument("--trunk-max-depth-m", type=float, default=15.0,
+                        help="Reject trunks whose mask depth exceeds this "
+                             "many metres (default 15.0 — RealSense D435 "
+                             "effective range). Lower to e.g. 5 if the "
+                             "camera is foreground-aimed; raise if it looks "
+                             "sideways across the aisle.")
     parser.add_argument("--trunk-min-roi-overlap", type=float, default=0.10,
                         help="Reject trunk detections whose bbox overlaps "
                              "the (vertically-extended) PRGB ROI by less "
