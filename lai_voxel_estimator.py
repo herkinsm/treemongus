@@ -884,8 +884,10 @@ def aggregate_tree_pointcloud(
                 continue
             silhouette_subs.append(SubMask(
                 frame_idx=det.frame_idx,
+                tree_id=cluster.tree_id,
                 mask=sil,
                 class_id=1,                # treat as foliage
+                depth_median_m=float(det.depth_m or 0.0),
                 confidence=1.0,
             ))
 
