@@ -1167,6 +1167,39 @@ def _propagate_image_mode(
                 dtype=ac_dtype,
             ):
                 state = sam3_processor.set_image(pil_img)
+
+                # Pre-compute the sprayer-pipeline canopy mask once
+                # per frame. This is the depth-thresholded, row-band-
+                # filtered tree mask the user already uses for flower
+                # filtering — far more reliable for thin saplings than
+                # SAM 3 wrestling with sparse foliage. We'll split
+                # this canopy across the frame's trunks via
+                # nearest-trunk assignment so touching trees stay
+                # separated.
+                canopy_mask_frame: Optional[np.ndarray] = None
+                try:
+                    from analyze_days import compute_canopy_mask
+                    depth_m = loader.load_depth_m(frame_idx)
+                    if depth_m is not None and np.isfinite(depth_m).any():
+                        depth_mm = np.where(
+                            np.isfinite(depth_m) & (depth_m > 0),
+                            (depth_m * 1000.0).astype(np.uint16),
+                            np.zeros_like(depth_m, dtype=np.uint16),
+                        )
+                        canopy_mask_frame = compute_canopy_mask(
+                            depth_mm,
+                            min_mm=int(cfg.trunk_min_depth_m * 1000),
+                            max_mm=int(cfg.trunk_max_depth_m * 1000),
+                        )
+                        if not canopy_mask_frame.any():
+                            canopy_mask_frame = None
+                except Exception as exc:
+                    log.debug(
+                        "Canopy mask failed on frame %d: %s",
+                        frame_idx, exc,
+                    )
+                    canopy_mask_frame = None
+
                 for det in dets:
                     # ── Pass 1: trunk-tight mask via box prompt ──
                     sam3_processor.reset_all_prompts(state)
@@ -1183,58 +1216,103 @@ def _propagate_image_mode(
                             continue
                         sam3_score = 1.0
 
-                    # ── Pass 2: whole-tree mask via text-only prompt ──
-                    # We deliberately do NOT pass the trunk box as a
-                    # geometric prompt here -- SAM 3 constrains its
-                    # mask to the box area when both are given, which
-                    # clips the canopy. Instead, ask SAM 3 to segment
-                    # *all* trees in the frame via the text prompt,
-                    # then pick the instance whose mask contains the
-                    # most of our trunk pixels. That instance is the
-                    # specific tree this trunk belongs to, with the
-                    # full canopy intact and adjacent trees in the
-                    # frame as separate instances.
+                    # ── Pass 2: whole-tree mask via sprayer-pipeline
+                    #   compute_canopy_mask + nearest-trunk split. ──
+                    # This is the SAME canopy mask the user already
+                    # uses to filter flowers in analyze_days.py:
+                    # depth-thresholded, row-band-filtered, connected-
+                    # component cleaned. Far more reliable than SAM 3
+                    # on sparse-canopy saplings.
+                    #
+                    # If multiple trunks land in the same canopy CC,
+                    # we'd be merging touching trees -- so we split
+                    # the canopy by nearest-trunk in pixel space:
+                    # each canopy pixel belongs to whichever trunk
+                    # mask is closest to it.
                     tree_mask: Optional[np.ndarray] = None
-                    try:
-                        sam3_processor.reset_all_prompts(state)
-                        state = sam3_processor.set_text_prompt(
-                            prompt=cfg.tree_text_prompt, state=state,
-                        )
-                        all_masks = state.get("masks")
-                        if all_masks is not None and len(all_masks) > 0:
-                            arr = all_masks.detach().cpu()
-                            if arr.dtype != _torch.bool:
-                                arr = arr.to(_torch.bool)
-                            arr = arr.numpy()
-                            if arr.ndim == 4:
-                                arr = arr.squeeze(1)
-                            best_overlap = 0
-                            best_idx = -1
-                            trunk_px = int(trunk_mask.sum())
-                            for i in range(arr.shape[0]):
-                                inter = int(np.logical_and(
-                                    arr[i], trunk_mask,
-                                ).sum())
-                                if inter > best_overlap:
-                                    best_overlap = inter
-                                    best_idx = i
-                            # Require >=10% of trunk pixels inside the
-                            # picked tree mask, else SAM 3 didn't find
-                            # this tree among its detections.
-                            if (best_idx >= 0
-                                    and best_overlap >= max(1, int(trunk_px * 0.10))):
-                                tree_mask = arr[best_idx].astype(bool)
-                                n_tree_mask_ok += 1
+                    if canopy_mask_frame is not None:
+                        # Find canopy pixels in/near this trunk's
+                        # connected component.
+                        try:
+                            import cv2 as _cv2
+                            n_cc, labels, stats, _ = (
+                                _cv2.connectedComponentsWithStats(
+                                    canopy_mask_frame.astype(np.uint8),
+                                    connectivity=8,
+                                )
+                            )
+                            # CC label of the trunk centroid.
+                            ys, xs = np.where(trunk_mask)
+                            if ys.size > 0:
+                                cy = int(np.median(ys))
+                                cx = int(np.median(xs))
+                                trunk_cc = int(labels[cy, cx])
+                                if trunk_cc > 0:
+                                    cc_mask = (labels == trunk_cc)
+                                    # Distance-transform-based split:
+                                    # for each pixel in the CC, find
+                                    # nearest trunk by checking against
+                                    # all other trunks' centroids in
+                                    # this frame.
+                                    other_centroids = []
+                                    for other in dets:
+                                        if other is det:
+                                            continue
+                                        ox1, oy1, ox2, oy2 = other.bbox_xyxy
+                                        other_centroids.append((
+                                            (oy1 + oy2) * 0.5,
+                                            (ox1 + ox2) * 0.5,
+                                        ))
+                                    if not other_centroids:
+                                        # Only trunk in CC — keep all.
+                                        tree_mask = cc_mask
+                                    else:
+                                        # Nearest-trunk Voronoi within
+                                        # this CC: keep canopy pixels
+                                        # whose nearest trunk centroid
+                                        # is OUR trunk.
+                                        my_cy = (det.bbox_xyxy[1]
+                                                 + det.bbox_xyxy[3]) * 0.5
+                                        my_cx = (det.bbox_xyxy[0]
+                                                 + det.bbox_xyxy[2]) * 0.5
+                                        cc_ys, cc_xs = np.where(cc_mask)
+                                        d_self = (
+                                            (cc_ys - my_cy) ** 2
+                                            + (cc_xs - my_cx) ** 2
+                                        )
+                                        d_others = np.full_like(
+                                            d_self, np.inf,
+                                            dtype=np.float64,
+                                        )
+                                        for oc_y, oc_x in other_centroids:
+                                            d_other = (
+                                                (cc_ys - oc_y) ** 2
+                                                + (cc_xs - oc_x) ** 2
+                                            )
+                                            d_others = np.minimum(
+                                                d_others, d_other,
+                                            )
+                                        keep = d_self <= d_others
+                                        m = np.zeros_like(cc_mask)
+                                        m[cc_ys[keep], cc_xs[keep]] = True
+                                        tree_mask = m
+                                    if tree_mask is not None and tree_mask.any():
+                                        n_tree_mask_ok += 1
+                                    else:
+                                        tree_mask = None
+                                        n_tree_mask_fail += 1
+                                else:
+                                    n_tree_mask_fail += 1
                             else:
                                 n_tree_mask_fail += 1
-                        else:
+                        except Exception as exc:
                             n_tree_mask_fail += 1
-                    except Exception as exc:
+                            log.debug(
+                                "Canopy split failed on frame %d: %s",
+                                frame_idx, exc,
+                            )
+                    else:
                         n_tree_mask_fail += 1
-                        log.debug(
-                            "SAM 3 tree pass failed on frame %d: %s",
-                            frame_idx, exc,
-                        )
 
                     track = TrunkTrack(track_id=next_track_id)
                     next_track_id += 1
@@ -1277,8 +1355,9 @@ def _propagate_image_mode(
     log.info("%s: %d single-frame tracks built", desc_map[backend], len(tracks))
     if backend == "sam3":
         log.info(
-            "Whole-tree mask (text+box prompt %r): %d ok, %d failed/discarded",
-            cfg.tree_text_prompt, n_tree_mask_ok, n_tree_mask_fail,
+            "Whole-tree mask (sprayer-pipeline canopy + nearest-trunk split): "
+            "%d ok, %d failed/discarded",
+            n_tree_mask_ok, n_tree_mask_fail,
         )
     return tracks
 
