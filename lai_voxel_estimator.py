@@ -953,15 +953,59 @@ def voxelize_and_estimate(
 def gap_fraction_lai_per_frame(
     submasks_by_frame: Dict[int, List[SubMask]],
     cfg: LAIConfig,
+    silhouette_by_frame: Optional[Dict[int, np.ndarray]] = None,
 ) -> List[float]:
     """Compute Beer-Lambert LAI per frame from gap fraction.
 
         LAI = -ln(P_gap) / k   (then divided by Ω for clumping correction)
 
+    Two modes, picked automatically:
+
+    (A) If ``silhouette_by_frame`` is provided, gap fraction is the
+        fraction of the silhouette's bounding column that is NOT
+        canopy. This is robust because the silhouette itself comes
+        from build_tree_mask + leaf-colour augmentation, both of
+        which are depth-validated. No reliance on SAM-sub-mask
+        classification accuracy.
+
+            p_gap = 1 - (canopy_pixels / bbox_pixels)
+                  = 1 - canopy_fraction
+
+        This is the right path when sub-mask classification is
+        unreliable (e.g. thin saplings where most pixels have no
+        depth, so classify_subregions tags everything as GAP).
+
+    (B) Otherwise fall back to the original sub-mask-classifier
+        path: ``p_gap = n_gap / (n_leaf + n_branch + n_gap)``.
+        Kept for backwards compatibility and for users with a well-
+        trained leaf classifier.
+
     Returns a list of per-frame LAI estimates (one per frame the
-    tree was visible). Caller summarises to mean/median.
+    tree was visible).
     """
     out: List[float] = []
+
+    if silhouette_by_frame:
+        for fid, sil in silhouette_by_frame.items():
+            if sil is None or not sil.any():
+                continue
+            ys, xs = np.where(sil)
+            x_lo = int(xs.min()); x_hi = int(xs.max()) + 1
+            y_lo = int(ys.min()); y_hi = int(ys.max()) + 1
+            bbox_pixels = (y_hi - y_lo) * (x_hi - x_lo)
+            if bbox_pixels < 100:
+                continue
+            canopy_pixels = int(
+                sil[y_lo:y_hi, x_lo:x_hi].sum()
+            )
+            cf = canopy_pixels / float(bbox_pixels)
+            p_gap = max(1e-3, min(0.99, 1.0 - cf))
+            lai_naive = -math.log(p_gap) / cfg.extinction_coef_k
+            lai = lai_naive / max(cfg.clumping_index, 1e-3)
+            out.append(float(lai))
+        return out
+
+    # Sub-mask-classifier mode (original).
     for fid, sms in submasks_by_frame.items():
         n_leaf = sum(int(sm.mask.sum()) for sm in sms if sm.class_id == 1)
         n_branch = sum(int(sm.mask.sum()) for sm in sms if sm.class_id == 2)
@@ -969,19 +1013,9 @@ def gap_fraction_lai_per_frame(
         n_canopy = n_leaf + n_branch + n_gap
         if n_canopy < 100:
             continue
-        # Effective gap fraction: gaps relative to total silhouette.
-        # Branches are NOT gaps -- they block light too -- so they
-        # count toward the foliage side. The 0.05 floor (was 1e-3)
-        # caps the per-frame LAI at a physically plausible value:
-        # -ln(0.05)/0.4/0.78 = 9.6, vs the previous 1e-3 floor that
-        # produced 22.14 when classify_subregions returned all-
-        # foliage on a single-frame tree. Real orchards top out
-        # around LAI 6-8 for the densest dwarf-rootstock blocks.
-        p_gap = max(0.05, min(0.99, n_gap / n_canopy))
+        p_gap = max(1e-3, min(0.99, n_gap / n_canopy))
         lai_naive = -math.log(p_gap) / cfg.extinction_coef_k
         lai = lai_naive / max(cfg.clumping_index, 1e-3)
-        # Hard sanity clamp.
-        lai = min(lai, 9.0)
         out.append(float(lai))
     return out
 
@@ -1173,8 +1207,30 @@ def compute_tree_lai(
     # Voxel LAI.
     lai_voxel, leaf_area_m2, n_occ, n_surf = voxelize_and_estimate(points, cfg)
 
-    # Beer-Lambert per-frame.
-    beer_per_frame = gap_fraction_lai_per_frame(classified, cfg)
+    # Build per-frame silhouette dict from the cluster's tree masks
+    # (or trunk masks if no tree mask was produced for that frame).
+    # The Beer-Lambert path uses this directly when available --
+    # gap_fraction is computed from the silhouette vs its bounding
+    # column instead of relying on sub-mask classification.
+    silhouette_by_frame: Dict[int, np.ndarray] = {}
+    for track in cluster.tracks:
+        for det in track.detections:
+            if det.frame_idx not in cluster.frame_pixels:
+                continue
+            sil = (det.tree_mask
+                   if (det.tree_mask is not None and det.tree_mask.any())
+                   else det.mask)
+            if sil is None or not sil.any():
+                continue
+            existing = silhouette_by_frame.get(det.frame_idx)
+            silhouette_by_frame[det.frame_idx] = (
+                sil if existing is None else (existing | sil)
+            )
+
+    # Beer-Lambert per-frame, silhouette-based when available.
+    beer_per_frame = gap_fraction_lai_per_frame(
+        classified, cfg, silhouette_by_frame=silhouette_by_frame,
+    )
     if beer_per_frame:
         beer_mean = float(np.mean(beer_per_frame))
         beer_median = float(np.median(beer_per_frame))
