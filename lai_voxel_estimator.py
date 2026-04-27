@@ -910,7 +910,10 @@ def aggregate_tree_pointcloud(
                             (depth * 1000.0).astype(np.uint16),
                             np.zeros_like(depth, dtype=np.uint16),
                         )
-                        canopy_u8 = _build_tree_mask(depth_mm, rgb=rgb)
+                        canopy_u8 = _build_tree_mask(
+                            depth_mm, rgb=rgb,
+                            roi_cols=(0, depth_mm.shape[1] - 1),
+                        )
                         canopy = (canopy_u8 > 0)
                         if canopy.any():
                             # Restrict to a column band centred on the

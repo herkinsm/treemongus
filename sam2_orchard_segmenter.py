@@ -1197,7 +1197,17 @@ def _propagate_image_mode(
                             np.zeros_like(depth_m, dtype=np.uint16),
                         )
                         # build_tree_mask returns uint8 (0 / 255).
-                        canopy_u8 = build_tree_mask(depth_mm, rgb=rgb)
+                        # Anchor on the FULL frame width, not the
+                        # sprayer's centered ROI columns. The
+                        # segmenter sees trees across the whole
+                        # frame as the camera moves down the row,
+                        # so the centred-ROI anchor (default
+                        # x ∈ [285, 354]) drops every tree that
+                        # isn't directly under the sprayer.
+                        canopy_u8 = build_tree_mask(
+                            depth_mm, rgb=rgb,
+                            roi_cols=(0, w - 1),
+                        )
                         canopy_mask_frame = (canopy_u8 > 0)
 
                         # Leaf-colour augmentation: HSV-green pixels
