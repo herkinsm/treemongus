@@ -1464,12 +1464,24 @@ def project_tracks_to_world(
             depth = loader.load_depth_m(det.frame_idx)
             # Prefer the whole-tree mask for depth: thin-trunk pixels
             # often have no depth, but the canopy has thousands of
-            # valid pixels at roughly the same distance.
-            depth_mask = (
-                det.tree_mask if det.tree_mask is not None
-                and det.tree_mask.any() else det.mask
-            )
-            d_m, used_dilated = _trunk_depth_m(depth, depth_mask)
+            # valid pixels at roughly the same distance. Use p10
+            # (closest 10%) when sampling from the tree mask -- the
+            # mask includes sky/background visible through sparse
+            # canopy gaps, and p10 latches onto the actual canopy
+            # surface instead of being dragged toward background.
+            d_m: float
+            used_dilated = False
+            if det.tree_mask is not None and det.tree_mask.any():
+                valid = (det.tree_mask
+                         & np.isfinite(depth)
+                         & (depth > 0.1)
+                         & (depth < 20.0))
+                if valid.any():
+                    d_m = float(np.percentile(depth[valid], 10))
+                else:
+                    d_m, used_dilated = _trunk_depth_m(depth, det.mask)
+            else:
+                d_m, used_dilated = _trunk_depth_m(depth, det.mask)
             used_nominal = False
             if used_dilated:
                 n_used_dilated += 1
@@ -1580,7 +1592,13 @@ def _estimate_dbscan_eps(
     """
     from sklearn.neighbors import NearestNeighbors
 
-    k = min(min_samples, len(xy) - 1)
+    if len(xy) < 2:
+        log.warning(
+            "Auto-eps: only %d valid detections — using fallback %.2f m",
+            len(xy), max_eps_m,
+        )
+        return max_eps_m
+    k = max(1, min(min_samples, len(xy) - 1))
     nbrs = NearestNeighbors(n_neighbors=k).fit(xy)
     distances, _ = nbrs.kneighbors(xy)
     k_dist = np.sort(distances[:, -1])
