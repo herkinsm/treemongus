@@ -3344,13 +3344,6 @@ def _main() -> None:
                              "effective range). Lower to e.g. 5 if the "
                              "camera is foreground-aimed; raise if it looks "
                              "sideways across the aisle.")
-    parser.add_argument("--canopy-half-band-m", type=float, default=0.7,
-                        help="Half-width of the canopy-depth band centred "
-                             "on --nominal-tree-distance-m (default 0.7 m). "
-                             "Pixels outside [nom-half, nom+half] are "
-                             "excluded from the canopy mask -- filters out "
-                             "ground (close), background trees / cars "
-                             "(far). Widen for varying tree distances.")
     parser.add_argument("--nominal-tree-distance-m", type=float,
                         default=1.5,
                         help="Fallback perpendicular distance from camera "
@@ -3410,7 +3403,6 @@ def _main() -> None:
         trunk_max_depth_m=args.trunk_max_depth_m,
         trunk_min_roi_overlap=args.trunk_min_roi_overlap,
         nominal_tree_distance_m=args.nominal_tree_distance_m,
-        canopy_half_band_m=args.canopy_half_band_m,
     )
 
     sessions = _walk_all2023_sessions(Path(args.root))
