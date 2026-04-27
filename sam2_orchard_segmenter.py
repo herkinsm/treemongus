@@ -1221,14 +1221,15 @@ def _propagate_image_mode(
                 # We then split the canopy across the frame's trunks
                 # via nearest-trunk assignment so touching trees
                 # stay separated.
-                # Pre-load depth + per-frame canopy mask once.
-                # The canopy is the union of:
-                #   1. build_wide_tree_mask (depth + sky/ground filters)
-                #   2. SAM 3 leaf detection at canopy depth
-                # SAM 3 catches leaves where RealSense returns no
-                # depth (thin foliage against sky, edge dropouts);
-                # depth catches branches/trunk SAM 3 doesn't tag as
-                # leaves. Together they cover the whole canopy.
+                # Per-frame canopy from SAM 3 instance segmentation.
+                # SAM 3 with text prompts identifies tree pixels
+                # VISUALLY -- it knows what an apple tree looks like
+                # and doesn't tag grass / ground / barns. Depth then
+                # validates: a SAM 3 'tree' instance is real only if
+                # most of its pixels sit in the canopy depth band
+                # (rejects distant background trees). For pixels
+                # where depth is invalid (RealSense fails on thin
+                # leaves), trust SAM 3's visual evidence.
                 depth_mm: Optional[np.ndarray] = None
                 wide_canopy: Optional[np.ndarray] = None
                 target_depth_band: Optional[Tuple[int, int]] = None
@@ -1240,95 +1241,90 @@ def _propagate_image_mode(
                             (depth_m * 1000.0).astype(np.uint16),
                             np.zeros_like(depth_m, dtype=np.uint16),
                         )
-                        # Step 1: depth-based wide mask.
-                        try:
-                            from tree_mask import (
-                                build_wide_tree_mask,
-                                CANOPY_DEPTH_MIN_MM as _CMM,
-                                CANOPY_DEPTH_MAX_MM as _CXMM,
-                            )
-                            wide_u8 = build_wide_tree_mask(
-                                depth_mm, rgb,
-                            )
-                            wide_canopy = (wide_u8 > 0)
-                        except Exception as exc:
-                            log.warning(
-                                "build_wide_tree_mask failed frame %d: %s",
-                                frame_idx, exc,
-                            )
-                            wide_canopy = None
 
-                        # Step 2: SAM 3 "leaves" augmentation.
-                        # Run SAM 3 with text prompt "leaves" once
-                        # per frame (we already have set_image done
-                        # below for trunk box prompts; do it here
-                        # before the trunk loop to get leaf masks).
-                        # Pixels SAM 3 calls "leaves" at canopy depth
-                        # are added to the canopy mask -- catches
-                        # what depth missed.
-                        try:
-                            import torch as _torch
-                            from PIL import Image as _PILImage
-                            ac_dtype = (
-                                _torch.bfloat16
-                                if device.startswith("cuda")
-                                else _torch.float32
+                    try:
+                        from tree_mask import (
+                            CANOPY_DEPTH_MIN_MM as _CMM,
+                            CANOPY_DEPTH_MAX_MM as _CXMM,
+                        )
+                    except ImportError:
+                        _CMM, _CXMM = 600, 3000
+
+                    # SAM 3 with multiple tree-related text prompts.
+                    # Union all instances. Each prompt covers a
+                    # different visual aspect of the tree.
+                    try:
+                        import torch as _torch
+                        from PIL import Image as _PILImage
+                        ac_dtype = (
+                            _torch.bfloat16
+                            if device.startswith("cuda")
+                            else _torch.float32
+                        )
+                        prompts = (
+                            "apple tree", "tree", "leaves", "tree branch",
+                        )
+                        canopy_union = np.zeros((h, w), dtype=bool)
+                        with _torch.autocast(
+                            "cuda" if device.startswith("cuda")
+                            else "cpu",
+                            dtype=ac_dtype,
+                        ):
+                            tree_state = sam3_processor.set_image(
+                                _PILImage.fromarray(rgb),
                             )
-                            with _torch.autocast(
-                                "cuda" if device.startswith("cuda")
-                                else "cpu",
-                                dtype=ac_dtype,
-                            ):
-                                lf_state = sam3_processor.set_image(
-                                    _PILImage.fromarray(rgb),
-                                )
-                                sam3_processor.reset_all_prompts(lf_state)
-                                lf_state = sam3_processor.set_text_prompt(
-                                    prompt="leaves", state=lf_state,
-                                )
-                                lf_masks = lf_state.get("masks")
-                            if lf_masks is not None and len(lf_masks) > 0:
-                                arr = lf_masks.detach().cpu()
+                            for tp in prompts:
+                                sam3_processor.reset_all_prompts(tree_state)
+                                try:
+                                    tree_state = (
+                                        sam3_processor.set_text_prompt(
+                                            prompt=tp, state=tree_state,
+                                        )
+                                    )
+                                except Exception:
+                                    continue
+                                ms = tree_state.get("masks")
+                                if ms is None or len(ms) == 0:
+                                    continue
+                                arr = ms.detach().cpu()
                                 if arr.dtype != _torch.bool:
                                     arr = arr.to(_torch.bool)
                                 arr = arr.numpy()
                                 if arr.ndim == 4:
                                     arr = arr.squeeze(1)
-                                # Union all leaf instance masks.
-                                leaves_union = np.zeros(
-                                    (h, w), dtype=bool,
-                                )
                                 for i in range(arr.shape[0]):
-                                    leaves_union |= arr[i].astype(bool)
-                                # Restrict to canopy depth band so
-                                # SAM 3 doesn't pull in distant
-                                # background leaves at 5 m+.
-                                in_canopy_depth = (
-                                    (depth_mm >= _CMM)
-                                    & (depth_mm <= _CXMM)
-                                )
-                                # Pixels with no valid depth on a
-                                # leaf -- include them too if they're
-                                # in the upper half of the frame
-                                # (RealSense often fails on thin
-                                # leaves; not having depth doesn't
-                                # mean they're not real leaves).
-                                no_depth_upper = (
-                                    (depth_mm == 0)
-                                    & (np.arange(h)[:, None] < 380)
-                                )
-                                leaves_keep = leaves_union & (
-                                    in_canopy_depth | no_depth_upper
-                                )
-                                if wide_canopy is None:
-                                    wide_canopy = leaves_keep
-                                else:
-                                    wide_canopy = wide_canopy | leaves_keep
-                        except Exception as exc:
-                            log.debug(
-                                "SAM 3 leaf augmentation failed frame "
-                                "%d: %s", frame_idx, exc,
+                                    canopy_union |= arr[i].astype(bool)
+
+                        # Depth validation. Keep only:
+                        #   - pixels at canopy depth, OR
+                        #   - pixels with no valid depth in upper
+                        #     half (SAM 3 saw a leaf, RealSense
+                        #     failed; trust SAM 3)
+                        if depth_mm is not None and canopy_union.any():
+                            in_band = (
+                                (depth_mm >= _CMM)
+                                & (depth_mm <= _CXMM)
                             )
+                            no_depth_upper = (
+                                (depth_mm == 0)
+                                & (np.arange(h)[:, None] < 380)
+                            )
+                            wide_canopy = canopy_union & (
+                                in_band | no_depth_upper
+                            )
+                            # Hard bottom cutoff at row 420 -- bottom
+                            # of frame is always ground territory.
+                            wide_canopy[420:, :] = False
+                            if not wide_canopy.any():
+                                wide_canopy = None
+                        else:
+                            wide_canopy = None
+                    except Exception as exc:
+                        log.warning(
+                            "SAM 3 tree segmentation failed frame "
+                            "%d: %s", frame_idx, exc,
+                        )
+                        wide_canopy = None
                 except Exception as exc:
                     log.warning(
                         "Depth load failed on frame %d: %s",
