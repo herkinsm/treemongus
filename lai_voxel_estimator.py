@@ -869,17 +869,60 @@ def aggregate_tree_pointcloud(
     # Prefer projecting the whole canopy silhouette per frame --
     # SAM 3 with text "leaf" returns coarse all-leaves masks rather
     # than per-leaf instances, so the leaf-class sub-mask path
-    # produces 0 points on sparse-canopy data. The silhouette is
-    # depth-validated by build_tree_mask, so every silhouette pixel
-    # with valid depth is real canopy and contributes a real point.
+    # produces 0 points on sparse-canopy data.
+    #
+    # If the segmenter already populated det.tree_mask, use it. If
+    # not, compute a per-detection canopy mask here using
+    # build_tree_mask + horizontal-column restriction around the
+    # trunk centroid -- guarantees a real canopy mask reaches
+    # backproject_to_world even when the segmenter's tree-mask
+    # association failed for this detection.
+    try:
+        from tree_mask import build_tree_mask as _build_tree_mask
+    except ImportError:
+        _build_tree_mask = None
     silhouette_subs: List[SubMask] = []
+    canopy_column_half_px = 60                   # ±60 px around trunk centre
     for track in cluster.tracks:
         for det in track.detections:
             if det.frame_idx not in cluster.frame_pixels:
                 continue
             sil = (det.tree_mask
                    if (det.tree_mask is not None and det.tree_mask.any())
-                   else det.mask)
+                   else None)
+            if sil is None and _build_tree_mask is not None:
+                # Build canopy on demand from depth + RGB.
+                try:
+                    depth = loader.load_depth_m(det.frame_idx)
+                    rgb = loader.load_rgb(det.frame_idx)
+                    if (depth is not None and rgb is not None
+                            and np.isfinite(depth).any()):
+                        depth_mm = np.where(
+                            np.isfinite(depth) & (depth > 0),
+                            (depth * 1000.0).astype(np.uint16),
+                            np.zeros_like(depth, dtype=np.uint16),
+                        )
+                        canopy_u8 = _build_tree_mask(depth_mm, rgb=rgb)
+                        canopy = (canopy_u8 > 0)
+                        if canopy.any():
+                            # Restrict to a column band centred on the
+                            # trunk so adjacent trees don't pollute
+                            # this cluster's canopy point cloud.
+                            x1, _, x2, _ = det.bbox_xyxy
+                            cx = int(round((x1 + x2) * 0.5))
+                            x_lo = max(0, cx - canopy_column_half_px)
+                            x_hi = min(canopy.shape[1],
+                                       cx + canopy_column_half_px)
+                            band = np.zeros_like(canopy)
+                            band[:, x_lo:x_hi] = True
+                            sil = canopy & band
+                            if not sil.any():
+                                sil = None
+                except Exception as exc:
+                    log.debug("Canopy compute failed for tree %d frame %d: %s",
+                              cluster.tree_id, det.frame_idx, exc)
+            if sil is None and det.mask is not None and det.mask.any():
+                sil = det.mask    # last resort
             if sil is None or not sil.any():
                 continue
             silhouette_subs.append(SubMask(
