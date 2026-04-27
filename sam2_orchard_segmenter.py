@@ -1404,10 +1404,11 @@ def _propagate_image_mode(
 
     log.info("%s: %d single-frame tracks built", desc_map[backend], len(tracks))
     if backend == "sam3":
+        total = n_tree_mask_ok + n_tree_mask_fail
         log.info(
-            "Whole-tree mask (sprayer-pipeline canopy + nearest-trunk split): "
-            "%d ok, %d failed/discarded",
-            n_tree_mask_ok, n_tree_mask_fail,
+            "===== TREE MASK STATUS: %d/%d detections got a canopy "
+            "tree_mask (%d failed/discarded) =====",
+            n_tree_mask_ok, total, n_tree_mask_fail,
         )
     return tracks
 

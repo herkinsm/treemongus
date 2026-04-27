@@ -877,19 +877,27 @@ def aggregate_tree_pointcloud(
     # trunk centroid -- guarantees a real canopy mask reaches
     # backproject_to_world even when the segmenter's tree-mask
     # association failed for this detection.
+    _build_tree_mask = None
     try:
         from tree_mask import build_tree_mask as _build_tree_mask
-    except ImportError:
-        _build_tree_mask = None
+    except ImportError as exc:
+        log.warning(
+            "tree_mask import failed for tree %d (%s); on-demand canopy "
+            "fallback disabled", cluster.tree_id, exc,
+        )
+
+    n_used_existing = n_used_built = n_used_trunk = n_skipped = 0
     silhouette_subs: List[SubMask] = []
-    canopy_column_half_px = 60                   # ±60 px around trunk centre
+    canopy_column_half_px = 60
     for track in cluster.tracks:
         for det in track.detections:
             if det.frame_idx not in cluster.frame_pixels:
                 continue
-            sil = (det.tree_mask
-                   if (det.tree_mask is not None and det.tree_mask.any())
-                   else None)
+            if det.tree_mask is not None and det.tree_mask.any():
+                sil = det.tree_mask
+                n_used_existing += 1
+            else:
+                sil = None
             if sil is None and _build_tree_mask is not None:
                 # Build canopy on demand from depth + RGB.
                 try:
@@ -916,14 +924,18 @@ def aggregate_tree_pointcloud(
                             band = np.zeros_like(canopy)
                             band[:, x_lo:x_hi] = True
                             sil = canopy & band
-                            if not sil.any():
+                            if sil.any():
+                                n_used_built += 1
+                            else:
                                 sil = None
                 except Exception as exc:
                     log.debug("Canopy compute failed for tree %d frame %d: %s",
                               cluster.tree_id, det.frame_idx, exc)
             if sil is None and det.mask is not None and det.mask.any():
-                sil = det.mask    # last resort
+                sil = det.mask
+                n_used_trunk += 1
             if sil is None or not sil.any():
+                n_skipped += 1
                 continue
             silhouette_subs.append(SubMask(
                 frame_idx=det.frame_idx,
@@ -934,6 +946,12 @@ def aggregate_tree_pointcloud(
                 confidence=1.0,
             ))
 
+    log.info(
+        "Tree %d aggregator: silhouettes built — existing=%d, "
+        "computed=%d, trunk-fallback=%d, skipped=%d",
+        cluster.tree_id, n_used_existing, n_used_built,
+        n_used_trunk, n_skipped,
+    )
     if silhouette_subs:
         pts4 = backproject_to_world(
             silhouette_subs, loader, cfg,
@@ -941,6 +959,10 @@ def aggregate_tree_pointcloud(
             lat0=cluster.world_lat,
             lon0=cluster.world_lon,
             icp_corrections=icp_corrections,
+        )
+        log.info(
+            "Tree %d aggregator: %d silhouette sub-masks -> %d 3D points",
+            cluster.tree_id, len(silhouette_subs), pts4.shape[0],
         )
         if pts4.size > 0:
             return pts4[:, :3].astype(np.float32)
