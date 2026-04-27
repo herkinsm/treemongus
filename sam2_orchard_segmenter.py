@@ -520,6 +520,32 @@ class All2023FrameLoader(FrameLoader):
             raise FileNotFoundError(f"Missing RGB: {path}")
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
+    def load_ir(self, frame_idx: int) -> Optional[np.ndarray]:
+        """Load IR image (uint8) for this frame, resized to RGB shape.
+
+        Returns None when the IR file is absent. NDVI uses this for
+        canopy validation: real leaves reflect NIR strongly
+        (NDVI > 0.3), ground/metal/grass sit near 0.
+        """
+        import cv2
+        base = self._base_stem(self._imgs[frame_idx])
+        ir_path = self._session_dir / "IR" / f"{base}-IR.bmp"
+        if not ir_path.is_file():
+            return None
+        img = cv2.imread(str(ir_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        if img.ndim == 3:
+            img = img[..., 0]
+        h, w = self.load_rgb(frame_idx).shape[:2]
+        if img.shape != (h, w):
+            from PIL import Image as _PILImage
+            pim = _PILImage.fromarray(
+                img.astype(np.float32), mode="F",
+            ).resize((w, h), _PILImage.BILINEAR)
+            img = np.asarray(pim, dtype=np.float32)
+        return img.astype(np.float32)
+
     def load_depth_m(self, frame_idx: int) -> np.ndarray:
         import cv2
         base = self._base_stem(self._imgs[frame_idx])
@@ -3213,6 +3239,31 @@ def compute_per_frame_lai(
             canopy = canopy_union
         # Hard cutoff at row 400 -- mirrors main.py's MAX_GROUND_ROW.
         canopy[400:, :] = False
+
+        # ── NDVI canopy gate (sprayer_pipeline NDVI_FRAME_GATE) ──
+        # Real leaves reflect NIR strongly (NDVI > 0.2-0.3); ground /
+        # metal / grass / fence wire sit near 0. Per-pixel: drop
+        # canopy with NDVI < 0.15. This catches the ground leaks
+        # build_tree_mask + per-CC plane filters miss because:
+        #   - Grass at canopy depth: low NDVI -> dropped
+        #   - Background trees: high NDVI but already dropped by
+        #     ROI-column anchor -> not affected here
+        #   - Sky returning depth=0: not in canopy -> not affected
+        try:
+            ir = loader.load_ir(frame_idx)
+            if ir is not None and canopy.any():
+                red_f = rgb[..., 0].astype(np.float32)
+                nir_f = ir.astype(np.float32)
+                if nir_f.max() > 255.0:
+                    nir_f = nir_f / max(1.0, nir_f.max()) * 255.0
+                denom = nir_f + red_f
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    ndvi = np.where(
+                        denom > 1.0, (nir_f - red_f) / denom, 0.0,
+                    )
+                canopy = canopy & (ndvi >= 0.15)
+        except Exception as exc:
+            log.debug("NDVI gate failed frame %d: %s", frame_idx, exc)
 
         # Per-CC plane / ground rejection -- ports the
         # extract_zone gates (roi.py:425-463). build_tree_mask's
