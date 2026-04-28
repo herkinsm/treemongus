@@ -1740,6 +1740,56 @@ def main():
                     kept_areas: list[int] = []
                     if is_flower_prompt and n > 0:
                         rgb_arr = np.asarray(img)
+                        # Refine masks to only contain real blossom-
+                        # color pixels. SAM 3 sometimes returns a
+                        # mask that wraps the flower AND surrounding
+                        # leaves/branches; intersecting with the
+                        # white-or-pink HSV mask drops the non-
+                        # blossom area so per-mask area, area-based
+                        # filters, and the saved overlay reflect just
+                        # the actual flower. The COUNT (one mask per
+                        # SAM detection) is preserved.
+                        if args.flower_require_blossom_color:
+                            try:
+                                import cv2 as _cv2
+                                hsv_full = _cv2.cvtColor(
+                                    rgb_arr, _cv2.COLOR_RGB2HSV,
+                                )
+                                Hc = hsv_full[..., 0]
+                                Sc = hsv_full[..., 1]
+                                Vc = hsv_full[..., 2]
+                                # HSV thresholds match
+                                # flower_quality_keep defaults.
+                                white_mask = (
+                                    (Sc <= 50)
+                                    & (Vc >= 150)
+                                )
+                                pink_mask = (
+                                    (((Hc >= 0) & (Hc <= 30))
+                                     | ((Hc >= 150) & (Hc <= 179)))
+                                    & ((Sc >= 10) & (Sc <= 100))
+                                    & (Vc >= 100)
+                                )
+                                blossom_pix = white_mask | pink_mask
+                                # Refine each mask: keep only the
+                                # intersection with blossom_pix.
+                                # If the intersection is empty, keep
+                                # the original mask (filter chain
+                                # below will reject it via the
+                                # min_area / blossom_color_frac gate).
+                                refined = []
+                                for mi in range(masks_np.shape[0]):
+                                    m_orig = masks_np[mi].astype(bool)
+                                    m_ref = m_orig & blossom_pix
+                                    if int(m_ref.sum()) >= int(
+                                            args.flower_min_area_px
+                                    ):
+                                        refined.append(m_ref)
+                                    else:
+                                        refined.append(m_orig)
+                                masks_np = np.stack(refined, axis=0)
+                            except Exception:
+                                pass
                         keep, diag, areas_in = flower_quality_keep(
                             masks_np,
                             args.flower_min_area_px, args.flower_max_area_px,
