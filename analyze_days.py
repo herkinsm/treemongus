@@ -1132,6 +1132,26 @@ def main():
     ap.add_argument("--flower-local-depth-window-px", type=int, default=30,
                     help="Half-width in pixels of the depth-std window around "
                          "the mask centroid (default 30, so a 61x61 px window).")
+    ap.add_argument("--flower-min-valid-depth-frac", type=float, default=0.50,
+                    help="Fraction of refined flower-mask pixels that must "
+                         "have valid canopy depth in [min_depth_mm, "
+                         "max_depth_mm]. Sky / clouds match white-blossom HSV "
+                         "exactly (low S, high V) so HSV alone can't tell them "
+                         "apart from petals; a real flower sits on the canopy "
+                         "(returns valid 1-3 m depth) while sky returns 0 / "
+                         "noise. Default 0.50 = at least half the refined "
+                         "petal pixels must lie on real canopy depth. "
+                         "Set 0 to disable. Requires --depth.")
+    ap.add_argument("--flower-depth-min-mm", type=float, default=500.0,
+                    help="Lower bound (mm) for the depth-validity gate "
+                         "(default 500 = 0.5 m). Pixels below this are "
+                         "treated as invalid (sky / no-return / sensor "
+                         "noise).")
+    ap.add_argument("--flower-depth-max-mm", type=float, default=5000.0,
+                    help="Upper bound (mm) for the depth-validity gate "
+                         "(default 5000 = 5 m). Pixels above are treated as "
+                         "background (distant trees, buildings, sky max-range "
+                         "value).")
     # Per-tree ROI restriction via PRGB images (red bounding boxes).
     ap.add_argument("--prgb", action="store_true",
                     help="Restrict detections to within the per-tree ROIs drawn as "
@@ -1975,6 +1995,60 @@ def main():
                                 if boxes_np is not None:
                                     boxes_np = boxes_np[keep_c]
                                 n = int(keep_c.sum())
+                        # Depth-validity gate. White / cloudy sky has the
+                        # SAME HSV signature as a white blossom (low S,
+                        # high V) -- pure pixel-color filtering can't
+                        # tell them apart. The unmistakable difference
+                        # is depth: a real petal sits on the canopy
+                        # (returns valid 1-3 m depth) while sky returns
+                        # 0 mm or noise outside the valid range. Reject
+                        # any refined mask whose petal pixels don't have
+                        # enough valid-depth content. Targets the
+                        # specific "branch silhouetted against bright
+                        # sky" failure: SAM 3 wraps the branch + the
+                        # adjacent bright sky into one mask, refinement
+                        # keeps just the sky portion (bright low-S
+                        # pixels), which then passes shape gates because
+                        # a sky patch IS blob-shaped.
+                        if (args.depth and depth_mm is not None
+                                and args.flower_min_valid_depth_frac > 0
+                                and n > 0):
+                            keep_d = np.ones(n, dtype=bool)
+                            d_lo = float(args.flower_depth_min_mm)
+                            d_hi = float(args.flower_depth_max_mm)
+                            valid_depth_pixels = (
+                                (depth_mm >= d_lo) & (depth_mm <= d_hi)
+                            )
+                            for di in range(n):
+                                mb = masks_np[di].astype(bool)
+                                if mb.ndim == 3:
+                                    mb = mb.any(axis=0)
+                                total_d = int(mb.sum())
+                                if total_d == 0:
+                                    keep_d[di] = False
+                                    continue
+                                valid_in_mask = int(
+                                    (mb & valid_depth_pixels).sum()
+                                )
+                                frac_valid = (
+                                    valid_in_mask / float(total_d)
+                                )
+                                if (frac_valid
+                                        < args.flower_min_valid_depth_frac):
+                                    keep_d[di] = False
+                            if not keep_d.all():
+                                rt_key = (day, category, session, prompt)
+                                rt = rejection_totals.setdefault(rt_key, {})
+                                rt["sky_depth"] = (
+                                    rt.get("sky_depth", 0)
+                                    + int((~keep_d).sum())
+                                )
+                                masks_np = masks_np[keep_d]
+                                if scores_np is not None:
+                                    scores_np = scores_np[keep_d]
+                                if boxes_np is not None:
+                                    boxes_np = boxes_np[keep_d]
+                                n = int(keep_d.sum())
                         keep, diag, areas_in = flower_quality_keep(
                             masks_np,
                             args.flower_min_area_px, args.flower_max_area_px,
