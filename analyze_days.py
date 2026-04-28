@@ -98,25 +98,39 @@ if not torch.cuda.is_available():
     #    `synchronize()` raise the same "No CUDA GPUs are available"
     #    error mid-inference. Stub them to harmless no-ops or sane
     #    fallback values.
-    def _noop(*args, **kwargs):
-        return None
+    #
+    #    IMPORTANT: each stub MUST be a distinct function object,
+    #    not the same `_noop` reused across attributes. torch._dynamo
+    #    iterates torch's namespace at import time and asserts when
+    #    the same function object is registered against multiple
+    #    torch attributes with different trace rules
+    #    (`AssertionError: Duplicate torch object ... with different
+    #    rules`). Building each stub via a factory closure guarantees
+    #    distinct objects.
+    def _make_noop():
+        def _stub_noop(*args, **kwargs):
+            return None
+        return _stub_noop
 
-    def _zero(*args, **kwargs):
-        return 0
+    def _make_zero():
+        def _stub_zero(*args, **kwargs):
+            return 0
+        return _stub_zero
 
-    for _cuda_fn, _stub in (
-        ("synchronize", _noop),
-        ("empty_cache", _noop),
-        ("set_device", _noop),
-        ("current_device", _zero),
-        ("device_count", _zero),
-        ("ipc_collect", _noop),
-        ("reset_peak_memory_stats", _noop),
-        ("reset_max_memory_allocated", _noop),
+    for _cuda_fn, _stub_factory in (
+        ("synchronize", _make_noop),
+        ("empty_cache", _make_noop),
+        ("set_device", _make_noop),
+        ("current_device", _make_zero),
+        ("device_count", _make_zero),
+        ("ipc_collect", _make_noop),
+        ("reset_peak_memory_stats", _make_noop),
+        ("reset_max_memory_allocated", _make_noop),
     ):
         if hasattr(torch.cuda, _cuda_fn):
             try:
-                setattr(torch.cuda, _cuda_fn, _stub)
+                # Fresh closure per attribute -> distinct function id.
+                setattr(torch.cuda, _cuda_fn, _stub_factory())
             except Exception:
                 pass
 
