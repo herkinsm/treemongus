@@ -1993,7 +1993,7 @@ def main():
                          "(default 5000 = 5 m). Pixels above are treated as "
                          "background (distant trees, buildings, sky max-range "
                          "value).")
-    ap.add_argument("--flower-refine-min-area-px", type=int, default=40,
+    ap.add_argument("--flower-refine-min-area-px", type=int, default=15,
                     help="After HSV-refining a SAM flower mask to its "
                          "blossom-color subset, drop the mask if the "
                          "refined area is below this many pixels. Was "
@@ -2001,6 +2001,13 @@ def main():
                          "blossoms at the cost of more glints. The soft-"
                          "score gate downstream is the primary glint "
                          "rejector; this just removes extreme-tiny noise.")
+    ap.add_argument("--flower-refine-max-aspect", type=float, default=3.5,
+                    help="Max long-axis / short-axis ratio of the refined "
+                         "petal mask. Was hardcoded at 2.5; raising lets "
+                         "tilted / partial-view blossoms pass. Branches "
+                         "produce 5:1+ refined ratios so this still "
+                         "rejects them. The soft-score shape component "
+                         "also penalizes elongation continuously.")
     # ---- Soft-score (continuous quality) flower gate. -----------------
     # Combines SAM 3 confidence, shape, color, contextual depth, and NDVI
     # into a single [0,1] score via weighted geometric mean. Replaces
@@ -2873,7 +2880,9 @@ def main():
                                 # rejecting branches / twigs (they
                                 # produce long thin bright
                                 # ridges along the bark).
-                                MAX_ASPECT_RATIO = 2.5
+                                MAX_ASPECT_RATIO = float(
+                                    args.flower_refine_max_aspect
+                                )
                                 # Per-mask rejection labels for the
                                 # refinement loop, indexed by current-
                                 # array position. Mapped back to
