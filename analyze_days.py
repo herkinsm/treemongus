@@ -11,6 +11,7 @@ Outputs:
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
@@ -903,6 +904,254 @@ _warned_bad_depth_bmps: set[str] = set()
 _logged_prgb_dims: set[str] = set()
 
 
+# ---------------------------------------------------------------------------
+# Per-mask rejection audit. Tracks WHICH original SAM detection got rejected
+# by WHICH filter, so we can (a) emit a per-mask JSONL diagnostic log and
+# (b) render a debug overlay that color-codes every detection by its outcome.
+# Replaces the lossy "masks_np = masks_np[keep]" pattern at every filter site
+# with a call that also records rejections by their pre-filter SAM indices.
+# ---------------------------------------------------------------------------
+class MaskAudit:
+    """Track per-mask rejection reasons through a chain of boolean keep
+    arrays. Initialized once per (frame, prompt) before any filtering.
+    Each .apply(keep, stage) call records, for every False entry in
+    `keep`, that the corresponding ORIGINAL SAM mask was rejected at
+    `stage` -- only the FIRST stage that rejects a mask is kept (later
+    filters never see already-rejected masks anyway).
+    """
+
+    def __init__(self, n_original: int):
+        # `surviving` maps current array indices -> original SAM indices.
+        # Starts as identity; every .apply(keep, ...) compresses it to
+        # the same length as the surviving masks.
+        self.n_original = int(n_original)
+        self.surviving = np.arange(int(n_original), dtype=np.int64)
+        self.rejected_by: dict[int, str] = {}
+        # Optional per-mask metadata captured at specific stages
+        # (refined area, soft score, etc.), keyed by original index.
+        self.meta: dict[int, dict] = {}
+
+    def apply(self, keep: np.ndarray, stage: str) -> None:
+        """Record rejections for the False entries in `keep` and shrink
+        the surviving-index map to match. Idempotent if keep.all().
+        """
+        if keep is None or len(keep) == 0:
+            return
+        if not isinstance(keep, np.ndarray):
+            keep = np.asarray(keep, dtype=bool)
+        if keep.dtype != bool:
+            keep = keep.astype(bool)
+        if len(keep) != len(self.surviving):
+            # Defensive: if a caller passed the wrong-length keep array,
+            # don't corrupt the audit. Skip and warn once.
+            print(
+                f"[warn] MaskAudit.apply size mismatch: keep={len(keep)} "
+                f"surviving={len(self.surviving)} stage={stage!r}",
+                file=sys.stderr,
+            )
+            return
+        if not keep.all():
+            for i in np.where(~keep)[0]:
+                orig_i = int(self.surviving[int(i)])
+                if orig_i not in self.rejected_by:
+                    self.rejected_by[orig_i] = stage
+        self.surviving = self.surviving[keep]
+
+    def force_drop_remaining(self, stage: str) -> None:
+        """Mark every currently-surviving mask as rejected at this
+        stage. Used when a code path empties masks_np unconditionally
+        (e.g. the 'all SAM masks lacked enough blossom-color content'
+        branch in flower refinement)."""
+        for orig_i in self.surviving:
+            i = int(orig_i)
+            if i not in self.rejected_by:
+                self.rejected_by[i] = stage
+        self.surviving = np.array([], dtype=np.int64)
+
+    def remap_after_split(self, parent_idx_per_new: list[int]) -> None:
+        """Cluster splitting (e.g. watershed) replaces N parent masks
+        with M children where each child's parent is in
+        `parent_idx_per_new` (length M). The audit's `surviving` array
+        currently has the parents; this method rewrites it to the
+        children, mapping each child to its parent's original SAM idx.
+        After this call, downstream .apply() calls operate on children.
+        """
+        if len(self.surviving) == 0:
+            return
+        new_surviving = np.array(
+            [int(self.surviving[int(p)]) for p in parent_idx_per_new],
+            dtype=np.int64,
+        )
+        self.surviving = new_surviving
+
+    def set_meta(self, current_idx: int, **kw) -> None:
+        """Attach metadata to the original mask at `current_idx` in the
+        currently-surviving array (e.g., refined_area, soft_score)."""
+        if 0 <= current_idx < len(self.surviving):
+            orig_i = int(self.surviving[int(current_idx)])
+            self.meta.setdefault(orig_i, {}).update(kw)
+
+    def kept_originals(self) -> list[int]:
+        return [int(i) for i in self.surviving]
+
+
+def assign_centroids_to_zones(
+    masks_np: np.ndarray, roi_mask_img: np.ndarray | None,
+    n_cols: int = 2, n_rows: int = 5,
+) -> tuple[list[tuple[int, int] | None], tuple[int, int, int, int] | None]:
+    """For each mask, return the (col, row) zone its centroid lands in,
+    or None if the mask is empty / outside the ROI bounding box.
+
+    Zones tile the PRGB ROI's bounding box as `n_cols` x `n_rows`
+    cells (default 2 columns wide, 5 rows tall -- matches the spray
+    pipeline's per-tree treatment grid). Returns the per-mask zone
+    list AND the (rx0, ry0, roi_w, roi_h) bbox used so the CSV writer
+    can flag images where the ROI was missing entirely.
+    """
+    if roi_mask_img is None or not roi_mask_img.any():
+        return [None] * len(masks_np), None
+    roi_ys, roi_xs = np.where(roi_mask_img)
+    rx0 = int(roi_xs.min())
+    rx1 = int(roi_xs.max())
+    ry0 = int(roi_ys.min())
+    ry1 = int(roi_ys.max())
+    roi_w = rx1 - rx0 + 1
+    roi_h = ry1 - ry0 + 1
+    if roi_w < n_cols or roi_h < n_rows:
+        return [None] * len(masks_np), (rx0, ry0, roi_w, roi_h)
+    cell_w = roi_w / float(n_cols)
+    cell_h = roi_h / float(n_rows)
+    zones: list[tuple[int, int] | None] = []
+    for m in masks_np:
+        mb = m.astype(bool)
+        if mb.ndim == 3:
+            mb = mb.any(axis=0)
+        if not mb.any():
+            zones.append(None)
+            continue
+        ys, xs = np.where(mb)
+        cx = float(xs.mean())
+        cy = float(ys.mean())
+        # Clip to ROI box; centroid outside ROI -> no zone (the prgb
+        # centroid gate should already have rejected these, but stay
+        # defensive).
+        if cx < rx0 or cx > rx1 or cy < ry0 or cy > ry1:
+            zones.append(None)
+            continue
+        col = int((cx - rx0) // cell_w)
+        row = int((cy - ry0) // cell_h)
+        col = max(0, min(n_cols - 1, col))
+        row = max(0, min(n_rows - 1, row))
+        zones.append((col, row))
+    return zones, (rx0, ry0, roi_w, roi_h)
+
+
+def zone_count_csv_keys(n_cols: int = 2, n_rows: int = 5) -> list[str]:
+    """CSV column names for per-zone flower counts. Order:
+    flowers_c0_r0, flowers_c0_r1, ..., flowers_c1_r4.
+    Stable so downstream readers can rely on it."""
+    keys: list[str] = []
+    for c in range(n_cols):
+        for r in range(n_rows):
+            keys.append(f"flowers_c{c}_r{r}")
+    return keys
+
+
+def _render_debug_overlay(
+    img: "Image.Image", orig_masks: np.ndarray,
+    rejected_by: dict[int, str], kept_set: set[int],
+    out_path: Path, title: str,
+    roi_mask: np.ndarray | None = None,
+) -> None:
+    """Save a debug JPG of every PRE-filter SAM mask, color-coded by
+    outcome.
+
+    - kept (in `kept_set`): pink translucent fill, green outline.
+    - rejected: red outline only, with the rejection-stage text label
+      drawn just above the mask centroid.
+
+    The masks are drawn over the original RGB image. Saves as JPEG at
+    quality 85. No matplotlib title (we render the title as overlaid
+    text so the saved image is the actual size of the source).
+    """
+    import cv2 as _cv2_dbg
+    base = np.asarray(img.convert("RGB")).copy()
+    h, w = base.shape[:2]
+    overlay_img = base.copy()
+    # Tint the ROI faintly so the user can see context.
+    if roi_mask is not None and roi_mask.shape[:2] == (h, w):
+        tint = overlay_img.copy()
+        tint[roi_mask] = (
+            tint[roi_mask] * 0.85 + np.array([255, 255, 0]) * 0.15
+        ).astype(np.uint8)
+        overlay_img = tint
+    # Pink fill for kept masks (alpha-blended).
+    for orig_i in kept_set:
+        if orig_i >= len(orig_masks):
+            continue
+        m = orig_masks[int(orig_i)].astype(bool)
+        if m.ndim == 3:
+            m = m.any(axis=0)
+        if not m.any():
+            continue
+        # Pink fill at 35% alpha.
+        fill = overlay_img.copy()
+        fill[m] = (
+            fill[m] * 0.65
+            + np.array([255, 105, 180]) * 0.35
+        ).astype(np.uint8)
+        overlay_img = fill
+        # Green outline.
+        contours, _ = _cv2_dbg.findContours(
+            m.astype(np.uint8),
+            _cv2_dbg.RETR_EXTERNAL,
+            _cv2_dbg.CHAIN_APPROX_SIMPLE,
+        )
+        _cv2_dbg.drawContours(overlay_img, contours, -1, (0, 200, 0), 1)
+    # Red outline + label for rejected masks.
+    for orig_i, reason in rejected_by.items():
+        if orig_i >= len(orig_masks):
+            continue
+        m = orig_masks[int(orig_i)].astype(bool)
+        if m.ndim == 3:
+            m = m.any(axis=0)
+        if not m.any():
+            continue
+        contours, _ = _cv2_dbg.findContours(
+            m.astype(np.uint8),
+            _cv2_dbg.RETR_EXTERNAL,
+            _cv2_dbg.CHAIN_APPROX_SIMPLE,
+        )
+        _cv2_dbg.drawContours(overlay_img, contours, -1, (220, 30, 30), 1)
+        ys_d, xs_d = np.where(m)
+        cx = int(xs_d.mean())
+        cy = int(ys_d.mean())
+        # Label slightly above the centroid; clip to frame.
+        label_y = max(12, cy - 6)
+        label_x = max(2, min(w - 80, cx - 40))
+        _cv2_dbg.putText(
+            overlay_img, reason, (label_x, label_y),
+            _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.35, (220, 30, 30), 1,
+            _cv2_dbg.LINE_AA,
+        )
+    # Title bar at the top.
+    bar_h = 20
+    titled = np.zeros((h + bar_h, w, 3), dtype=np.uint8)
+    titled[bar_h:] = overlay_img
+    titled[:bar_h] = (30, 30, 30)
+    _cv2_dbg.putText(
+        titled, title[:90], (4, bar_h - 6),
+        _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 240), 1,
+        _cv2_dbg.LINE_AA,
+    )
+    # cv2 expects BGR.
+    bgr = _cv2_dbg.cvtColor(titled, _cv2_dbg.COLOR_RGB2BGR)
+    _cv2_dbg.imwrite(
+        str(out_path), bgr,
+        [int(_cv2_dbg.IMWRITE_JPEG_QUALITY), 85],
+    )
+
+
 def load_depth_mm(depth_path: Path, target_hw: tuple[int, int]) -> np.ndarray | None:
     """Load a depth file and return uint16 mm upsampled to target (H, W).
     Supported:
@@ -1613,6 +1862,23 @@ def main():
     ap.add_argument("--flower-soft-w-color", type=float, default=1.5)
     ap.add_argument("--flower-soft-w-depth", type=float, default=1.5)
     ap.add_argument("--flower-soft-w-ndvi", type=float, default=1.0)
+    # ---- Debug instrumentation. Both default off so production runs
+    # don't accumulate large debug artifacts. -----------------------
+    ap.add_argument("--debug-rejection-log", action="store_true",
+                    help="Write one JSONL line per pre-filter SAM "
+                         "detection to <out>/rejections_per_mask.jsonl "
+                         "with score, bbox, area, kept-bool, and the "
+                         "name of the FIRST gate that rejected it. "
+                         "Lets you answer 'why did this specific flower "
+                         "get missed?' in seconds.")
+    ap.add_argument("--debug-overlay", action="store_true",
+                    help="Save a second '<image>_<prompt>_debug.jpg' "
+                         "per frame showing ALL pre-filter SAM "
+                         "detections, color-coded by outcome: "
+                         "kept = pink fill, rejected = red outline "
+                         "with the rejection-stage label. Use to "
+                         "visually identify what nearly survived but "
+                         "got dropped, vs what passed.")
     # Per-tree ROI restriction via PRGB images (red bounding boxes).
     ap.add_argument("--prgb", action="store_true",
                     help="Restrict detections to within the per-tree ROIs drawn as "
@@ -1856,14 +2122,30 @@ def main():
     # quality filter). n_raw is always SAM 3's raw count.
     # est_flowers is the density-based individual blossom estimate
     # (sum over kept detections of max(1, round(area / area_per_flower))).
+    # Per-zone flower count columns: 10 zones in a 2-col x 5-row grid
+    # over the PRGB ROI bbox (matches the spray pipeline's per-tree
+    # treatment cells). Empty for non-flower prompts. Stable order so
+    # downstream readers can index by name.
+    zone_cols = zone_count_csv_keys(n_cols=2, n_rows=5)
     fieldnames = ["day", "category", "session", "image", "prompt",
                   "n_detections", "n_raw", "est_flowers",
                   "mean_score", "max_score", "elapsed_s",
                   "near_frac_mean", "near_frac_max",
                   "canopy_overlap_mean", "roi_overlap_mean", "track_ids"]
+    fieldnames.extend(zone_cols)
     f = open(csv_path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(f, fieldnames=fieldnames)
     writer.writeheader()
+
+    # Optional per-mask rejection log. One JSONL line per pre-filter SAM
+    # detection across all (frame, prompt) pairs. Lets you grep for a
+    # specific frame and see exactly which gate dropped each mask --
+    # the answer to "why did THAT flower get missed?" is a one-liner.
+    rejection_log_path = out_dir / "rejections_per_mask.jsonl"
+    rejection_log_f = (
+        open(rejection_log_path, "w", encoding="utf-8")
+        if args.debug_rejection_log else None
+    )
 
     # Accumulator for the per-image wide-format CSV: image_path -> {
     #   "day": str, "category": str, "session": str,
@@ -2105,6 +2387,28 @@ def main():
                     mean_s = float(np.mean(scores_np)) if scores_np is not None and len(scores_np) else 0.0
                     max_s = float(np.max(scores_np)) if scores_np is not None and len(scores_np) else 0.0
 
+                    # Per-(frame, prompt) rejection audit. Tracks which
+                    # ORIGINAL SAM detection got rejected by which filter
+                    # so we can emit the per-mask JSONL log, render the
+                    # debug overlay, and answer "why was this specific
+                    # flower missed?" without reverse-engineering the
+                    # filter chain.
+                    audit = MaskAudit(n_raw)
+                    # Snapshot the pre-filter masks / scores / boxes so
+                    # the debug overlay can render every detection,
+                    # not just the survivors. These are references, not
+                    # copies -- masks_np itself gets reassigned by the
+                    # filters, but the original ndarray remains alive.
+                    orig_masks = masks_np
+                    orig_scores = scores_np
+                    orig_boxes = boxes_np
+                    # Pre-init for downstream blocks: the visualization
+                    # block defines roi_mask_for_overlay only when
+                    # save_this_overlay is True; the debug-overlay block
+                    # runs unconditionally and would NameError on
+                    # non-saved frames otherwise.
+                    roi_mask_for_overlay = None
+
                     # Depth-based near-field filter. When --depth is on, we
                     # actively drop detections whose mask doesn't sit inside
                     # the canopy band (background trees, far ground, etc.).
@@ -2116,6 +2420,7 @@ def main():
                         )
                         fracs_arr = np.asarray(fracs, dtype=float)
                         keep = ~np.isnan(fracs_arr) & (fracs_arr >= args.depth_near_frac)
+                        audit.apply(keep, "near_field")
                         if not keep.all():
                             masks_np = masks_np[keep]
                             if scores_np is not None:
@@ -2174,6 +2479,32 @@ def main():
                         rt = rejection_totals.setdefault(rt_key, {})
                         for k, v in diag_g.items():
                             rt[k] = rt.get(k, 0) + v
+                        # Map the multi-bucket diag back into the audit
+                        # by stage. Each entry in `keep` already reflects
+                        # the FIRST bucket that fired in the loop above
+                        # (the inner `continue` after setting keep[i] =
+                        # False), so re-record by rerunning the same
+                        # cheap geometry once -- only on rejected ones.
+                        if depth_mm is not None and not keep.all():
+                            for i in np.where(~keep)[0]:
+                                m = masks_np[int(i)]
+                                spread, corr, _ = mask_depth_geom(m, depth_mm)
+                                if (args.mask_min_depth_spread_mm > 0
+                                        and spread < args.mask_min_depth_spread_mm):
+                                    stage = "depth_spread"
+                                elif (args.mask_max_depth_row_corr < 1.0
+                                        and corr > args.mask_max_depth_row_corr):
+                                    stage = "depth_row_corr"
+                                else:
+                                    stage = "on_smooth_plane"
+                                orig_i = int(audit.surviving[int(i)])
+                                if orig_i not in audit.rejected_by:
+                                    audit.rejected_by[orig_i] = stage
+                            # Now compress audit.surviving in lockstep
+                            # with masks_np below.
+                            audit.surviving = audit.surviving[keep]
+                        else:
+                            audit.apply(keep, "depth_geom")
                         if not keep.all():
                             masks_np = masks_np[keep]
                             if scores_np is not None:
@@ -2196,6 +2527,7 @@ def main():
                         rt_key = (day, category, session, prompt)
                         rt = rejection_totals.setdefault(rt_key, {})
                         rt["prgb_roi"] = rt.get("prgb_roi", 0) + int((~keep).sum())
+                        audit.apply(keep, "prgb_roi")
                         if not keep.all():
                             masks_np = masks_np[keep]
                             if scores_np is not None:
@@ -2222,6 +2554,7 @@ def main():
                         rt_key = (day, category, session, prompt)
                         rt = rejection_totals.setdefault(rt_key, {})
                         rt["tree_mask"] = rt.get("tree_mask", 0) + int((~keep).sum())
+                        audit.apply(keep, "tree_mask")
                         if not keep.all():
                             masks_np = masks_np[keep]
                             if scores_np is not None:
@@ -2346,9 +2679,16 @@ def main():
                                 # produce long thin bright
                                 # ridges along the bark).
                                 MAX_ASPECT_RATIO = 2.5
+                                # Per-mask rejection labels for the
+                                # refinement loop, indexed by current-
+                                # array position. Mapped back to
+                                # original SAM idx via audit.surviving
+                                # below.
+                                refine_reject: dict[int, str] = {}
                                 for mi in range(masks_np.shape[0]):
                                     m_orig = masks_np[mi].astype(bool)
                                     if not m_orig.any():
+                                        refine_reject[mi] = "refine_empty"
                                         continue
                                     m_ref_raw = m_orig & blossom_pix
                                     refined_area = int(m_ref_raw.sum())
@@ -2357,6 +2697,7 @@ def main():
                                     # the 15-50 px range. Real
                                     # blossoms refine to 80-300+ px.
                                     if refined_area < 80:
+                                        refine_reject[mi] = "refine_min_area"
                                         continue
                                     # Aspect ratio on the refined
                                     # petal mass (was the original
@@ -2370,6 +2711,7 @@ def main():
                                     long_ = max(bw_r, bh_r)
                                     if (short > 0
                                             and (long_ / short) > MAX_ASPECT_RATIO):
+                                        refine_reject[mi] = "refine_aspect"
                                         continue
                                     m_ref = _cv2.dilate(
                                         m_ref_raw.astype(np.uint8),
@@ -2379,8 +2721,43 @@ def main():
                                     # mask so dilation can't claim
                                     # surrounding leaves.
                                     m_ref = m_ref & m_orig
+                                    # Record the refined area on the
+                                    # audit so the per-mask JSONL log
+                                    # can show it.
+                                    audit.set_meta(
+                                        mi, refined_area_px=int(m_ref.sum()),
+                                    )
                                     refined.append(m_ref)
                                     keep_idx.append(mi)
+                                # Apply the refinement decisions to
+                                # the audit BEFORE we mutate masks_np
+                                # / scores_np / boxes_np below: build a
+                                # boolean keep aligned with the
+                                # current array, attach per-mask
+                                # rejection labels by stage name.
+                                keep_refine = np.zeros(
+                                    masks_np.shape[0], dtype=bool,
+                                )
+                                if keep_idx:
+                                    keep_refine[np.asarray(
+                                        keep_idx, dtype=int)] = True
+                                # Record specific reject reasons
+                                # FIRST so apply() doesn't overwrite
+                                # them with a generic stage name.
+                                for mi_r, stage_r in refine_reject.items():
+                                    if 0 <= mi_r < len(audit.surviving):
+                                        orig_i = int(audit.surviving[mi_r])
+                                        if orig_i not in audit.rejected_by:
+                                            audit.rejected_by[orig_i] = stage_r
+                                # Now compress audit.surviving in
+                                # lockstep with masks_np below. Any
+                                # remaining False entries (mi not in
+                                # refine_reject) get "refine_other".
+                                for i in np.where(~keep_refine)[0]:
+                                    orig_i = int(audit.surviving[int(i)])
+                                    if orig_i not in audit.rejected_by:
+                                        audit.rejected_by[orig_i] = "refine_other"
+                                audit.surviving = audit.surviving[keep_refine]
                                 if refined:
                                     masks_np = np.stack(refined, axis=0)
                                     keep_arr = np.asarray(keep_idx, dtype=int)
@@ -2469,6 +2846,7 @@ def main():
                                         keep_c[ci] = False
                                 else:
                                     keep_c[ci] = False
+                            audit.apply(keep_c, "prgb_centroid")
                             if not keep_c.all():
                                 rt_key = (day, category, session, prompt)
                                 rt = rejection_totals.setdefault(rt_key, {})
@@ -2523,6 +2901,7 @@ def main():
                                 if (frac_valid
                                         < args.flower_min_valid_depth_frac):
                                     keep_d[di] = False
+                            audit.apply(keep_d, "sky_depth")
                             if not keep_d.all():
                                 rt_key = (day, category, session, prompt)
                                 rt = rejection_totals.setdefault(rt_key, {})
@@ -2570,7 +2949,19 @@ def main():
                                     & (_Vc >= 130)
                                 )
                                 _blossom_pix = _white | _pink
-                            except Exception:
+                            except Exception as _bp_err:
+                                # Log instead of silently disabling --
+                                # we burned a lot of cycles last week
+                                # on a bare `except: pass` in this
+                                # exact path. compute_flower_soft_score
+                                # tolerates blossom_pix=None (color
+                                # component falls back to 1.0), but at
+                                # least we'll see the bug in stderr.
+                                print(
+                                    f"[warn] soft-score blossom_pix "
+                                    f"build failed: {_bp_err!r}",
+                                    file=sys.stderr,
+                                )
                                 _hsv = None
                                 _blossom_pix = None
                             keep_soft = np.ones(n, dtype=bool)
@@ -2613,8 +3004,18 @@ def main():
                                     w_ndvi=args.flower_soft_w_ndvi,
                                 )
                                 soft_scores_log.append(soft)
+                                # Stash the score and per-component
+                                # breakdown on the audit so the
+                                # rejection JSONL log can show why a
+                                # specific mask scored where it did.
+                                audit.set_meta(
+                                    si,
+                                    soft_score=float(soft),
+                                    soft_components=_comps,
+                                )
                                 if soft < args.flower_min_soft_score:
                                     keep_soft[si] = False
+                            audit.apply(keep_soft, "soft_score")
                             if not keep_soft.all():
                                 rt_key = (day, category, session, prompt)
                                 rt = rejection_totals.setdefault(rt_key, {})
@@ -2651,6 +3052,16 @@ def main():
                         rt = rejection_totals.setdefault(rt_key, {k: 0 for k in diag})
                         for k, v in diag.items():
                             rt[k] = rt.get(k, 0) + v
+                        # Audit: flower_quality_keep returns a multi-
+                        # bucket diag, so recover per-mask reasons by
+                        # inspecting which gate fired in order. We
+                        # don't have direct per-mask labels here, so
+                        # we recompute the cheapest discriminator: any
+                        # rejected mask gets stage = "flower_quality"
+                        # in the audit. A finer breakdown would
+                        # require flower_quality_keep to return per-
+                        # mask reasons; out of scope for this commit.
+                        audit.apply(keep, "flower_quality")
                         if not keep.all():
                             masks_np = masks_np[keep]
                             if scores_np is not None:
@@ -2827,6 +3238,113 @@ def main():
                         )
                         overlay.save(op, quality=85)
 
+                    # ---------- Debug overlay (--debug-overlay) ----------
+                    # Render every PRE-filter SAM detection on a separate
+                    # image, color-coded: pink fill = kept, red outline +
+                    # text label = rejected (with the FIRST gate that
+                    # killed it). Lets you instantly see what nearly
+                    # survived vs what survived.
+                    if (args.debug_overlay and is_flower_prompt
+                            and orig_masks is not None and len(orig_masks) > 0):
+                        try:
+                            debug_path = (
+                                op.parent / f"{op.stem}_debug.jpg"
+                                if save_this_overlay
+                                else (overlays_dir / slug
+                                      / img_path.relative_to(args.root).with_suffix(".jpg"))
+                            )
+                            debug_path.parent.mkdir(parents=True, exist_ok=True)
+                            kept_set = set(audit.kept_originals())
+                            _render_debug_overlay(
+                                img, orig_masks, audit.rejected_by,
+                                kept_set, debug_path,
+                                title=f"{prompt} debug "
+                                      f"(kept={len(kept_set)}, "
+                                      f"rejected={len(audit.rejected_by)})",
+                                roi_mask=roi_mask_for_overlay,
+                            )
+                        except Exception as _dbg_err:
+                            print(
+                                f"[warn] debug overlay failed for "
+                                f"{img_path}: {_dbg_err!r}",
+                                file=sys.stderr,
+                            )
+
+                    # ---------- Per-zone flower counts (CSV) ----------
+                    # For flower prompts only: assign each kept mask's
+                    # centroid to one of the 10 sprayer ROI zones (2
+                    # cols x 5 rows over the PRGB ROI bbox) and count.
+                    zone_counts = {k: "" for k in zone_cols}
+                    if is_flower_prompt and n > 0 and roi_mask_img is not None:
+                        zones, _ = assign_centroids_to_zones(
+                            masks_np, roi_mask_img, n_cols=2, n_rows=5,
+                        )
+                        # Initialize zeros for flower prompts so the
+                        # CSV reader can distinguish "no flowers in this
+                        # zone" from "no ROI / not a flower prompt".
+                        for k in zone_cols:
+                            zone_counts[k] = 0
+                        for z in zones:
+                            if z is None:
+                                continue
+                            c, r = z
+                            zone_counts[f"flowers_c{c}_r{r}"] = (
+                                int(zone_counts[f"flowers_c{c}_r{r}"]) + 1
+                            )
+
+                    # ---------- Per-mask rejection log (JSONL) ----------
+                    if (rejection_log_f is not None
+                            and orig_masks is not None and len(orig_masks) > 0):
+                        try:
+                            kept_set_jl = set(audit.kept_originals())
+                            for orig_i in range(len(orig_masks)):
+                                m = orig_masks[orig_i].astype(bool)
+                                if m.ndim == 3:
+                                    m = m.any(axis=0)
+                                area = int(m.sum())
+                                if area > 0:
+                                    ys_j, xs_j = np.where(m)
+                                    bbox = [int(xs_j.min()), int(ys_j.min()),
+                                            int(xs_j.max()), int(ys_j.max())]
+                                else:
+                                    bbox = [0, 0, 0, 0]
+                                kept_jl = orig_i in kept_set_jl
+                                rejected_by = (
+                                    audit.rejected_by.get(orig_i, "")
+                                    if not kept_jl else ""
+                                )
+                                meta = audit.meta.get(orig_i, {})
+                                sam_score = (
+                                    float(orig_scores[orig_i])
+                                    if orig_scores is not None
+                                       and orig_i < len(orig_scores)
+                                    else None
+                                )
+                                rec = {
+                                    "image": str(img_path),
+                                    "prompt": prompt,
+                                    "orig_idx": orig_i,
+                                    "sam_score": sam_score,
+                                    "bbox_xyxy": bbox,
+                                    "area_px": area,
+                                    "kept": bool(kept_jl),
+                                    "rejected_by": rejected_by,
+                                }
+                                # Inline the per-mask metadata captured
+                                # by audit.set_meta() at filter sites
+                                # (refined area, soft score, etc.).
+                                for k_meta, v_meta in meta.items():
+                                    rec[k_meta] = v_meta
+                                rejection_log_f.write(
+                                    json.dumps(rec, default=str) + "\n"
+                                )
+                        except Exception as _log_err:
+                            print(
+                                f"[warn] rejection log write failed for "
+                                f"{img_path}: {_log_err!r}",
+                                file=sys.stderr,
+                            )
+
                     writer.writerow({
                         "day": day, "category": category, "session": session,
                         "image": str(img_path), "prompt": prompt,
@@ -2841,6 +3359,7 @@ def main():
                         "canopy_overlap_mean": canopy_overlap_mean,
                         "roi_overlap_mean": roi_overlap_mean,
                         "track_ids": ";".join(str(t) for t in track_ids) if track_ids else "",
+                        **zone_counts,
                     })
 
                     # Per-image aggregator for wide CSV.
@@ -2860,6 +3379,11 @@ def main():
                 print(f"[ERR] {img_path}: {e}", file=sys.stderr)
     finally:
         f.close()
+        if rejection_log_f is not None:
+            try:
+                rejection_log_f.close()
+            except Exception:
+                pass
 
     # Flush the final session's trackers.
     if args.track and current_session_key is not None:
