@@ -1782,7 +1782,7 @@ def main():
                                     (((Hc >= 0) & (Hc <= 30))
                                      | ((Hc >= 150) & (Hc <= 179)))
                                     & ((Sc >= 20) & (Sc <= 100))
-                                    & (Vc >= 150)
+                                    & (Vc >= 130)
                                 )
                                 blossom_pix = white_mask | pink_mask
                                 # Pink-content gate: real apple
@@ -1795,15 +1795,17 @@ def main():
                                 # MIN_PINK_PIXELS of actual pink in
                                 # the mask before accepting it as a
                                 # flower.
-                                MIN_PINK_PIXELS = 8
-                                # Pink FRACTION: real blossoms are
-                                # 15-50% pink pixels by mask area
-                                # (the rest is white petal). Glint
-                                # masks are 95-100% pure white with
-                                # at most a few incidental pink
-                                # neighbours, so their pink fraction
-                                # is < 5%. 0.10 cleanly separates.
-                                MIN_PINK_FRACTION = 0.10
+                                MIN_PINK_PIXELS = 5
+                                # Pink FRACTION: white-dominated
+                                # apple blossoms (most petals + small
+                                # pink stamens) sit at 5-20% pink;
+                                # pink-dominated cultivars at
+                                # 30-50%. Pure-white glints with one
+                                # or two incidental pink neighbours
+                                # < 3%. 0.05 keeps the white-
+                                # dominated case while still
+                                # rejecting glints.
+                                MIN_PINK_FRACTION = 0.05
                                 # Refine each mask: keep ONLY the
                                 # blossom-color intersection. Drop
                                 # masks whose refined area is below
