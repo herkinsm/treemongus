@@ -1795,12 +1795,47 @@ def main():
                                 # easily clear 20.
                                 refined: list[np.ndarray] = []
                                 keep_idx: list[int] = []
+                                # Small dilation kernel to grow the
+                                # refined mask back out to the petal
+                                # edges (HSV thresholds chop pale-
+                                # pink edges when the gradient
+                                # crosses thresholds). Bounded by
+                                # the ORIGINAL SAM mask so dilation
+                                # can't pull in surrounding leaves.
+                                _dil_k = _cv2.getStructuringElement(
+                                    _cv2.MORPH_ELLIPSE, (5, 5),
+                                )
+                                # Aspect-ratio gate on the original
+                                # SAM bbox: a real blossom's bbox is
+                                # roughly square (aspect 1-2x);
+                                # branches / twigs come back at 4:1
+                                # or more.
+                                MAX_ASPECT_RATIO = 3.0
                                 for mi in range(masks_np.shape[0]):
                                     m_orig = masks_np[mi].astype(bool)
-                                    m_ref = m_orig & blossom_pix
-                                    if int(m_ref.sum()) >= 20:
-                                        refined.append(m_ref)
-                                        keep_idx.append(mi)
+                                    if not m_orig.any():
+                                        continue
+                                    ys_o, xs_o = np.where(m_orig)
+                                    bw_o = xs_o.max() - xs_o.min() + 1
+                                    bh_o = ys_o.max() - ys_o.min() + 1
+                                    short = min(bw_o, bh_o)
+                                    long_ = max(bw_o, bh_o)
+                                    if (short > 0
+                                            and (long_ / short) > MAX_ASPECT_RATIO):
+                                        continue
+                                    m_ref_raw = m_orig & blossom_pix
+                                    if int(m_ref_raw.sum()) < 20:
+                                        continue
+                                    m_ref = _cv2.dilate(
+                                        m_ref_raw.astype(np.uint8),
+                                        _dil_k, iterations=1,
+                                    ).astype(bool)
+                                    # Stay inside the original SAM
+                                    # mask so dilation can't claim
+                                    # surrounding leaves.
+                                    m_ref = m_ref & m_orig
+                                    refined.append(m_ref)
+                                    keep_idx.append(mi)
                                 if refined:
                                     masks_np = np.stack(refined, axis=0)
                                     keep_arr = np.asarray(keep_idx, dtype=int)
