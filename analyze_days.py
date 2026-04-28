@@ -21,6 +21,37 @@ import numpy as np
 import torch
 from PIL import Image
 
+# Compatibility shim for CPU-only nodes (login nodes, salloc / sbatch
+# without --gpus). SAM 3's source has hardcoded `device="cuda"` calls
+# (e.g. sam3/model/position_encoding.py:55:
+#   tensors = torch.zeros((1, 1) + size, device="cuda")
+# ) that fire during build_sam3_image_model() -- BEFORE we ever get a
+# chance to .to(device) the model. On a CPU node this raises
+# `RuntimeError: No CUDA GPUs are available` and the process dies
+# during model construction. Wrap torch's tensor creators so that, when
+# no GPU is visible, an explicit device="cuda" silently maps to "cpu".
+# No-op on a real GPU node (the wrapper is never installed).
+if not torch.cuda.is_available():
+    def _make_cpu_fallback(orig):
+        def _patched(*args, **kwargs):
+            d = kwargs.get("device")
+            if d == "cuda" or (
+                hasattr(d, "type") and getattr(d, "type", "") == "cuda"
+            ):
+                kwargs["device"] = "cpu"
+            return orig(*args, **kwargs)
+        return _patched
+    for _fn_name in (
+        "zeros", "ones", "empty", "rand", "randn",
+        "tensor", "full", "arange", "eye", "linspace", "logspace",
+        "zeros_like", "ones_like", "empty_like",
+    ):
+        if hasattr(torch, _fn_name):
+            setattr(
+                torch, _fn_name,
+                _make_cpu_fallback(getattr(torch, _fn_name)),
+            )
+
 import sam3
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
