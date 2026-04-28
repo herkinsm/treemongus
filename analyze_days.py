@@ -1784,20 +1784,16 @@ def main():
                                     & ((Sc >= 20) & (Sc <= 100))
                                     & (Vc >= 130)
                                 )
-                                # Yellow / orange anther stamens.
-                                # Most apple cultivars (Gala,
-                                # Honeycrisp, Goldrush, etc.) have
-                                # white petals with bright yellow
-                                # stamens in the center. The yellow
-                                # has H ~20-35 (OpenCV scale,
-                                # corresponds to true 40-70 deg)
-                                # and is highly saturated.
-                                yellow_mask = (
-                                    ((Hc >= 18) & (Hc <= 35))
-                                    & (Sc >= 60)
-                                    & (Vc >= 130)
-                                )
-                                blossom_pix = white_mask | pink_mask | yellow_mask
+                                # Yellow is intentionally NOT in the
+                                # blossom set: trunk bark, dry leaves,
+                                # ground straw all produce yellow-
+                                # range pixels and would inflate the
+                                # mask. White petals + (optional) pink
+                                # is enough -- a side-view blossom
+                                # without visible yellow stamens
+                                # still has plenty of white petal
+                                # pixels for the refined mask.
+                                blossom_pix = white_mask | pink_mask
                                 # NO pink-content gate -- most apple
                                 # cultivars produce nearly pure-
                                 # white blossoms (Gala, Honeycrisp,
@@ -1848,7 +1844,12 @@ def main():
                                             and (long_ / short) > MAX_ASPECT_RATIO):
                                         continue
                                     m_ref_raw = m_orig & blossom_pix
-                                    if int(m_ref_raw.sum()) < 20:
+                                    # 35 px minimum: leaf glints are
+                                    # typically 10-25 px. A real
+                                    # blossom (even a small distant
+                                    # one) is 35-300+ px after
+                                    # refinement.
+                                    if int(m_ref_raw.sum()) < 35:
                                         continue
                                     # Require some PINK content,
                                     # not just white. Glints /
