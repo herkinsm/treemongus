@@ -1782,7 +1782,7 @@ def main():
                                     (((Hc >= 0) & (Hc <= 30))
                                      | ((Hc >= 150) & (Hc <= 179)))
                                     & ((Sc >= 20) & (Sc <= 100))
-                                    & (Vc >= 110)
+                                    & (Vc >= 150)
                                 )
                                 blossom_pix = white_mask | pink_mask
                                 # Pink-content gate: real apple
@@ -1795,7 +1795,7 @@ def main():
                                 # MIN_PINK_PIXELS of actual pink in
                                 # the mask before accepting it as a
                                 # flower.
-                                MIN_PINK_PIXELS = 3
+                                MIN_PINK_PIXELS = 8
                                 # Refine each mask: keep ONLY the
                                 # blossom-color intersection. Drop
                                 # masks whose refined area is below
