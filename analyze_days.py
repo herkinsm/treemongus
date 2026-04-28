@@ -1825,58 +1825,44 @@ def main():
                                 _dil_k = _cv2.getStructuringElement(
                                     _cv2.MORPH_ELLIPSE, (5, 5),
                                 )
-                                # Aspect-ratio gate on the original
-                                # SAM bbox: a real blossom's bbox is
-                                # roughly square (aspect 1-2x);
-                                # branches / twigs come back at 4:1
-                                # or more.
-                                MAX_ASPECT_RATIO = 2.0
+                                # Aspect-ratio gate on the REFINED
+                                # (petal-only) mask, not the
+                                # original SAM bbox. SAM 3 often
+                                # wraps a single flower together
+                                # with adjacent leaves, producing
+                                # an elongated original bbox even
+                                # when the actual blossom is round.
+                                # Computing on the blossom-color
+                                # intersection isolates the petal
+                                # cluster's true shape, while still
+                                # rejecting branches / twigs (they
+                                # produce long thin bright
+                                # ridges along the bark).
+                                MAX_ASPECT_RATIO = 2.5
                                 for mi in range(masks_np.shape[0]):
                                     m_orig = masks_np[mi].astype(bool)
                                     if not m_orig.any():
                                         continue
-                                    ys_o, xs_o = np.where(m_orig)
-                                    bw_o = xs_o.max() - xs_o.min() + 1
-                                    bh_o = ys_o.max() - ys_o.min() + 1
-                                    short = min(bw_o, bh_o)
-                                    long_ = max(bw_o, bh_o)
-                                    if (short > 0
-                                            and (long_ / short) > MAX_ASPECT_RATIO):
-                                        continue
                                     m_ref_raw = m_orig & blossom_pix
+                                    refined_area = int(m_ref_raw.sum())
                                     # 80 px minimum: trunk specular
                                     # spots and leaf glints sit in
-                                    # the 15-50 px range -- they're
-                                    # small bright reflections, not
-                                    # real petal masses. Real apple
-                                    # blossoms in-frame are 60-300+
-                                    # px after refinement (a single
-                                    # petal cluster spans ~7 cm at
-                                    # the canopy depth, ~80 px). 80
-                                    # cuts above the glint
-                                    # distribution and below the
-                                    # blossom one. The shape filters
-                                    # alone couldn't discriminate
-                                    # because both shapes are
-                                    # blob-like; size is the only
-                                    # clean separator.
-                                    if int(m_ref_raw.sum()) < 80:
+                                    # the 15-50 px range. Real
+                                    # blossoms refine to 80-300+ px.
+                                    if refined_area < 80:
                                         continue
-                                    # Require some PINK content,
-                                    # not just white. Glints /
-                                    # specular highlights are pure
-                                    # white; real blossoms always
-                                    # have a few pink pixels.
-                                    pink_in_mask = int(
-                                        (m_orig & pink_mask).sum()
-                                    )
-                                    if pink_in_mask < MIN_PINK_PIXELS:
-                                        continue
-                                    refined_total = int(m_ref_raw.sum())
-                                    if refined_total > 0 and (
-                                        pink_in_mask / refined_total
-                                        < MIN_PINK_FRACTION
-                                    ):
+                                    # Aspect ratio on the refined
+                                    # petal mass (was the original
+                                    # SAM bbox -- wrong target when
+                                    # SAM groups flower with
+                                    # adjacent leaves).
+                                    ys_r, xs_r = np.where(m_ref_raw)
+                                    bw_r = xs_r.max() - xs_r.min() + 1
+                                    bh_r = ys_r.max() - ys_r.min() + 1
+                                    short = min(bw_r, bh_r)
+                                    long_ = max(bw_r, bh_r)
+                                    if (short > 0
+                                            and (long_ / short) > MAX_ASPECT_RATIO):
                                         continue
                                     m_ref = _cv2.dilate(
                                         m_ref_raw.astype(np.uint8),
@@ -1893,8 +1879,32 @@ def main():
                                     keep_arr = np.asarray(keep_idx, dtype=int)
                                     if scores_np is not None:
                                         scores_np = scores_np[keep_arr]
-                                    if boxes_np is not None:
-                                        boxes_np = boxes_np[keep_arr]
+                                    # Recompute boxes from the
+                                    # REFINED masks so the
+                                    # downstream density and
+                                    # max-bbox-area gates in
+                                    # flower_quality_keep operate
+                                    # on the petal region, not the
+                                    # inflated original SAM bbox.
+                                    # Without this, a real flower
+                                    # that SAM grouped with leaves
+                                    # has a tight refined mask but
+                                    # the original SAM bbox, so
+                                    # density = mask_area / sam_box
+                                    # comes out tiny and trips the
+                                    # min_mask_density 0.40 gate.
+                                    new_boxes = []
+                                    for ref_m in refined:
+                                        ys_b, xs_b = np.where(ref_m)
+                                        new_boxes.append([
+                                            float(xs_b.min()),
+                                            float(ys_b.min()),
+                                            float(xs_b.max() + 1),
+                                            float(ys_b.max() + 1),
+                                        ])
+                                    boxes_np = np.asarray(
+                                        new_boxes, dtype=np.float32,
+                                    )
                                     n = int(masks_np.shape[0])
                                 else:
                                     # All SAM masks lacked enough
@@ -1910,8 +1920,61 @@ def main():
                                     if boxes_np is not None:
                                         boxes_np = boxes_np[:0]
                                     n = 0
-                            except Exception:
-                                pass
+                            except Exception as _refine_err:
+                                # Don't silently swallow refinement
+                                # bugs -- log to stderr so the next
+                                # NameError-style regression is
+                                # visible instead of disabling the
+                                # whole color refinement loop.
+                                print(
+                                    f"[warn] flower refinement "
+                                    f"failed: {_refine_err!r}",
+                                    file=sys.stderr,
+                                )
+                        # Post-refinement PRGB centroid gate for
+                        # flowers. The earlier PRGB-overlap filter
+                        # ran on the WIDE unrefined SAM masks (before
+                        # the HSV intersection trimmed them to
+                        # petals); a refined petal mass that ends up
+                        # mostly outside the red ROI box still passed
+                        # because the original wider mask had 50%+
+                        # overlap. Require the refined centroid to
+                        # actually sit inside the ROI so flowers that
+                        # the user expects to be in-bounds aren't
+                        # drawn outside the cyan zone grid.
+                        if (args.prgb and roi_mask_img is not None
+                                and n > 0):
+                            keep_c = np.ones(n, dtype=bool)
+                            roi_h_full, roi_w_full = roi_mask_img.shape[:2]
+                            for ci in range(n):
+                                mb = masks_np[ci].astype(bool)
+                                if mb.ndim == 3:
+                                    mb = mb.any(axis=0)
+                                if not mb.any():
+                                    keep_c[ci] = False
+                                    continue
+                                ys_c, xs_c = np.where(mb)
+                                cy_c = int(round(float(ys_c.mean())))
+                                cx_c = int(round(float(xs_c.mean())))
+                                if (0 <= cy_c < roi_h_full
+                                        and 0 <= cx_c < roi_w_full):
+                                    if not roi_mask_img[cy_c, cx_c]:
+                                        keep_c[ci] = False
+                                else:
+                                    keep_c[ci] = False
+                            if not keep_c.all():
+                                rt_key = (day, category, session, prompt)
+                                rt = rejection_totals.setdefault(rt_key, {})
+                                rt["prgb_centroid"] = (
+                                    rt.get("prgb_centroid", 0)
+                                    + int((~keep_c).sum())
+                                )
+                                masks_np = masks_np[keep_c]
+                                if scores_np is not None:
+                                    scores_np = scores_np[keep_c]
+                                if boxes_np is not None:
+                                    boxes_np = boxes_np[keep_c]
+                                n = int(keep_c.sum())
                         keep, diag, areas_in = flower_quality_keep(
                             masks_np,
                             args.flower_min_area_px, args.flower_max_area_px,
