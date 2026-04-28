@@ -592,6 +592,313 @@ def roi_overlap_per_mask(masks_np: np.ndarray, roi: np.ndarray) -> list[float]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Soft-scoring helpers: contextual depth, NDVI, and a continuous quality score
+# combining SAM 3 confidence, shape, color, depth, and NDVI signals. See
+# compute_flower_soft_score() for the full design notes.
+# ---------------------------------------------------------------------------
+def load_ir(ir_path: Path, target_hw: tuple[int, int]) -> np.ndarray | None:
+    """Load the IR (NIR) channel as a single-band float array in [0, 1].
+
+    Mirrors load_depth_mm: BMP / PNG / TIFF input, single channel, upsampled
+    to target_hw. Used for NDVI (positive vegetation/petal signal). Returns
+    None if the file is missing or unreadable so callers can fall back to a
+    depth-only scoring path."""
+    if not ir_path.is_file():
+        return None
+    try:
+        import cv2
+        ir = cv2.imread(str(ir_path), cv2.IMREAD_UNCHANGED)
+        if ir is None:
+            return None
+        if ir.ndim == 3:
+            ir = ir[..., 0]
+        if ir.shape != target_hw:
+            ir = cv2.resize(
+                ir, (target_hw[1], target_hw[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        ir = ir.astype(np.float32)
+        # Normalize to [0, 1] using dtype range. Some VB captures store
+        # IR as 8-bit, others as 16-bit; auto-scale by the actual max so
+        # NDVI is comparable across cameras.
+        m = float(ir.max())
+        if m > 1.5:
+            ir /= m
+        return ir
+    except Exception:
+        return None
+
+
+def compute_ndvi(rgb_arr: np.ndarray, ir_arr: np.ndarray | None) -> np.ndarray | None:
+    """NDVI = (NIR - Red) / (NIR + Red + eps), clamped to [-1, 1].
+
+    Returns None if IR is missing. Both inputs must be aligned at the same
+    H,W. RGB is uint8, IR is float in [0, 1]; we normalize R into [0, 1]
+    first so the index has the right scale."""
+    if ir_arr is None:
+        return None
+    if rgb_arr.ndim != 3 or rgb_arr.shape[2] < 3:
+        return None
+    red = rgb_arr[..., 0].astype(np.float32) / 255.0
+    nir = ir_arr.astype(np.float32)
+    if nir.shape[:2] != red.shape[:2]:
+        return None
+    eps = 1e-6
+    ndvi = (nir - red) / (nir + red + eps)
+    return np.clip(ndvi, -1.0, 1.0)
+
+
+def _ring_around_mask(
+    mask: np.ndarray, ring_px: int, exclude_self: bool = True
+) -> np.ndarray:
+    """Boolean ring of pixels JUST outside `mask` (within `ring_px`).
+
+    Implemented as (dilate(mask) AND NOT mask). Used to sample the
+    surrounding canopy / sky / ground for contextual gates."""
+    import cv2 as _cv2
+    if not mask.any():
+        return np.zeros_like(mask, dtype=bool)
+    k = max(1, 2 * int(ring_px) + 1)
+    kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (k, k))
+    dil = _cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
+    if exclude_self:
+        return dil & ~mask
+    return dil
+
+
+def compute_contextual_depth_score(
+    mask: np.ndarray, depth_mm: np.ndarray | None,
+    ring_px: int, depth_min_mm: float, depth_max_mm: float,
+    surr_min_canopy_frac: float, match_tol_mm: float,
+    saturated_partial_credit: float = 0.7,
+) -> float:
+    """Continuous score in [0, 1] for whether `mask` sits on the canopy.
+
+    Logic:
+      1. Compute the ring around the mask (default 20 px outside).
+      2. Surrounding canopy fraction = ring pixels with depth in valid
+         range / total ring pixels. If too low (sky on both sides /
+         ground), score = 0.
+      3. If mask itself has valid depth pixels: how close is mask median
+         depth to surrounding median? Within `match_tol_mm` => 1.0,
+         linearly down to 0 at 2 * tol.
+      4. If mask has NO valid depth (white petals saturating IR
+         projector): give `saturated_partial_credit` (default 0.7)
+         provided the surrounding IS canopy. Sky doesn't get this
+         because step 2 already ruled it out.
+
+    Returns 1.0 if depth_mm is None (signal absent => neutral).
+    """
+    if depth_mm is None:
+        return 1.0
+    mb = mask.astype(bool)
+    if not mb.any():
+        return 0.0
+    valid = (depth_mm >= depth_min_mm) & (depth_mm <= depth_max_mm)
+    ring = _ring_around_mask(mb, ring_px)
+    if ring.sum() == 0:
+        return 0.5  # mask covers the whole frame -- can't sample context
+    surr_canopy_frac = float((ring & valid).sum()) / float(ring.sum())
+    if surr_canopy_frac < surr_min_canopy_frac:
+        return 0.0  # surrounding is sky / ground; mask isn't on canopy
+    # We have canopy context. How does the mask compare?
+    mask_valid = mb & valid
+    if mask_valid.sum() == 0:
+        # Saturated petal case: mask all-invalid but surroundings
+        # confirm canopy. Partial credit -- this catches white petals
+        # whose IR returns swamp the depth sensor.
+        return float(saturated_partial_credit)
+    mask_med = float(np.median(depth_mm[mask_valid]))
+    surr_med = float(np.median(depth_mm[ring & valid]))
+    diff = abs(mask_med - surr_med)
+    # Smooth ramp: 0 mm diff -> 1.0; tol -> ~0.5; 2*tol -> 0.0
+    if match_tol_mm <= 0:
+        return 1.0 if diff == 0 else 0.0
+    return float(max(0.0, 1.0 - diff / (2.0 * match_tol_mm)))
+
+
+def compute_ndvi_score(
+    mask: np.ndarray, ndvi_arr: np.ndarray | None, ring_px: int,
+    petal_ndvi_mean: float, petal_ndvi_std: float,
+    canopy_ndvi_min: float, canopy_ndvi_softness: float,
+) -> float:
+    """Continuous [0, 1] score combining petal-NDVI and canopy-context-NDVI.
+
+    Real flower in canopy:
+      - mask NDVI is moderate (white petals: red ~ NIR; pink: red > NIR);
+        bell-curve centered at `petal_ndvi_mean`.
+      - surrounding NDVI is high (canopy leaves dominate the ring);
+        sigmoid above `canopy_ndvi_min`.
+
+    Sky / cloud regions:
+      - mask NDVI close to 0 (both R and NIR bright but similar) -- might
+        score OK on the petal component...
+      - ...but the surrounding-canopy component drops, so the combined
+        score collapses. That asymmetry is what separates white petals
+        from white clouds.
+
+    Returns 1.0 if ndvi_arr is None (signal absent => neutral)."""
+    if ndvi_arr is None:
+        return 1.0
+    mb = mask.astype(bool)
+    if not mb.any():
+        return 0.0
+    ring = _ring_around_mask(mb, ring_px)
+    mask_med = float(np.median(ndvi_arr[mb]))
+    if ring.sum() > 0:
+        surr_med = float(np.median(ndvi_arr[ring]))
+    else:
+        surr_med = mask_med
+    # Petal: bell curve on mask NDVI (white -> ~0.0, pink -> ~0.1).
+    if petal_ndvi_std <= 0:
+        petal = 1.0 if abs(mask_med - petal_ndvi_mean) < 1e-3 else 0.0
+    else:
+        z = (mask_med - petal_ndvi_mean) / petal_ndvi_std
+        petal = float(np.exp(-0.5 * z * z))
+    # Canopy: sigmoid above threshold.
+    if canopy_ndvi_softness <= 0:
+        canopy = 1.0 if surr_med >= canopy_ndvi_min else 0.0
+    else:
+        x = (surr_med - canopy_ndvi_min) / canopy_ndvi_softness
+        canopy = float(1.0 / (1.0 + np.exp(-x)))
+    # Geometric mean: both must be reasonable.
+    return float(np.sqrt(max(petal, 1e-6) * max(canopy, 1e-6)))
+
+
+def _sigmoid(x: float, center: float, softness: float) -> float:
+    if softness <= 0:
+        return 1.0 if x >= center else 0.0
+    return float(1.0 / (1.0 + np.exp(-(x - center) / softness)))
+
+
+def compute_shape_score(
+    circ: float, density: float, aspect: float,
+    circ_center: float, circ_softness: float,
+    density_center: float, density_softness: float,
+    aspect_max: float, aspect_softness: float,
+) -> float:
+    """[0, 1] shape-quality score: sigmoid(circ) * sigmoid(density) *
+    aspect-falloff. Each factor lets a borderline value contribute
+    partially instead of binary-rejecting; combined product means a
+    very weak signal in any one dimension still pulls the whole down."""
+    s_circ = _sigmoid(circ, circ_center, circ_softness)
+    s_dens = _sigmoid(density, density_center, density_softness)
+    if aspect <= aspect_max:
+        s_aspect = 1.0
+    else:
+        # Symmetric reverse sigmoid past the max.
+        if aspect_softness <= 0:
+            s_aspect = 0.0
+        else:
+            s_aspect = float(
+                1.0 / (1.0 + np.exp((aspect - aspect_max) / aspect_softness))
+            )
+    return float(s_circ * s_dens * s_aspect)
+
+
+def compute_flower_soft_score(
+    mask: np.ndarray, sam_score: float,
+    rgb_arr: np.ndarray, hsv_arr: np.ndarray,
+    blossom_pix: np.ndarray | None,
+    depth_mm: np.ndarray | None, ndvi_arr: np.ndarray | None,
+    *,
+    # Shape gate centers (sigmoids, not hard cutoffs):
+    circ_center: float, circ_softness: float,
+    density_center: float, density_softness: float,
+    aspect_max: float, aspect_softness: float,
+    # Color gate:
+    color_frac_center: float, color_frac_softness: float,
+    # Depth context:
+    ring_px: int, depth_min_mm: float, depth_max_mm: float,
+    surr_min_canopy_frac: float, match_tol_mm: float,
+    # NDVI context:
+    petal_ndvi_mean: float, petal_ndvi_std: float,
+    canopy_ndvi_min: float, canopy_ndvi_softness: float,
+    # Combination weights (geometric mean):
+    w_sam: float, w_shape: float, w_color: float,
+    w_depth: float, w_ndvi: float,
+) -> tuple[float, dict]:
+    """Final continuous quality score in [0, 1] for one flower mask.
+
+    Returns (score, components_dict) so the diagnostics CSV can show
+    per-mask why a borderline detection scored where it did. The
+    weighted geometric mean (instead of arithmetic) means any one
+    near-zero component drives the total to zero -- which is what we
+    want for hard mismatches like 'is on sky' or 'is wrong color',
+    while still letting strong evidence in some dimensions
+    compensate for moderate evidence in others.
+    """
+    import cv2 as _cv2
+    mb = mask.astype(bool)
+    area = int(mb.sum())
+    if area == 0:
+        return 0.0, {
+            "sam": 0.0, "shape": 0.0, "color": 0.0,
+            "depth": 0.0, "ndvi": 0.0,
+        }
+    ys, xs = np.where(mb)
+    bw = xs.max() - xs.min() + 1
+    bh = ys.max() - ys.min() + 1
+    bbox_area = bw * bh
+    density = float(area) / float(max(1, bbox_area))
+    short = min(bw, bh)
+    long_ = max(bw, bh)
+    aspect = float(long_) / float(max(1, short))
+    contours, _ = _cv2.findContours(
+        mb.astype(np.uint8), _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if contours:
+        biggest = max(contours, key=_cv2.contourArea)
+        perim = _cv2.arcLength(biggest, True)
+        circ = (4.0 * np.pi * area / (perim * perim)) if perim > 0 else 0.0
+    else:
+        circ = 0.0
+    # Color fraction (blossom-color pixels / mask pixels).
+    if blossom_pix is not None:
+        color_frac = float((mb & blossom_pix).sum()) / float(area)
+    else:
+        color_frac = 1.0
+    s_sam = float(np.clip(sam_score, 0.0, 1.0))
+    s_shape = compute_shape_score(
+        circ, density, aspect,
+        circ_center, circ_softness,
+        density_center, density_softness,
+        aspect_max, aspect_softness,
+    )
+    s_color = _sigmoid(color_frac, color_frac_center, color_frac_softness)
+    s_depth = compute_contextual_depth_score(
+        mb, depth_mm, ring_px,
+        depth_min_mm, depth_max_mm,
+        surr_min_canopy_frac, match_tol_mm,
+    )
+    s_ndvi = compute_ndvi_score(
+        mb, ndvi_arr, ring_px,
+        petal_ndvi_mean, petal_ndvi_std,
+        canopy_ndvi_min, canopy_ndvi_softness,
+    )
+    # Weighted geometric mean. Floor each component at 1e-6 so log()
+    # doesn't blow up; in practice a 0.0 means "extreme mismatch" and
+    # the resulting score will be ~0.
+    weights = [w_sam, w_shape, w_color, w_depth, w_ndvi]
+    components = [s_sam, s_shape, s_color, s_depth, s_ndvi]
+    total_w = sum(weights)
+    if total_w <= 0:
+        return 0.0, {
+            "sam": s_sam, "shape": s_shape, "color": s_color,
+            "depth": s_depth, "ndvi": s_ndvi,
+        }
+    log_score = sum(
+        w * float(np.log(max(c, 1e-6)))
+        for w, c in zip(weights, components)
+    ) / total_w
+    score = float(np.exp(log_score))
+    return score, {
+        "sam": s_sam, "shape": s_shape, "color": s_color,
+        "depth": s_depth, "ndvi": s_ndvi,
+    }
+
+
 _warned_bad_depth_bmps: set[str] = set()
 _logged_prgb_dims: set[str] = set()
 
@@ -1250,6 +1557,62 @@ def main():
                          "(default 5000 = 5 m). Pixels above are treated as "
                          "background (distant trees, buildings, sky max-range "
                          "value).")
+    # ---- Soft-score (continuous quality) flower gate. -----------------
+    # Combines SAM 3 confidence, shape, color, contextual depth, and NDVI
+    # into a single [0,1] score via weighted geometric mean. Replaces
+    # brittle hard thresholds with sigmoid-shaped components: a flower at
+    # circ=0.54 with a great score and good depth context still scores
+    # high; a glint at circ=0.56 with low SAM confidence and sky context
+    # scores low. See compute_flower_soft_score() for design.
+    ap.add_argument("--flower-min-soft-score", type=float, default=0.0,
+                    help="Minimum combined quality score in [0, 1] for a "
+                         "flower mask to be kept. 0 = soft scoring "
+                         "disabled (back-compat). Try 0.30-0.45. "
+                         "Independent of and complementary to the hard "
+                         "circularity / density / depth gates: those still "
+                         "catch extremes; this catches the brittle middle.")
+    # Component centers (where each sigmoid crosses 0.5):
+    ap.add_argument("--flower-soft-circ-center", type=float, default=0.55)
+    ap.add_argument("--flower-soft-circ-softness", type=float, default=0.10)
+    ap.add_argument("--flower-soft-density-center", type=float, default=0.40)
+    ap.add_argument("--flower-soft-density-softness", type=float, default=0.10)
+    ap.add_argument("--flower-soft-aspect-max", type=float, default=2.5)
+    ap.add_argument("--flower-soft-aspect-softness", type=float, default=0.5)
+    ap.add_argument("--flower-soft-color-center", type=float, default=0.10,
+                    help="Blossom-color fraction sigmoid center.")
+    ap.add_argument("--flower-soft-color-softness", type=float, default=0.05)
+    # Contextual-depth params:
+    ap.add_argument("--flower-context-ring-px", type=int, default=20,
+                    help="Pixels OUTSIDE the mask to sample as 'surrounding "
+                         "canopy' for both depth and NDVI context checks.")
+    ap.add_argument("--flower-context-min-canopy-frac", type=float, default=0.30,
+                    help="Of the surrounding ring, the fraction that must "
+                         "have valid canopy depth for the mask to be "
+                         "considered canopy-embedded. Sky-adjacent masks "
+                         "fail this and score 0 on depth.")
+    ap.add_argument("--flower-context-depth-tol-mm", type=float, default=1500.0,
+                    help="Tolerance for matching mask median depth to "
+                         "surrounding canopy median (mm). Within tol -> "
+                         "score ~1; at 2*tol -> score 0.")
+    # NDVI params:
+    ap.add_argument("--flower-petal-ndvi-mean", type=float, default=0.10,
+                    help="Expected median NDVI for white/pink petal pixels "
+                         "(petals reflect strongly in red, so NDVI is low "
+                         "but non-zero). Bell-curve center.")
+    ap.add_argument("--flower-petal-ndvi-std", type=float, default=0.20,
+                    help="Std-dev of the petal-NDVI bell curve. Wider = "
+                         "more permissive.")
+    ap.add_argument("--flower-canopy-ndvi-min", type=float, default=0.30,
+                    help="Surrounding-NDVI sigmoid center: real canopy "
+                         "leaves are 0.4+; below ~0.2 indicates sky / "
+                         "ground.")
+    ap.add_argument("--flower-canopy-ndvi-softness", type=float, default=0.10)
+    # Combination weights:
+    ap.add_argument("--flower-soft-w-sam", type=float, default=1.0)
+    ap.add_argument("--flower-soft-w-shape", type=float, default=1.5)
+    ap.add_argument("--flower-soft-w-color", type=float, default=1.5)
+    ap.add_argument("--flower-soft-w-depth", type=float, default=1.5)
+    ap.add_argument("--flower-soft-w-ndvi", type=float, default=1.0)
     # Per-tree ROI restriction via PRGB images (red bounding boxes).
     ap.add_argument("--prgb", action="store_true",
                     help="Restrict detections to within the per-tree ROIs drawn as "
@@ -1713,6 +2076,19 @@ def main():
                         max_row_width_frac=args.canopy_max_row_width_frac,
                     )
 
+                # IR + NDVI for the soft-score NDVI component. Loaded
+                # once per image and reused across prompts. NDVI gives
+                # us a positive vegetation/petal signal that depth
+                # alone can't (sky and white petals look identical in
+                # HSV; petals reflect strongly in red so NDVI is low
+                # but non-zero, while canopy leaves are NDVI > 0.4).
+                ir_arr = None
+                ndvi_arr = None
+                if args.flower_min_soft_score > 0:
+                    ir_arr = load_ir(
+                        ir_path_for(img_path), (img.height, img.width),
+                    )
+
                 # PRGB ROI mask was already computed at the top of the try
                 # block so its bounding box could constrain the tile grid.
 
@@ -2160,6 +2536,98 @@ def main():
                                 if boxes_np is not None:
                                     boxes_np = boxes_np[keep_d]
                                 n = int(keep_d.sum())
+                        # Soft-score gate. Continuous quality score
+                        # combining SAM 3 confidence, shape, color,
+                        # contextual depth, and NDVI. See
+                        # compute_flower_soft_score() docstring for
+                        # the design. Disabled when
+                        # --flower-min-soft-score 0 (default), so
+                        # this is opt-in and fully back-compat.
+                        if (args.flower_min_soft_score > 0
+                                and n > 0):
+                            # Compute NDVI lazily once we know the
+                            # gate is on AND we have masks left to
+                            # score. Reuses ir_arr loaded per-image.
+                            if ndvi_arr is None and ir_arr is not None:
+                                ndvi_arr = compute_ndvi(rgb_arr, ir_arr)
+                            # blossom_pix is only computed inside the
+                            # refinement try-block; recompute it here
+                            # in HSV space for the color component
+                            # (cheap; once per prompt-iteration).
+                            try:
+                                import cv2 as _cv2_score
+                                _hsv = _cv2_score.cvtColor(
+                                    rgb_arr, _cv2_score.COLOR_RGB2HSV,
+                                )
+                                _Hc, _Sc, _Vc = (
+                                    _hsv[..., 0], _hsv[..., 1], _hsv[..., 2],
+                                )
+                                _white = (_Sc <= 30) & (_Vc >= 180)
+                                _pink = (
+                                    (((_Hc >= 0) & (_Hc <= 30))
+                                     | ((_Hc >= 150) & (_Hc <= 179)))
+                                    & ((_Sc >= 20) & (_Sc <= 100))
+                                    & (_Vc >= 130)
+                                )
+                                _blossom_pix = _white | _pink
+                            except Exception:
+                                _hsv = None
+                                _blossom_pix = None
+                            keep_soft = np.ones(n, dtype=bool)
+                            soft_scores_log: list[float] = []
+                            for si in range(n):
+                                mb = masks_np[si].astype(bool)
+                                if mb.ndim == 3:
+                                    mb = mb.any(axis=0)
+                                sam_s = (
+                                    float(scores_np[si])
+                                    if scores_np is not None and si < len(scores_np)
+                                    else 1.0
+                                )
+                                soft, _comps = compute_flower_soft_score(
+                                    mb, sam_s,
+                                    rgb_arr, _hsv if _hsv is not None else rgb_arr,
+                                    _blossom_pix,
+                                    depth_mm, ndvi_arr,
+                                    circ_center=args.flower_soft_circ_center,
+                                    circ_softness=args.flower_soft_circ_softness,
+                                    density_center=args.flower_soft_density_center,
+                                    density_softness=args.flower_soft_density_softness,
+                                    aspect_max=args.flower_soft_aspect_max,
+                                    aspect_softness=args.flower_soft_aspect_softness,
+                                    color_frac_center=args.flower_soft_color_center,
+                                    color_frac_softness=args.flower_soft_color_softness,
+                                    ring_px=args.flower_context_ring_px,
+                                    depth_min_mm=args.flower_depth_min_mm,
+                                    depth_max_mm=args.flower_depth_max_mm,
+                                    surr_min_canopy_frac=args.flower_context_min_canopy_frac,
+                                    match_tol_mm=args.flower_context_depth_tol_mm,
+                                    petal_ndvi_mean=args.flower_petal_ndvi_mean,
+                                    petal_ndvi_std=args.flower_petal_ndvi_std,
+                                    canopy_ndvi_min=args.flower_canopy_ndvi_min,
+                                    canopy_ndvi_softness=args.flower_canopy_ndvi_softness,
+                                    w_sam=args.flower_soft_w_sam,
+                                    w_shape=args.flower_soft_w_shape,
+                                    w_color=args.flower_soft_w_color,
+                                    w_depth=args.flower_soft_w_depth,
+                                    w_ndvi=args.flower_soft_w_ndvi,
+                                )
+                                soft_scores_log.append(soft)
+                                if soft < args.flower_min_soft_score:
+                                    keep_soft[si] = False
+                            if not keep_soft.all():
+                                rt_key = (day, category, session, prompt)
+                                rt = rejection_totals.setdefault(rt_key, {})
+                                rt["soft_score"] = (
+                                    rt.get("soft_score", 0)
+                                    + int((~keep_soft).sum())
+                                )
+                                masks_np = masks_np[keep_soft]
+                                if scores_np is not None:
+                                    scores_np = scores_np[keep_soft]
+                                if boxes_np is not None:
+                                    boxes_np = boxes_np[keep_soft]
+                                n = int(keep_soft.sum())
                         keep, diag, areas_in = flower_quality_keep(
                             masks_np,
                             args.flower_min_area_px, args.flower_max_area_px,
