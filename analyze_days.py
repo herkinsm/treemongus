@@ -1057,36 +1057,101 @@ def zone_count_csv_keys(n_cols: int = 2, n_rows: int = 5) -> list[str]:
     return keys
 
 
+# Distinct, high-contrast color per rejection stage. RGB tuples.
+# Order roughly matches the filter chain. Anything not listed falls
+# back to grey so the user can spot novel stages.
+_DEBUG_STAGE_COLORS: dict[str, tuple[int, int, int]] = {
+    # Geometric / dataset-level
+    "near_field":       (255, 165,   0),   # orange
+    "depth_spread":     (255,  99,  71),   # tomato
+    "depth_row_corr":   (220,  20,  60),   # crimson
+    "on_smooth_plane":  (139,   0,   0),   # dark red
+    "prgb_roi":         (255, 215,   0),   # gold
+    "tree_mask":        (160,  82,  45),   # sienna
+    # Refinement
+    "refine_empty":     (105, 105, 105),   # dim grey
+    "refine_min_area":  (255,   0,   0),   # red
+    "refine_aspect":    (148,   0, 211),   # dark violet
+    "refine_other":     (128, 128, 128),   # grey
+    # Post-refinement
+    "prgb_centroid":    (255, 140,   0),   # dark orange
+    "sky_depth":        ( 65, 105, 225),   # royal blue
+    "soft_score":       (138,  43, 226),   # blue violet
+    "flower_quality":   (199,  21, 133),   # medium violet red
+}
+_DEBUG_KEPT_COLOR = (255, 105, 180)        # hot pink
+_DEBUG_KEPT_OUTLINE = (50, 205,  50)       # lime green
+_DEBUG_FALLBACK_COLOR = (180, 180, 180)
+
+
+def _stage_color(stage: str) -> tuple[int, int, int]:
+    return _DEBUG_STAGE_COLORS.get(stage, _DEBUG_FALLBACK_COLOR)
+
+
 def _render_debug_overlay(
     img: "Image.Image", orig_masks: np.ndarray,
     rejected_by: dict[int, str], kept_set: set[int],
     out_path: Path, title: str,
     roi_mask: np.ndarray | None = None,
+    upscale: int = 2,
 ) -> None:
-    """Save a debug JPG of every PRE-filter SAM mask, color-coded by
-    outcome.
+    """Save a debug JPG of every PRE-filter SAM mask, with a side
+    legend so the image is actually readable.
 
-    - kept (in `kept_set`): pink translucent fill, green outline.
-    - rejected: red outline only, with the rejection-stage text label
-      drawn just above the mask centroid.
+    Layout:
+      [ image, upscaled 2x ] [ legend column ]
 
-    The masks are drawn over the original RGB image. Saves as JPEG at
-    quality 85. No matplotlib title (we render the title as overlaid
-    text so the saved image is the actual size of the source).
+    Image:
+      - kept masks: pink translucent fill, lime outline.
+      - rejected masks: stage-specific colored outline + a small
+        numbered tag at the centroid (the original SAM index).
+
+    Legend column (right):
+      - Title line.
+      - For each rejection stage that fired: colored swatch, stage
+        name, count (e.g. "(3)").
+      - "kept" entry with its own color and count.
+      - One line per rejected mask: "#idx stage" so you can find a
+        specific detection by number on the image.
+
+    Upscales the source image 2x before drawing so labels fit.
     """
     import cv2 as _cv2_dbg
     base = np.asarray(img.convert("RGB")).copy()
     h, w = base.shape[:2]
+    if upscale != 1:
+        base = _cv2_dbg.resize(
+            base, (w * upscale, h * upscale),
+            interpolation=_cv2_dbg.INTER_NEAREST,
+        )
     overlay_img = base.copy()
+    H, W = overlay_img.shape[:2]
     # Tint the ROI faintly so the user can see context.
     if roi_mask is not None and roi_mask.shape[:2] == (h, w):
+        roi_up = (
+            _cv2_dbg.resize(
+                roi_mask.astype(np.uint8),
+                (W, H),
+                interpolation=_cv2_dbg.INTER_NEAREST,
+            ).astype(bool)
+        )
         tint = overlay_img.copy()
-        tint[roi_mask] = (
-            tint[roi_mask] * 0.85 + np.array([255, 255, 0]) * 0.15
+        tint[roi_up] = (
+            tint[roi_up] * 0.88 + np.array([255, 255, 0]) * 0.12
         ).astype(np.uint8)
         overlay_img = tint
-    # Pink fill for kept masks (alpha-blended).
-    for orig_i in kept_set:
+
+    def _upscale_mask(m: np.ndarray) -> np.ndarray:
+        if upscale == 1:
+            return m
+        return _cv2_dbg.resize(
+            m.astype(np.uint8),
+            (W, H),
+            interpolation=_cv2_dbg.INTER_NEAREST,
+        ).astype(bool)
+
+    # Pink fill for kept masks (alpha-blended), lime outline.
+    for orig_i in sorted(kept_set):
         if orig_i >= len(orig_masks):
             continue
         m = orig_masks[int(orig_i)].astype(bool)
@@ -1094,22 +1159,32 @@ def _render_debug_overlay(
             m = m.any(axis=0)
         if not m.any():
             continue
-        # Pink fill at 35% alpha.
+        m_up = _upscale_mask(m)
         fill = overlay_img.copy()
-        fill[m] = (
-            fill[m] * 0.65
-            + np.array([255, 105, 180]) * 0.35
+        fill[m_up] = (
+            fill[m_up] * 0.55
+            + np.array(_DEBUG_KEPT_COLOR) * 0.45
         ).astype(np.uint8)
         overlay_img = fill
-        # Green outline.
         contours, _ = _cv2_dbg.findContours(
-            m.astype(np.uint8),
+            m_up.astype(np.uint8),
             _cv2_dbg.RETR_EXTERNAL,
             _cv2_dbg.CHAIN_APPROX_SIMPLE,
         )
-        _cv2_dbg.drawContours(overlay_img, contours, -1, (0, 200, 0), 1)
-    # Red outline + label for rejected masks.
-    for orig_i, reason in rejected_by.items():
+        _cv2_dbg.drawContours(
+            overlay_img, contours, -1, _DEBUG_KEPT_OUTLINE, 2,
+        )
+        ys_k, xs_k = np.where(m_up)
+        cy_k = int(ys_k.mean())
+        cx_k = int(xs_k.mean())
+        _draw_index_tag(
+            overlay_img, cx_k, cy_k, str(int(orig_i)),
+            _DEBUG_KEPT_OUTLINE,
+        )
+
+    # Stage-colored outline + numbered tag for rejected masks.
+    for orig_i in sorted(rejected_by.keys()):
+        reason = rejected_by[orig_i]
         if orig_i >= len(orig_masks):
             continue
         m = orig_masks[int(orig_i)].astype(bool)
@@ -1117,39 +1192,151 @@ def _render_debug_overlay(
             m = m.any(axis=0)
         if not m.any():
             continue
+        m_up = _upscale_mask(m)
+        color = _stage_color(reason)
         contours, _ = _cv2_dbg.findContours(
-            m.astype(np.uint8),
+            m_up.astype(np.uint8),
             _cv2_dbg.RETR_EXTERNAL,
             _cv2_dbg.CHAIN_APPROX_SIMPLE,
         )
-        _cv2_dbg.drawContours(overlay_img, contours, -1, (220, 30, 30), 1)
-        ys_d, xs_d = np.where(m)
-        cx = int(xs_d.mean())
+        _cv2_dbg.drawContours(overlay_img, contours, -1, color, 2)
+        ys_d, xs_d = np.where(m_up)
         cy = int(ys_d.mean())
-        # Label slightly above the centroid; clip to frame.
-        label_y = max(12, cy - 6)
-        label_x = max(2, min(w - 80, cx - 40))
-        _cv2_dbg.putText(
-            overlay_img, reason, (label_x, label_y),
-            _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.35, (220, 30, 30), 1,
-            _cv2_dbg.LINE_AA,
-        )
-    # Title bar at the top.
-    bar_h = 20
-    titled = np.zeros((h + bar_h, w, 3), dtype=np.uint8)
+        cx = int(xs_d.mean())
+        _draw_index_tag(overlay_img, cx, cy, str(int(orig_i)), color)
+
+    # Title bar across the top of the image panel.
+    bar_h = 28
+    titled = np.zeros((H + bar_h, W, 3), dtype=np.uint8)
     titled[bar_h:] = overlay_img
     titled[:bar_h] = (30, 30, 30)
     _cv2_dbg.putText(
-        titled, title[:90], (4, bar_h - 6),
-        _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 240), 1,
+        titled, title[:120], (6, bar_h - 8),
+        _cv2_dbg.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1,
         _cv2_dbg.LINE_AA,
     )
-    # cv2 expects BGR.
-    bgr = _cv2_dbg.cvtColor(titled, _cv2_dbg.COLOR_RGB2BGR)
+
+    # Build the legend column.
+    legend = _build_legend_panel(
+        rejected_by, kept_set, total_h=titled.shape[0],
+    )
+    full = np.concatenate([titled, legend], axis=1)
+    bgr = _cv2_dbg.cvtColor(full, _cv2_dbg.COLOR_RGB2BGR)
     _cv2_dbg.imwrite(
         str(out_path), bgr,
-        [int(_cv2_dbg.IMWRITE_JPEG_QUALITY), 85],
+        [int(_cv2_dbg.IMWRITE_JPEG_QUALITY), 88],
     )
+
+
+def _draw_index_tag(
+    img_rgb: np.ndarray, cx: int, cy: int, label: str,
+    color: tuple[int, int, int],
+) -> None:
+    """Draw a small filled box with a number inside, centered at
+    (cx, cy). Used to label both kept and rejected detections so
+    you can cross-reference with the legend column."""
+    import cv2 as _cv2_t
+    h, w = img_rgb.shape[:2]
+    tw = 10 + 7 * len(label)
+    th = 16
+    x0 = max(0, min(w - tw, cx - tw // 2))
+    y0 = max(0, min(h - th, cy - th // 2))
+    # Filled box with black text for legibility against any color.
+    _cv2_t.rectangle(
+        img_rgb, (x0, y0), (x0 + tw, y0 + th), color, thickness=-1,
+    )
+    _cv2_t.rectangle(
+        img_rgb, (x0, y0), (x0 + tw, y0 + th), (0, 0, 0), thickness=1,
+    )
+    _cv2_t.putText(
+        img_rgb, label, (x0 + 4, y0 + th - 4),
+        _cv2_t.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, _cv2_t.LINE_AA,
+    )
+
+
+def _build_legend_panel(
+    rejected_by: dict[int, str],
+    kept_set: set[int],
+    total_h: int,
+    width: int = 280,
+) -> np.ndarray:
+    """Right-side legend column for the debug overlay. Top half =
+    stage swatch + count summary; bottom half = per-mask listing
+    so you can find any numbered detection in the image and read
+    its rejection reason."""
+    import cv2 as _cv2_l
+    panel = np.full((total_h, width, 3), 245, dtype=np.uint8)
+    # Header.
+    _cv2_l.rectangle(panel, (0, 0), (width, 28), (30, 30, 30), -1)
+    _cv2_l.putText(
+        panel, "Legend (stage : count)", (6, 20),
+        _cv2_l.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1,
+        _cv2_l.LINE_AA,
+    )
+    y = 38
+    # Stage counts (descending).
+    counts: dict[str, int] = {}
+    for orig_i, stage in rejected_by.items():
+        counts[stage] = counts.get(stage, 0) + 1
+    # Always show "kept" first, in green.
+    items: list[tuple[str, int, tuple[int, int, int]]] = [
+        ("kept", len(kept_set), _DEBUG_KEPT_OUTLINE),
+    ]
+    for stage, c in sorted(counts.items(), key=lambda x: -x[1]):
+        items.append((stage, c, _stage_color(stage)))
+    for stage, c, color in items:
+        # Color swatch.
+        _cv2_l.rectangle(
+            panel, (8, y - 11), (24, y + 3), color, -1,
+        )
+        _cv2_l.rectangle(
+            panel, (8, y - 11), (24, y + 3), (0, 0, 0), 1,
+        )
+        _cv2_l.putText(
+            panel, f"{stage}: {c}", (32, y),
+            _cv2_l.FONT_HERSHEY_SIMPLEX, 0.43, (20, 20, 20), 1,
+            _cv2_l.LINE_AA,
+        )
+        y += 17
+        if y > total_h - 100:
+            break
+    # Divider.
+    y += 6
+    _cv2_l.line(panel, (4, y), (width - 4, y), (180, 180, 180), 1)
+    y += 14
+    _cv2_l.putText(
+        panel, "Per-mask (#idx stage)", (6, y),
+        _cv2_l.FONT_HERSHEY_SIMPLEX, 0.42, (60, 60, 60), 1,
+        _cv2_l.LINE_AA,
+    )
+    y += 14
+    # Sort kept first by index, then rejected by index.
+    rows: list[tuple[int, str, tuple[int, int, int]]] = []
+    for orig_i in sorted(kept_set):
+        rows.append((int(orig_i), "kept", _DEBUG_KEPT_OUTLINE))
+    for orig_i in sorted(rejected_by.keys()):
+        rows.append(
+            (int(orig_i), rejected_by[orig_i],
+             _stage_color(rejected_by[orig_i])),
+        )
+    for orig_i, stage, color in rows:
+        if y > total_h - 12:
+            _cv2_l.putText(
+                panel, "...", (8, y),
+                _cv2_l.FONT_HERSHEY_SIMPLEX, 0.4, (60, 60, 60), 1,
+                _cv2_l.LINE_AA,
+            )
+            break
+        _cv2_l.rectangle(
+            panel, (6, y - 10), (18, y + 2), color, -1,
+        )
+        _cv2_l.putText(
+            panel, f"#{orig_i} {stage}", (24, y),
+            _cv2_l.FONT_HERSHEY_SIMPLEX, 0.4, (20, 20, 20), 1,
+            _cv2_l.LINE_AA,
+        )
+        y += 14
+    return panel
 
 
 def load_depth_mm(depth_path: Path, target_hw: tuple[int, int]) -> np.ndarray | None:
@@ -1806,6 +1993,14 @@ def main():
                          "(default 5000 = 5 m). Pixels above are treated as "
                          "background (distant trees, buildings, sky max-range "
                          "value).")
+    ap.add_argument("--flower-refine-min-area-px", type=int, default=40,
+                    help="After HSV-refining a SAM flower mask to its "
+                         "blossom-color subset, drop the mask if the "
+                         "refined area is below this many pixels. Was "
+                         "hardcoded at 80; lowering catches small/distant "
+                         "blossoms at the cost of more glints. The soft-"
+                         "score gate downstream is the primary glint "
+                         "rejector; this just removes extreme-tiny noise.")
     # ---- Soft-score (continuous quality) flower gate. -----------------
     # Combines SAM 3 confidence, shape, color, contextual depth, and NDVI
     # into a single [0,1] score via weighted geometric mean. Replaces
@@ -2696,7 +2891,7 @@ def main():
                                     # spots and leaf glints sit in
                                     # the 15-50 px range. Real
                                     # blossoms refine to 80-300+ px.
-                                    if refined_area < 80:
+                                    if refined_area < args.flower_refine_min_area_px:
                                         refine_reject[mi] = "refine_min_area"
                                         continue
                                     # Aspect ratio on the refined
