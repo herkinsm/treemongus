@@ -2331,6 +2331,29 @@ def main():
             f"{_move_err!r} — continuing with default placement.",
             file=sys.stderr,
         )
+    # CPU bfloat16/float32 mismatch fix. SAM 3's inference paths are
+    # decorated with @torch.autocast(device_type="cuda", dtype=bfloat16);
+    # on GPU autocast unifies tensor dtypes inside that scope, but on
+    # CPU autocast is disabled (you'll see the
+    # "CUDA is not available ... Disabling autocast" UserWarning at
+    # import time) and any bfloat16 weights or buffers in the model
+    # collide with float32 inputs:
+    #     RuntimeError: mat1 and mat2 must have the same dtype,
+    #                   but got BFloat16 and Float
+    # Cast the entire model to float32 on CPU. SAME numerical results
+    # at slightly higher memory + slightly slower throughput, but
+    # bfloat16 matmul on CPU is software-emulated and slow anyway, so
+    # float32 is usually FASTER on CPU.
+    if args.device == "cpu":
+        try:
+            model = model.float()
+        except Exception as _cast_err:
+            print(
+                f"[warn] could not cast SAM 3 model to float32 on "
+                f"CPU: {_cast_err!r} — bfloat16/float32 mismatch may "
+                f"crash inference.",
+                file=sys.stderr,
+            )
     processor = Sam3Processor(model, confidence_threshold=args.threshold)
 
     csv_path = out_dir / "results.csv"
