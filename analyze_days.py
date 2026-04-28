@@ -1796,6 +1796,14 @@ def main():
                                 # the mask before accepting it as a
                                 # flower.
                                 MIN_PINK_PIXELS = 8
+                                # Pink FRACTION: real blossoms are
+                                # 15-50% pink pixels by mask area
+                                # (the rest is white petal). Glint
+                                # masks are 95-100% pure white with
+                                # at most a few incidental pink
+                                # neighbours, so their pink fraction
+                                # is < 5%. 0.10 cleanly separates.
+                                MIN_PINK_FRACTION = 0.10
                                 # Refine each mask: keep ONLY the
                                 # blossom-color intersection. Drop
                                 # masks whose refined area is below
@@ -1846,6 +1854,12 @@ def main():
                                         (m_orig & pink_mask).sum()
                                     )
                                     if pink_in_mask < MIN_PINK_PIXELS:
+                                        continue
+                                    refined_total = int(m_ref_raw.sum())
+                                    if refined_total > 0 and (
+                                        pink_in_mask / refined_total
+                                        < MIN_PINK_FRACTION
+                                    ):
                                         continue
                                     m_ref = _cv2.dilate(
                                         m_ref_raw.astype(np.uint8),
