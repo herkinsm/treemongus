@@ -1784,28 +1784,31 @@ def main():
                                     & ((Sc >= 20) & (Sc <= 100))
                                     & (Vc >= 130)
                                 )
-                                blossom_pix = white_mask | pink_mask
-                                # Pink-content gate: real apple
-                                # blossoms have pink stamens / petal
-                                # bases / veins, even when mostly
-                                # white. Pure-white reflections
-                                # (leaf glints, branch highlights,
-                                # specular edges) are 100% white,
-                                # 0% pink. Require at least
-                                # MIN_PINK_PIXELS of actual pink in
-                                # the mask before accepting it as a
-                                # flower.
-                                MIN_PINK_PIXELS = 5
-                                # Pink FRACTION: white-dominated
-                                # apple blossoms (most petals + small
-                                # pink stamens) sit at 5-20% pink;
-                                # pink-dominated cultivars at
-                                # 30-50%. Pure-white glints with one
-                                # or two incidental pink neighbours
-                                # < 3%. 0.05 keeps the white-
-                                # dominated case while still
-                                # rejecting glints.
-                                MIN_PINK_FRACTION = 0.05
+                                # Yellow / orange anther stamens.
+                                # Most apple cultivars (Gala,
+                                # Honeycrisp, Goldrush, etc.) have
+                                # white petals with bright yellow
+                                # stamens in the center. The yellow
+                                # has H ~20-35 (OpenCV scale,
+                                # corresponds to true 40-70 deg)
+                                # and is highly saturated.
+                                yellow_mask = (
+                                    ((Hc >= 18) & (Hc <= 35))
+                                    & (Sc >= 60)
+                                    & (Vc >= 130)
+                                )
+                                blossom_pix = white_mask | pink_mask | yellow_mask
+                                # NO pink-content gate -- most apple
+                                # cultivars produce nearly pure-
+                                # white blossoms (Gala, Honeycrisp,
+                                # Goldrush, etc.) with only 1-3 px
+                                # of visible pink at our resolution.
+                                # Requiring pink content was killing
+                                # the most common bloom type. Glints
+                                # are still rejected by the shape
+                                # gates downstream (circularity,
+                                # density, aspect ratio, min refined
+                                # area).
                                 # Refine each mask: keep ONLY the
                                 # blossom-color intersection. Drop
                                 # masks whose refined area is below
