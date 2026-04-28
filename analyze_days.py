@@ -1785,6 +1785,17 @@ def main():
                                     & (Vc >= 110)
                                 )
                                 blossom_pix = white_mask | pink_mask
+                                # Pink-content gate: real apple
+                                # blossoms have pink stamens / petal
+                                # bases / veins, even when mostly
+                                # white. Pure-white reflections
+                                # (leaf glints, branch highlights,
+                                # specular edges) are 100% white,
+                                # 0% pink. Require at least
+                                # MIN_PINK_PIXELS of actual pink in
+                                # the mask before accepting it as a
+                                # flower.
+                                MIN_PINK_PIXELS = 3
                                 # Refine each mask: keep ONLY the
                                 # blossom-color intersection. Drop
                                 # masks whose refined area is below
@@ -1825,6 +1836,16 @@ def main():
                                         continue
                                     m_ref_raw = m_orig & blossom_pix
                                     if int(m_ref_raw.sum()) < 20:
+                                        continue
+                                    # Require some PINK content,
+                                    # not just white. Glints /
+                                    # specular highlights are pure
+                                    # white; real blossoms always
+                                    # have a few pink pixels.
+                                    pink_in_mask = int(
+                                        (m_orig & pink_mask).sum()
+                                    )
+                                    if pink_in_mask < MIN_PINK_PIXELS:
                                         continue
                                     m_ref = _cv2.dilate(
                                         m_ref_raw.astype(np.uint8),
