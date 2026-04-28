@@ -1844,12 +1844,23 @@ def main():
                                             and (long_ / short) > MAX_ASPECT_RATIO):
                                         continue
                                     m_ref_raw = m_orig & blossom_pix
-                                    # 35 px minimum: leaf glints are
-                                    # typically 10-25 px. A real
-                                    # blossom (even a small distant
-                                    # one) is 35-300+ px after
-                                    # refinement.
-                                    if int(m_ref_raw.sum()) < 35:
+                                    # 80 px minimum: trunk specular
+                                    # spots and leaf glints sit in
+                                    # the 15-50 px range -- they're
+                                    # small bright reflections, not
+                                    # real petal masses. Real apple
+                                    # blossoms in-frame are 60-300+
+                                    # px after refinement (a single
+                                    # petal cluster spans ~7 cm at
+                                    # the canopy depth, ~80 px). 80
+                                    # cuts above the glint
+                                    # distribution and below the
+                                    # blossom one. The shape filters
+                                    # alone couldn't discriminate
+                                    # because both shapes are
+                                    # blob-like; size is the only
+                                    # clean separator.
+                                    if int(m_ref_raw.sum()) < 80:
                                         continue
                                     # Require some PINK content,
                                     # not just white. Glints /
