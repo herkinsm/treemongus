@@ -1771,23 +1771,44 @@ def main():
                                     & (Vc >= 100)
                                 )
                                 blossom_pix = white_mask | pink_mask
-                                # Refine each mask: keep only the
-                                # intersection with blossom_pix.
-                                # If the intersection is empty, keep
-                                # the original mask (filter chain
-                                # below will reject it via the
-                                # min_area / blossom_color_frac gate).
-                                refined = []
+                                # Refine each mask: keep ONLY the
+                                # blossom-color intersection. Drop
+                                # masks whose refined area is too
+                                # small (likely branches / leaves
+                                # with a stray pink pixel rather
+                                # than real flowers). Pre-filter
+                                # threshold is generous (>= 4 px)
+                                # so genuine small blooms still pass.
+                                refined: list[np.ndarray] = []
+                                keep_idx: list[int] = []
                                 for mi in range(masks_np.shape[0]):
                                     m_orig = masks_np[mi].astype(bool)
                                     m_ref = m_orig & blossom_pix
-                                    if int(m_ref.sum()) >= int(
-                                            args.flower_min_area_px
-                                    ):
+                                    if int(m_ref.sum()) >= 4:
                                         refined.append(m_ref)
-                                    else:
-                                        refined.append(m_orig)
-                                masks_np = np.stack(refined, axis=0)
+                                        keep_idx.append(mi)
+                                if refined:
+                                    masks_np = np.stack(refined, axis=0)
+                                    keep_arr = np.asarray(keep_idx, dtype=int)
+                                    if scores_np is not None:
+                                        scores_np = scores_np[keep_arr]
+                                    if boxes_np is not None:
+                                        boxes_np = boxes_np[keep_arr]
+                                    n = int(masks_np.shape[0])
+                                else:
+                                    # All SAM masks lacked enough
+                                    # blossom-color content -- skip
+                                    # the rest of the per-prompt
+                                    # processing for this frame.
+                                    masks_np = np.zeros(
+                                        (0, *masks_np.shape[1:]),
+                                        dtype=bool,
+                                    )
+                                    if scores_np is not None:
+                                        scores_np = scores_np[:0]
+                                    if boxes_np is not None:
+                                        boxes_np = boxes_np[:0]
+                                    n = 0
                             except Exception:
                                 pass
                         keep, diag, areas_in = flower_quality_keep(
