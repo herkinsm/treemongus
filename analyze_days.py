@@ -43,13 +43,34 @@ def _is_cuda_device_arg(d):
     return False
 
 
+def _is_bfloat16_dtype(d):
+    """Detect bfloat16 dtype passed as kwarg or positional arg."""
+    if d is None:
+        return False
+    try:
+        if d is torch.bfloat16:
+            return True
+    except Exception:
+        pass
+    if isinstance(d, str) and d == "bfloat16":
+        return True
+    return False
+
+
 if not torch.cuda.is_available():
     # 1. Tensor *creators*: torch.zeros, torch.ones, etc. that take a
-    #    `device=` kwarg. Remap cuda -> cpu.
+    #    `device=` kwarg. Remap cuda -> cpu AND bfloat16 -> float32.
+    #    Bfloat16 on CPU is software-emulated; it also collides with
+    #    the float32 model inputs we use, causing
+    #      `mat1 and mat2 must have the same dtype, but got
+    #       BFloat16 and Float`
+    #    inside SAM 3's forward.
     def _make_cpu_fallback(orig):
         def _patched(*args, **kwargs):
             if _is_cuda_device_arg(kwargs.get("device")):
                 kwargs["device"] = "cpu"
+            if _is_bfloat16_dtype(kwargs.get("dtype")):
+                kwargs["dtype"] = torch.float32
             return orig(*args, **kwargs)
         return _patched
     for _fn_name in (
@@ -69,28 +90,63 @@ if not torch.cuda.is_available():
     torch.Tensor.cuda = lambda self, *args, **kwargs: self
     torch.nn.Module.cuda = lambda self, *args, **kwargs: self
 
+    # 2b. .bfloat16() method on Tensor / nn.Module: remap to float32
+    #     on CPU. SAM 3 has hardcoded `.bfloat16()` calls that put
+    #     activations into bfloat16; on CPU those collide with our
+    #     float32 weights/inputs and matmul fails.
+    torch.Tensor.bfloat16 = lambda self, *args, **kwargs: self.float()
+    torch.nn.Module.bfloat16 = lambda self, *args, **kwargs: self.float()
+
     # 3. .to() method: when called with a cuda device (positional or
-    #    kw), substitute cpu. Preserve dtype-only calls (.to(torch.float32))
+    #    kw), substitute cpu. When called with bfloat16 dtype, sub
+    #    float32. Preserve dtype-only calls (.to(torch.float32))
     #    and other forms unchanged.
     _orig_tensor_to = torch.Tensor.to
 
     def _tensor_to_patched(self, *args, **kwargs):
-        if args and _is_cuda_device_arg(args[0]):
-            args = ("cpu",) + tuple(args[1:])
+        new_args = list(args)
+        if new_args and _is_cuda_device_arg(new_args[0]):
+            new_args[0] = "cpu"
+        # Positional dtype: torch.Tensor.to(dtype) form.
+        if new_args and _is_bfloat16_dtype(new_args[0]):
+            new_args[0] = torch.float32
         if _is_cuda_device_arg(kwargs.get("device")):
             kwargs["device"] = "cpu"
-        return _orig_tensor_to(self, *args, **kwargs)
+        if _is_bfloat16_dtype(kwargs.get("dtype")):
+            kwargs["dtype"] = torch.float32
+        return _orig_tensor_to(self, *new_args, **kwargs)
     torch.Tensor.to = _tensor_to_patched
 
     _orig_module_to = torch.nn.Module.to
 
     def _module_to_patched(self, *args, **kwargs):
-        if args and _is_cuda_device_arg(args[0]):
-            args = ("cpu",) + tuple(args[1:])
+        new_args = list(args)
+        if new_args and _is_cuda_device_arg(new_args[0]):
+            new_args[0] = "cpu"
+        if new_args and _is_bfloat16_dtype(new_args[0]):
+            new_args[0] = torch.float32
         if _is_cuda_device_arg(kwargs.get("device")):
             kwargs["device"] = "cpu"
-        return _orig_module_to(self, *args, **kwargs)
+        if _is_bfloat16_dtype(kwargs.get("dtype")):
+            kwargs["dtype"] = torch.float32
+        return _orig_module_to(self, *new_args, **kwargs)
     torch.nn.Module.to = _module_to_patched
+
+    # 3b. autocast context manager: SAM 3 decorates inference methods
+    #     with @torch.autocast(device_type="cuda", dtype=bfloat16).
+    #     On CPU PyTorch emits a UserWarning and the context is a
+    #     no-op for activations -- but the dtype kwarg can still
+    #     propagate via subclassing. Force-disable autocast entirely
+    #     on CPU so no decorated method tries to coerce activations
+    #     into bfloat16 mid-forward.
+    _orig_autocast_init = torch.amp.autocast_mode.autocast.__init__
+
+    def _autocast_init_patched(self, *args, **kwargs):
+        # Force enabled=False; preserve other args so the call shape
+        # stays compatible.
+        kwargs["enabled"] = False
+        return _orig_autocast_init(self, *args, **kwargs)
+    torch.amp.autocast_mode.autocast.__init__ = _autocast_init_patched
 
     # 4. torch.cuda.* utility functions that some libraries call
     #    unconditionally for memory mgmt / sync / device queries.
