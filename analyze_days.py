@@ -1810,7 +1810,7 @@ def main():
                                 # roughly square (aspect 1-2x);
                                 # branches / twigs come back at 4:1
                                 # or more.
-                                MAX_ASPECT_RATIO = 3.0
+                                MAX_ASPECT_RATIO = 2.0
                                 for mi in range(masks_np.shape[0]):
                                     m_orig = masks_np[mi].astype(bool)
                                     if not m_orig.any():
