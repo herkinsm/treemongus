@@ -91,6 +91,34 @@ if not torch.cuda.is_available():
         return _orig_module_to(self, *args, **kwargs)
     torch.nn.Module.to = _module_to_patched
 
+    # 4. torch.cuda.* utility functions that some libraries call
+    #    unconditionally for memory mgmt / sync / device queries.
+    #    On a CPU-only node `torch.cuda.current_device()` and
+    #    `synchronize()` raise the same "No CUDA GPUs are available"
+    #    error mid-inference. Stub them to harmless no-ops or sane
+    #    fallback values.
+    def _noop(*args, **kwargs):
+        return None
+
+    def _zero(*args, **kwargs):
+        return 0
+
+    for _cuda_fn, _stub in (
+        ("synchronize", _noop),
+        ("empty_cache", _noop),
+        ("set_device", _noop),
+        ("current_device", _zero),
+        ("device_count", _zero),
+        ("ipc_collect", _noop),
+        ("reset_peak_memory_stats", _noop),
+        ("reset_max_memory_allocated", _noop),
+    ):
+        if hasattr(torch.cuda, _cuda_fn):
+            try:
+                setattr(torch.cuda, _cuda_fn, _stub)
+            except Exception:
+                pass
+
 import sam3
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
