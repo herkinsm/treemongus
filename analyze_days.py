@@ -854,15 +854,15 @@ def flower_quality_keep(masks_np: np.ndarray,
                          yellow_s_min: int = 80,
                          require_blossom_color: bool = False,
                          min_blossom_color_frac: float = 0.30,
-                         blossom_white_s_max: int = 50,
-                         blossom_white_v_min: int = 150,
+                         blossom_white_s_max: int = 20,
+                         blossom_white_v_min: int = 180,
                          blossom_pink_h_lo: int = 0,
                          blossom_pink_h_hi: int = 30,
                          blossom_pink_h_lo2: int = 150,
                          blossom_pink_h_hi2: int = 179,
-                         blossom_pink_s_lo: int = 10,
+                         blossom_pink_s_lo: int = 30,
                          blossom_pink_s_hi: int = 100,
-                         blossom_pink_v_min: int = 100,
+                         blossom_pink_v_min: int = 110,
                          max_bbox_area_px: int = 0,
                          min_mask_density: float = 0.0,
                          sam3_boxes: np.ndarray | None = None,
@@ -1760,31 +1760,40 @@ def main():
                                 Vc = hsv_full[..., 2]
                                 # HSV thresholds match
                                 # flower_quality_keep defaults.
+                                # Tightened to match the
+                                # flower_quality_keep defaults: real
+                                # blossom petals are nearly pure
+                                # white (S < 20) and bright (V > 180);
+                                # pink blossoms are saturated
+                                # (S >= 30). Glossy leaf highlights
+                                # (S 20-50) and brownish branch tips
+                                # (low-saturation red) no longer
+                                # qualify.
                                 white_mask = (
-                                    (Sc <= 50)
-                                    & (Vc >= 150)
+                                    (Sc <= 20)
+                                    & (Vc >= 180)
                                 )
                                 pink_mask = (
                                     (((Hc >= 0) & (Hc <= 30))
                                      | ((Hc >= 150) & (Hc <= 179)))
-                                    & ((Sc >= 10) & (Sc <= 100))
-                                    & (Vc >= 100)
+                                    & ((Sc >= 30) & (Sc <= 100))
+                                    & (Vc >= 110)
                                 )
                                 blossom_pix = white_mask | pink_mask
                                 # Refine each mask: keep ONLY the
                                 # blossom-color intersection. Drop
-                                # masks whose refined area is too
-                                # small (likely branches / leaves
-                                # with a stray pink pixel rather
-                                # than real flowers). Pre-filter
-                                # threshold is generous (>= 4 px)
-                                # so genuine small blooms still pass.
+                                # masks whose refined area is below
+                                # 20 px -- isolated leaf-glint /
+                                # branch-tip refinements rarely
+                                # exceed 15 px; real blossoms
+                                # (single-petal cluster: 30-300 px)
+                                # easily clear 20.
                                 refined: list[np.ndarray] = []
                                 keep_idx: list[int] = []
                                 for mi in range(masks_np.shape[0]):
                                     m_orig = masks_np[mi].astype(bool)
                                     m_ref = m_orig & blossom_pix
-                                    if int(m_ref.sum()) >= 4:
+                                    if int(m_ref.sum()) >= 20:
                                         refined.append(m_ref)
                                         keep_idx.append(mi)
                                 if refined:
