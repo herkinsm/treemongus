@@ -1375,6 +1375,19 @@ def main():
     # Let SAM 3 resolve its own BPE vocab via pkg_resources — the file ships
     # inside the package at sam3/assets/, not the repo's top-level assets/.
     model = build_sam3_image_model()
+    # SAM 3's build_sam3_image_model() defaults to GPU placement; on CPU-only
+    # nodes (login nodes, salloc without --gpus) the inference path then hits
+    # `RuntimeError: No CUDA GPUs are available` when a tensor is moved with
+    # an unconditional .cuda(). Explicit .to(device) keeps everything on the
+    # selected device.
+    try:
+        model = model.to(args.device)
+    except Exception as _move_err:
+        print(
+            f"[warn] could not move SAM 3 model to {args.device!r}: "
+            f"{_move_err!r} — continuing with default placement.",
+            file=sys.stderr,
+        )
     processor = Sam3Processor(model, confidence_threshold=args.threshold)
 
     csv_path = out_dir / "results.csv"
