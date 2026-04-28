@@ -22,22 +22,32 @@ import torch
 from PIL import Image
 
 # Compatibility shim for CPU-only nodes (login nodes, salloc / sbatch
-# without --gpus). SAM 3's source has hardcoded `device="cuda"` calls
-# (e.g. sam3/model/position_encoding.py:55:
-#   tensors = torch.zeros((1, 1) + size, device="cuda")
-# ) that fire during build_sam3_image_model() -- BEFORE we ever get a
-# chance to .to(device) the model. On a CPU node this raises
-# `RuntimeError: No CUDA GPUs are available` and the process dies
-# during model construction. Wrap torch's tensor creators so that, when
-# no GPU is visible, an explicit device="cuda" silently maps to "cpu".
-# No-op on a real GPU node (the wrapper is never installed).
+# without --gpus). SAM 3's source has hardcoded CUDA references
+# scattered across model build AND inference paths, e.g.
+#   sam3/model/position_encoding.py:55:
+#       tensors = torch.zeros((1, 1) + size, device="cuda")
+#   per-frame inference: tensor.cuda() and .to("cuda") method calls.
+# On a CPU node these raise `RuntimeError: No CUDA GPUs are available`.
+# Patching SAM 3's installed source is fragile; instead, when no GPU
+# is visible, intercept torch's tensor creators AND the .cuda() / .to()
+# methods on Tensor and nn.Module so explicit cuda placements transparently
+# map to cpu. No-op on a real GPU node (the wrapper is never installed).
+def _is_cuda_device_arg(d):
+    if d is None:
+        return False
+    if isinstance(d, str) and d.startswith("cuda"):
+        return True
+    if hasattr(d, "type") and getattr(d, "type", "") == "cuda":
+        return True
+    return False
+
+
 if not torch.cuda.is_available():
+    # 1. Tensor *creators*: torch.zeros, torch.ones, etc. that take a
+    #    `device=` kwarg. Remap cuda -> cpu.
     def _make_cpu_fallback(orig):
         def _patched(*args, **kwargs):
-            d = kwargs.get("device")
-            if d == "cuda" or (
-                hasattr(d, "type") and getattr(d, "type", "") == "cuda"
-            ):
+            if _is_cuda_device_arg(kwargs.get("device")):
                 kwargs["device"] = "cpu"
             return orig(*args, **kwargs)
         return _patched
@@ -51,6 +61,35 @@ if not torch.cuda.is_available():
                 torch, _fn_name,
                 _make_cpu_fallback(getattr(torch, _fn_name)),
             )
+
+    # 2. .cuda() method on Tensor / nn.Module: make it a no-op that
+    #    returns self. Inference paths often do `tensor.cuda()` to push
+    #    inputs to GPU; on CPU we want the tensor to stay where it is.
+    torch.Tensor.cuda = lambda self, *args, **kwargs: self
+    torch.nn.Module.cuda = lambda self, *args, **kwargs: self
+
+    # 3. .to() method: when called with a cuda device (positional or
+    #    kw), substitute cpu. Preserve dtype-only calls (.to(torch.float32))
+    #    and other forms unchanged.
+    _orig_tensor_to = torch.Tensor.to
+
+    def _tensor_to_patched(self, *args, **kwargs):
+        if args and _is_cuda_device_arg(args[0]):
+            args = ("cpu",) + tuple(args[1:])
+        if _is_cuda_device_arg(kwargs.get("device")):
+            kwargs["device"] = "cpu"
+        return _orig_tensor_to(self, *args, **kwargs)
+    torch.Tensor.to = _tensor_to_patched
+
+    _orig_module_to = torch.nn.Module.to
+
+    def _module_to_patched(self, *args, **kwargs):
+        if args and _is_cuda_device_arg(args[0]):
+            args = ("cpu",) + tuple(args[1:])
+        if _is_cuda_device_arg(kwargs.get("device")):
+            kwargs["device"] = "cpu"
+        return _orig_module_to(self, *args, **kwargs)
+    torch.nn.Module.to = _module_to_patched
 
 import sam3
 from sam3 import build_sam3_image_model
