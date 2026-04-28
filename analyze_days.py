@@ -854,13 +854,13 @@ def flower_quality_keep(masks_np: np.ndarray,
                          yellow_s_min: int = 80,
                          require_blossom_color: bool = False,
                          min_blossom_color_frac: float = 0.30,
-                         blossom_white_s_max: int = 20,
+                         blossom_white_s_max: int = 30,
                          blossom_white_v_min: int = 180,
                          blossom_pink_h_lo: int = 0,
                          blossom_pink_h_hi: int = 30,
                          blossom_pink_h_lo2: int = 150,
                          blossom_pink_h_hi2: int = 179,
-                         blossom_pink_s_lo: int = 30,
+                         blossom_pink_s_lo: int = 20,
                          blossom_pink_s_hi: int = 100,
                          blossom_pink_v_min: int = 110,
                          max_bbox_area_px: int = 0,
@@ -1769,14 +1769,19 @@ def main():
                                 # (S 20-50) and brownish branch tips
                                 # (low-saturation red) no longer
                                 # qualify.
+                                # Overlap the white & pink windows
+                                # at S ∈ [20, 30] so pale-pink petal
+                                # edges (which fall between near-
+                                # white and saturated-pink) are not
+                                # lost.
                                 white_mask = (
-                                    (Sc <= 20)
+                                    (Sc <= 30)
                                     & (Vc >= 180)
                                 )
                                 pink_mask = (
                                     (((Hc >= 0) & (Hc <= 30))
                                      | ((Hc >= 150) & (Hc <= 179)))
-                                    & ((Sc >= 30) & (Sc <= 100))
+                                    & ((Sc >= 20) & (Sc <= 100))
                                     & (Vc >= 110)
                                 )
                                 blossom_pix = white_mask | pink_mask
