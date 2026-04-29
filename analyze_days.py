@@ -253,17 +253,87 @@ def sample_indices(n: int, k: int | None) -> list[int]:
     return sorted(set(np.linspace(0, n - 1, num=k).round().astype(int).tolist()))
 
 
+def parse_frame_timestamp(path: Path) -> tuple[int, ...]:
+    """Parse the frame's wall-clock timestamp from its filename for
+    chronological sorting.
+
+    Filenames look like
+        2023-4-20-8-40-58-417-RGB-BP.bmp
+        ^   ^ ^  ^ ^  ^  ^   ^^^ ^^^
+        Y   M D  H M  S  MS
+
+    Plain alphabetical sort breaks here because the minute / second /
+    millisecond fields have variable width: '9-37-2-100' sorts AFTER
+    '9-37-12-100' lexicographically, but chronologically 9:37:02
+    comes before 9:37:12. We instead split on '-' and sort by the
+    numeric (Y, M, D, H, M, S, MS) tuple.
+
+    Returns a tuple of ints suitable for sorted() / min() / max().
+    Falls back to a tuple of zeros if parsing fails so the caller
+    can keep the file in the list rather than crashing."""
+    stem = path.stem
+    for suffix in ("-RGB-BP", "-RGB-bp", "-RGB", "-rgb"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    parts = stem.split("-")
+    out: list[int] = []
+    for p in parts[:7]:
+        try:
+            out.append(int(p))
+        except ValueError:
+            return (0,) * 7  # fallback: keep a stable position
+    while len(out) < 7:
+        out.append(0)
+    return tuple(out)
+
+
+def info_path_for(img_path: Path) -> Path:
+    """Given .../<session>/RGB/<stem>-RGB-BP.<ext>, return
+    .../<session>/Info/<stem>-Info.txt.
+
+    Mirrors depth_path_for / ir_path_for / prgb_path_for. The exact
+    extension may vary by capture rig; the caller should treat a
+    missing file as 'modality not present' (same as the other
+    modalities) rather than an error."""
+    session_dir = img_path.parent.parent
+    stem = img_path.stem
+    base = stem
+    for suffix in ("-RGB-BP", "-RGB-bp", "-RGB", "-rgb"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return session_dir / "Info" / f"{base}-Info.txt"
+
+
 def find_images(root: Path, only_rgb_folders: bool = True,
                 sample_per_session: int | None = None,
                 frame_range: tuple[int, int] | None = None,
-                require_all_modalities: bool = False):
+                require_all_modalities: bool = False,
+                require_info_modality: bool = False,
+                sample_mode: str = "sequential"):
     """Yield (day, category, session, image_path) tuples.
 
-    When require_all_modalities is True, the per-session image list is FIRST
-    filtered down to frames that have matching depth / IR / PRGB sibling
-    files, and THEN frame_range / sample_per_session is applied. This way
-    --frame-range 50 80 means "the 50th-80th *complete* frame" rather than
-    "the 50th-80th raw frame, of which some may get skipped later"."""
+    When require_all_modalities is True, the per-session image list
+    is FIRST filtered to frames that have matching depth / IR / PRGB
+    (and optionally Info) sibling files, and THEN frame_range /
+    sample_per_session is applied. This way --frame-range 50 80
+    means "the 50th-80th *complete* frame".
+
+    Sorting: frames are sorted by the parsed (Y, M, D, H, M, S, MS)
+    timestamp tuple from the filename, NOT alphabetically. Variable-
+    width seconds/milliseconds fields make alphabetical sort
+    chronologically wrong (e.g. '9-37-2-100' sorts after '9-37-12-100'
+    lexicographically).
+
+    sample_mode controls how `sample_per_session` picks frames:
+      "sequential" : the FIRST N complete frames of the session
+                     (chronological order). User-requested default.
+      "even"       : N frames evenly spaced across the session
+                     (the original behavior, kept for analyses
+                     that want temporal coverage).
+    frame_range overrides sample_per_session when supplied.
+    """
     root = Path(root)
     for day_dir in sorted(root.glob("2023 day *")):
         inner = day_dir / day_dir.name
@@ -278,18 +348,24 @@ def find_images(root: Path, only_rgb_folders: bool = True,
                 else:
                     search_dirs = [session_dir]
                 for sd in search_dirs:
-                    imgs = sorted(p for p in sd.iterdir() if p.suffix.lower() in IMAGE_EXTS)
+                    imgs = [p for p in sd.iterdir() if p.suffix.lower() in IMAGE_EXTS]
                     if not imgs:
                         continue
+                    # Chronological sort by parsed timestamp.
+                    imgs.sort(key=parse_frame_timestamp)
                     if require_all_modalities:
                         n_total = len(imgs)
-                        miss_d = miss_i = miss_p = 0
+                        miss_d = miss_i = miss_p = miss_info = 0
                         kept: list[Path] = []
                         for p in imgs:
                             ok_d = depth_path_for(p).is_file()
                             ok_i = ir_path_for(p).is_file()
                             ok_p = prgb_path_for(p).is_file()
-                            if ok_d and ok_i and ok_p:
+                            ok_info = (
+                                info_path_for(p).is_file()
+                                if require_info_modality else True
+                            )
+                            if ok_d and ok_i and ok_p and ok_info:
                                 kept.append(p)
                             else:
                                 if not ok_d:
@@ -298,11 +374,18 @@ def find_images(root: Path, only_rgb_folders: bool = True,
                                     miss_i += 1
                                 if not ok_p:
                                     miss_p += 1
+                                if require_info_modality and not ok_info:
+                                    miss_info += 1
                         imgs = kept
                         if len(imgs) < n_total:
+                            extra = (
+                                f" Info={miss_info}"
+                                if require_info_modality else ""
+                            )
                             print(f"[scan] {session_dir.name}: "
                                   f"{len(imgs)}/{n_total} complete frames "
-                                  f"(missing depth={miss_d} IR={miss_i} PRGB={miss_p})",
+                                  f"(missing depth={miss_d} IR={miss_i} "
+                                  f"PRGB={miss_p}{extra})",
                                   file=sys.stderr)
                         if not imgs:
                             continue
@@ -311,7 +394,17 @@ def find_images(root: Path, only_rgb_folders: bool = True,
                         a = max(0, a)
                         b = min(len(imgs), b)
                         idxs = list(range(a, b))
+                    elif sample_per_session is None or sample_per_session <= 0:
+                        idxs = list(range(len(imgs)))
+                    elif sample_mode == "sequential":
+                        # First N chronologically-ordered complete
+                        # frames. Matches the user's expectation of
+                        # "100 sequential frames per session".
+                        idxs = list(range(min(len(imgs), sample_per_session)))
                     else:
+                        # Legacy evenly-spaced sampling for analyses
+                        # that need representative coverage of the
+                        # whole session timeline.
                         idxs = sample_indices(len(imgs), sample_per_session)
                     for i in idxs:
                         yield day_dir.name, category_dir.name, session_dir.name, imgs[i]
@@ -1999,11 +2092,20 @@ def main():
                          "flower, leaf, fruitlet.")
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--sample-per-session", type=int, default=20,
-                    help="How many evenly-spaced frames to analyze per session "
-                         "(captures start/middle/end). Use 0 for all frames.")
+                    help="How many frames to analyze per session. With "
+                         "--sample-mode sequential (default), takes the FIRST "
+                         "N chronologically-ordered complete frames. With "
+                         "--sample-mode even, evenly spaces N across the "
+                         "whole session. Use 0 for all frames.")
+    ap.add_argument("--sample-mode", choices=("sequential", "even"),
+                    default="sequential",
+                    help="How --sample-per-session picks frames. 'sequential' "
+                         "= the first N (matches typical 'first 100 frames' "
+                         "intuition). 'even' = N evenly-spaced (good for "
+                         "characterizing a whole session timeline).")
     ap.add_argument("--frame-range", nargs=2, type=int, metavar=("START", "END"),
                     help="Process consecutive frames imgs[START:END] from each "
-                         "session instead of even sampling. Tracker-friendly "
+                         "session instead of sampling. Tracker-friendly "
                          "subset. Overrides --sample-per-session when set.")
     ap.add_argument("--max-images", type=int, default=None)
     ap.add_argument("--all-folders", action="store_true",
@@ -2012,6 +2114,10 @@ def main():
                     help="Skip any frame whose timestamp doesn't have matching "
                          "files in all four folders (RGB, depth, IR, PRGB). "
                          "Guarantees strict cross-modality alignment for the run.")
+    ap.add_argument("--require-info-modality", action="store_true",
+                    help="Also require an Info file (e.g. <stem>-Info.txt in "
+                         "<session>/Info/) alongside RGB/depth/IR/PRGB. Only "
+                         "applies when --require-all-modalities is also set.")
     ap.add_argument("--save-masks", action="store_true")
     ap.add_argument("--save-overlays", action="store_true")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -2540,6 +2646,8 @@ def main():
             sample_per_session=sample,
             frame_range=tuple(args.frame_range) if args.frame_range else None,
             require_all_modalities=args.require_all_modalities,
+            require_info_modality=args.require_info_modality,
+            sample_mode=args.sample_mode,
         ):
             if args.max_images is not None and total_imgs >= args.max_images:
                 break

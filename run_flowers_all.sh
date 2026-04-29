@@ -68,8 +68,8 @@ echo "[batch] Using python: $PY"
   --out "$HOME/sam3_all_v29" \
   --save-overlays \
   --depth --tree-mask --prgb \
-  --require-all-modalities --skip-no-roi \
-  --sample-per-session 100 \
+  --require-all-modalities --require-info-modality --skip-no-roi \
+  --sample-per-session 100 --sample-mode sequential \
   --threshold 0.01 \
   --prompts apple branch trunk flower leaf fruitlet \
   --flower-multi-prompts flower blossom "apple blossom" \
