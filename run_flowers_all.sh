@@ -60,7 +60,7 @@ echo "[batch] Using python: $PY"
   --save-overlays --save-masks \
   --depth --tree-mask --prgb \
   --require-all-modalities --skip-no-roi \
-  --sample-per-session 0 \
+  --sample-per-session 100 \
   --threshold 0.01 \
   --prompts apple branch trunk flower leaf fruitlet \
   --flower-multi-prompts flower blossom "apple blossom" \
