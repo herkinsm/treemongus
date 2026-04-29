@@ -290,20 +290,21 @@ def parse_frame_timestamp(path: Path) -> tuple[int, ...]:
 
 def info_path_for(img_path: Path) -> Path:
     """Given .../<session>/RGB/<stem>-RGB-BP.<ext>, return
-    .../<session>/Info/<stem>-Info.txt.
+    .../<session>/Info/<bare_timestamp>.txt.
 
-    Mirrors depth_path_for / ir_path_for / prgb_path_for. The exact
-    extension may vary by capture rig; the caller should treat a
-    missing file as 'modality not present' (same as the other
-    modalities) rather than an error."""
+    The Info file is just named with the bare timestamp (no
+    `-Info` or `-RGB-BP` suffix), e.g. for RGB
+        2023-4-20-8-40-58-417-RGB-BP.bmp
+    Info is
+        2023-4-20-8-40-58-417.txt
+    """
     session_dir = img_path.parent.parent
-    stem = img_path.stem
-    base = stem
+    base = img_path.stem
     for suffix in ("-RGB-BP", "-RGB-bp", "-RGB", "-rgb"):
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
-    return session_dir / "Info" / f"{base}-Info.txt"
+    return session_dir / "Info" / f"{base}.txt"
 
 
 def find_images(root: Path, only_rgb_folders: bool = True,
