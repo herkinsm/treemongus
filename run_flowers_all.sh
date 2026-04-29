@@ -66,7 +66,7 @@ echo "[batch] Using python: $PY"
 "$PY" analyze_days.py \
   --root "/fs/scratch/PAS0228" \
   --out "$HOME/sam3_all_v29" \
-  --save-overlays \
+  --save-overlays --save-empty-overlays \
   --depth --tree-mask --prgb \
   --require-all-modalities --require-info-modality --skip-no-roi \
   --sample-per-session 100 --sample-mode sequential \

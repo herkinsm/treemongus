@@ -2121,6 +2121,14 @@ def main():
                          "applies when --require-all-modalities is also set.")
     ap.add_argument("--save-masks", action="store_true")
     ap.add_argument("--save-overlays", action="store_true")
+    ap.add_argument("--save-empty-overlays", action="store_true",
+                    help="Also save overlay JPGs for frames where the "
+                         "prompt produced 0 detections (e.g., frames "
+                         "with no visible flowers). Useful for debugging "
+                         "-- you can confirm SAM 3 saw nothing rather "
+                         "than guessing why a frame is missing from the "
+                         "overlay folder. Off by default since it 6-10x "
+                         "the overlay count on bulk runs.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     # Depth-based background filter (matches sprayer_pipeline/config.py).
     ap.add_argument("--depth", action="store_true",
@@ -3593,9 +3601,13 @@ def main():
                                             scores=scores_np, boxes=boxes_np)
                     # Save overlays only for tracked prompts when --track is on
                     # (so we get just flower JPGs instead of one per category).
-                    save_this_overlay = args.save_overlays and n > 0 and (
-                        not args.track or prompt in tracked_set
-                    )
+                    # When --save-empty-overlays is on, save EVERY frame's
+                    # overlay even when n=0; useful for confirming SAM 3
+                    # saw nothing vs the frame being skipped for some
+                    # other reason.
+                    save_this_overlay = args.save_overlays and (
+                        n > 0 or args.save_empty_overlays
+                    ) and (not args.track or prompt in tracked_set)
                     if save_this_overlay:
                         rel = img_path.relative_to(args.root).with_suffix(".jpg")
                         op = overlays_dir / slug / rel
