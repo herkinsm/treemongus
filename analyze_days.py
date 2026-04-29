@@ -2210,6 +2210,19 @@ def main():
                          "(default 5000 = 5 m). Pixels above are treated as "
                          "background (distant trees, buildings, sky max-range "
                          "value).")
+    ap.add_argument("--flower-white-s-max", type=int, default=30,
+                    help="Max HSV saturation for the 'white blossom' mask "
+                         "in the in-loop refinement step (default 30). "
+                         "Raise to capture more off-white / cream petals.")
+    ap.add_argument("--flower-white-v-min", type=int, default=180,
+                    help="Min HSV value (brightness) for the 'white "
+                         "blossom' mask (default 180). LOWER for golden-"
+                         "hour / overcast scenes where white petals come "
+                         "back at V=140-170 instead of 200+.")
+    ap.add_argument("--flower-pink-v-min", type=int, default=130,
+                    help="Min HSV value for the 'pink blossom' mask "
+                         "(default 130). Lower for shadowed/sidelit "
+                         "blossoms.")
     ap.add_argument("--flower-refine-min-area-px", type=int, default=15,
                     help="After HSV-refining a SAM flower mask to its "
                          "blossom-color subset, drop the mask if the "
@@ -3069,14 +3082,14 @@ def main():
                                 # white and saturated-pink) are not
                                 # lost.
                                 white_mask = (
-                                    (Sc <= 30)
-                                    & (Vc >= 180)
+                                    (Sc <= args.flower_white_s_max)
+                                    & (Vc >= args.flower_white_v_min)
                                 )
                                 pink_mask = (
                                     (((Hc >= 0) & (Hc <= 30))
                                      | ((Hc >= 150) & (Hc <= 179)))
                                     & ((Sc >= 20) & (Sc <= 100))
-                                    & (Vc >= 130)
+                                    & (Vc >= args.flower_pink_v_min)
                                 )
                                 # Yellow is intentionally NOT in the
                                 # blossom set: trunk bark, dry leaves,
@@ -3401,12 +3414,15 @@ def main():
                                 _Hc, _Sc, _Vc = (
                                     _hsv[..., 0], _hsv[..., 1], _hsv[..., 2],
                                 )
-                                _white = (_Sc <= 30) & (_Vc >= 180)
+                                _white = (
+                                    (_Sc <= args.flower_white_s_max)
+                                    & (_Vc >= args.flower_white_v_min)
+                                )
                                 _pink = (
                                     (((_Hc >= 0) & (_Hc <= 30))
                                      | ((_Hc >= 150) & (_Hc <= 179)))
                                     & ((_Sc >= 20) & (_Sc <= 100))
-                                    & (_Vc >= 130)
+                                    & (_Vc >= args.flower_pink_v_min)
                                 )
                                 _blossom_pix = _white | _pink
                             except Exception as _bp_err:
