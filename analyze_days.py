@@ -198,6 +198,30 @@ if not torch.cuda.is_available():
             except Exception:
                 pass
 
+    # 5. Explicit thread count for CPU inference. PyTorch reads
+    #    OMP_NUM_THREADS at import time, but on some HPC nodes the
+    #    env var doesn't propagate cleanly into a SLURM batch job's
+    #    Python process; setting torch.set_num_threads() directly
+    #    is the only reliable way. SAM 3's transformer attention
+    #    is ~3-5x faster with 8 threads than with 1.
+    import os as _os_thread
+    try:
+        _n_threads = int(
+            _os_thread.environ.get(
+                "OMP_NUM_THREADS",
+                _os_thread.environ.get("SLURM_CPUS_PER_TASK", "8"),
+            )
+        )
+        torch.set_num_threads(max(1, _n_threads))
+        torch.set_num_interop_threads(max(1, _n_threads))
+        print(
+            f"[shim] CPU threading: torch.set_num_threads("
+            f"{torch.get_num_threads()}), interop="
+            f"{torch.get_num_interop_threads()}",
+        )
+    except Exception as _t_err:
+        print(f"[shim] could not set torch threads: {_t_err!r}")
+
 import sam3
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
