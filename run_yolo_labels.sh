@@ -71,7 +71,7 @@ echo "[batch] Using python: $PY"
   --flower-multi-prompts flower blossom "apple blossom" \
   --flower-require-blossom-color --flower-min-blossom-color-frac 0.10 \
   --flower-min-area-px 4 --no-flower-reject-yellow \
-  --depth-min-mm 600 --depth-max-mm 2200 --depth-near-frac 0.65 \
+  --depth-min-mm 600 --depth-max-mm 3000 --depth-near-frac 0.65 \
   --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
   --tree-mask-min-overlap 0.20 \
@@ -85,6 +85,6 @@ echo "[batch] Using python: $PY"
   --flower-context-depth-tol-mm 3000 \
   --flower-petal-ndvi-mean 0.05 --flower-petal-ndvi-std 0.50 \
   --flower-canopy-ndvi-min 0.0 --flower-canopy-ndvi-softness 0.0 \
-  --flower-min-local-depth-std-mm 0 \
+  --flower-min-local-depth-std-mm 200 \
   --debug-rejection-log \
   --track --track-min-frames 3
