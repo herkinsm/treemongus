@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=sam3_flowers_all
 #SBATCH --account=PAS0228
-#SBATCH --time=24:00:00
+#SBATCH --time=8:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
