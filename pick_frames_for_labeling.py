@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--high-density-frac", type=float, default=0.2,
                     help="Fraction of N for high-density (most kept "
                          "flowers per frame) bucket.")
+    ap.add_argument("--one-per-session", action="store_true",
+                    help="Override: ignore --n and the bucket fractions. "
+                         "Pick exactly one representative frame per "
+                         "session (the median-density one). Maximum "
+                         "diversity, minimum redundancy. Good for a "
+                         "small but well-distributed labeling set.")
     return ap.parse_args()
 
 
@@ -85,6 +91,7 @@ def main() -> None:
 
     # Build per-frame stats from results.csv (n_detections per flower frame).
     frame_density: dict[str, int] = {}
+    frame_session: dict[str, tuple[str, str, str]] = {}
     with open(results_csv, "r", newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if row.get("prompt") != "flower":
@@ -94,6 +101,48 @@ def main() -> None:
             except ValueError:
                 n = 0
             frame_density[row["image"]] = n
+            frame_session[row["image"]] = (
+                row.get("day", ""), row.get("category", ""),
+                row.get("session", ""),
+            )
+
+    # Short-circuit: --one-per-session takes the median-density frame
+    # in each session. Returns max-diversity, min-redundancy set.
+    if args.one_per_session:
+        by_session_frames: dict[tuple[str, str, str], list[tuple[str, int]]] = {}
+        for img, n in frame_density.items():
+            key = frame_session[img]
+            by_session_frames.setdefault(key, []).append((img, n))
+        selected: list[str] = []
+        for key, lst in sorted(by_session_frames.items()):
+            lst.sort(key=lambda x: x[1])
+            mid = lst[len(lst) // 2]
+            selected.append(mid[0])
+        print(f"[picks] one-per-session: {len(selected)} frames "
+              f"(one median-density frame per session)")
+        out_path = Path(args.out).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("\n".join(selected) + "\n", encoding="utf-8")
+        print(f"\n[done] wrote {len(selected)} paths to {out_path}")
+        if args.copy_to:
+            copy_dst = Path(args.copy_to).expanduser()
+            copy_dst.mkdir(parents=True, exist_ok=True)
+            n_copied = 0
+            for src_str in selected:
+                src = Path(src_str)
+                if not src.is_file():
+                    continue
+                try:
+                    rel = src.relative_to(Path("/fs/scratch/PAS0228"))
+                except ValueError:
+                    rel = Path(src.name)
+                flat = "__".join(p.replace(" ", "_") for p in rel.parts)
+                dst = copy_dst / flat
+                if not dst.exists():
+                    shutil.copy2(src, dst)
+                    n_copied += 1
+            print(f"[done] copied {n_copied} images to {copy_dst}")
+        return
 
     # Per-frame soft-score signals from the JSONL.
     # min_kept_soft_per_frame: lowest kept soft score (most borderline-real)
