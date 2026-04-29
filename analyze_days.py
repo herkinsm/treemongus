@@ -97,6 +97,14 @@ if not torch.cuda.is_available():
     torch.Tensor.bfloat16 = lambda self, *args, **kwargs: self.float()
     torch.nn.Module.bfloat16 = lambda self, *args, **kwargs: self.float()
 
+    # 2c. .pin_memory() on Tensor: SAM 3's geometry_encoders.py:648
+    #     calls `scale.pin_memory().to(device=..., non_blocking=True)`
+    #     to set up an async CUDA host->device transfer. Pinned
+    #     memory only makes sense for CUDA; on CPU `pin_memory()`
+    #     itself raises "No CUDA GPUs are available". No-op it to
+    #     return self so the .to(device=cpu) downstream still runs.
+    torch.Tensor.pin_memory = lambda self, *args, **kwargs: self
+
     # 3. .to() method: when called with a cuda device (positional or
     #    kw), substitute cpu. When called with bfloat16 dtype, sub
     #    float32. Preserve dtype-only calls (.to(torch.float32))
