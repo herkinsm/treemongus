@@ -10,20 +10,19 @@
 
 # Generate flower bounding-box labels for YOLO training.
 #
-# Differs from run_flowers_all.sh in two key ways:
+# Differs from run_flowers_all.sh:
 #   1) NO --prgb anywhere -- SAM looks at the whole frame and labels
 #      every flower it can find, regardless of which tree they're on.
 #      A YOLO detector at inference time has no ROI; training labels
 #      should match that.
-#   2) Stricter quality gates -- precision matters more than recall
-#      for training data:
-#        --flower-min-soft-score 0.40 (was 0.25)
-#        --track-min-frames 3 (only stable detections)
-#        --flower-canopy-ndvi-min 0.30 (was 0.20)
+#   2) Looser flower gates than the previous strict-precision config,
+#      because the strict version was UNDER-predicting. The
+#      track-min-frames 3 stability filter still removes most false
+#      positives at the dataset assembly step (make_yolo_dataset.py).
 #
 # After this job completes, run:
 #   python make_yolo_dataset.py --in $HOME/sam3_yolo_labels \
-#       --out $HOME/yolo_dataset --val-frac 0.2
+#       --out $HOME/yolo_dataset --val-frac 0.2 --min-track-frames 3
 # to assemble images + labels into a YOLO-compatible folder layout.
 
 cd ~/sam3-apple-analysis && git pull
@@ -63,11 +62,11 @@ echo "[batch] Using python: $PY"
 "$PY" analyze_days.py \
   --root "/fs/scratch/PAS0228" \
   --out "$HOME/sam3_yolo_labels" \
-  --save-overlays --save-masks \
+  --save-overlays --save-empty-overlays --save-masks \
   --depth --tree-mask \
   --require-all-modalities --require-info-modality \
   --sample-per-session 100 --sample-mode sequential \
-  --threshold 0.01 \
+  --threshold 0.005 \
   --prompts flower \
   --flower-multi-prompts flower blossom "apple blossom" \
   --flower-require-blossom-color --flower-min-blossom-color-frac 0.10 \
@@ -78,11 +77,12 @@ echo "[batch] Using python: $PY"
   --tree-mask-min-overlap 0.10 \
   --flower-y-min 0 --flower-y-max 380 \
   --flower-max-area-px 12000 --flower-max-bbox-area-px 60000 \
-  --flower-min-circularity 0.45 --flower-min-mask-density 0.30 \
-  --flower-refine-min-area-px 15 --flower-refine-max-aspect 3.5 \
-  --flower-min-soft-score 0.40 --flower-soft-w-sam 2.5 \
-  --flower-context-ring-px 20 --flower-context-min-canopy-frac 0.20 \
-  --flower-context-depth-tol-mm 2000 \
-  --flower-petal-ndvi-mean 0.05 --flower-petal-ndvi-std 0.30 \
-  --flower-canopy-ndvi-min 0.30 \
+  --flower-min-circularity 0.40 --flower-min-mask-density 0.25 \
+  --flower-refine-min-area-px 12 --flower-refine-max-aspect 4.0 \
+  --flower-min-soft-score 0.20 --flower-soft-w-sam 1.5 \
+  --flower-context-ring-px 20 --flower-context-min-canopy-frac 0.15 \
+  --flower-context-depth-tol-mm 2500 \
+  --flower-petal-ndvi-mean 0.05 --flower-petal-ndvi-std 0.35 \
+  --flower-canopy-ndvi-min 0.15 \
+  --debug-rejection-log \
   --track --track-min-frames 3
