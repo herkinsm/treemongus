@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=sam3_flowers_all
 #SBATCH --account=PAS0228
-#SBATCH --time=8:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -78,7 +78,7 @@ echo "[batch] Using python: $PY"
   --flower-min-local-depth-std-mm 200 \
   --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
   --prgb-min-overlap 0.30 --prgb-dilate-px 0 --prgb-extend-vertical \
-  --tile-grid 1 1 --tile-overlap 0.0 --tile-nms-iou 0.15 \
+  --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
   --tree-mask-min-overlap 0.10 \
   --flower-y-min 0 --flower-y-max 380 \
   --flower-max-area-px 12000 --flower-max-bbox-area-px 60000 \
