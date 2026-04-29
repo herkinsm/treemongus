@@ -20,7 +20,41 @@
 
 cd ~/sam3-apple-analysis && git pull
 
-python analyze_days.py \
+# Activate the sam3 conda env. SLURM batch jobs start with a fresh
+# shell, so even if the user has `conda activate sam3` in their
+# interactive session, the job won't inherit it. Source conda's
+# init script then explicitly activate. Falls back to the env's
+# python binary directly if conda activation fails (e.g. conda
+# init script moved).
+if [ -f "$HOME/.conda/envs/sam3/bin/python" ]; then
+    PY="$HOME/.conda/envs/sam3/bin/python"
+elif [ -f "/users/PAS0228/mherkins/.conda/envs/sam3/bin/python" ]; then
+    PY="/users/PAS0228/mherkins/.conda/envs/sam3/bin/python"
+else
+    PY="python"
+fi
+
+# Best-effort conda activation; the absolute-path PY above is the
+# real safety net.
+for conda_init in \
+    "$HOME/miniconda3/etc/profile.d/conda.sh" \
+    "$HOME/anaconda3/etc/profile.d/conda.sh" \
+    "$HOME/.conda/etc/profile.d/conda.sh" \
+    "/apps/anaconda3/etc/profile.d/conda.sh" \
+    "/users/PAS0228/mherkins/.conda/etc/profile.d/conda.sh"
+do
+    if [ -f "$conda_init" ]; then
+        # shellcheck disable=SC1090
+        . "$conda_init"
+        conda activate sam3 2>/dev/null && break
+    fi
+done
+
+echo "[batch] Using python: $PY"
+"$PY" -c "import sys; print('[batch] python:', sys.executable); import sam3; print('[batch] sam3 OK')" \
+    || { echo "[batch] sam3 import failed -- aborting"; exit 1; }
+
+"$PY" analyze_days.py \
   --root "/fs/scratch/PAS0228" \
   --out "$HOME/sam3_all_v29" \
   --save-overlays --save-masks \
