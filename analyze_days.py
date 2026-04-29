@@ -2326,6 +2326,16 @@ def main():
                          "horizontal extent. Use with --tile-grid 5 2 to mirror the "
                          "sprayer pipeline's 2-column x 5-row = 10-zone canopy "
                          "discretization.")
+    ap.add_argument("--prgb-skip-centroid-check", action="store_true",
+                    help="Skip the post-refinement check that requires a "
+                         "flower mask's centroid to lie inside the PRGB ROI. "
+                         "The earlier --prgb-min-overlap fraction check still "
+                         "applies. Without this, a flower at the edge of the "
+                         "ROI whose petals extend slightly outside (so its "
+                         "centroid lands a few pixels past the dilated box) "
+                         "gets rejected even though most of the mask is "
+                         "inside. Recommended for orchards where lateral "
+                         "branches reach beyond the trunk-anchored ROI.")
     ap.add_argument("--prgb-extend-horizontal", action="store_true",
                     help="Stretch the ROI mask horizontally to span the full image "
                          "width, preserving its vertical extent. Combine with "
@@ -3272,8 +3282,12 @@ def main():
                         # actually sit inside the ROI so flowers that
                         # the user expects to be in-bounds aren't
                         # drawn outside the cyan zone grid.
+                        # Skipped when --prgb-skip-centroid-check is
+                        # set (lateral branches whose flowers extend
+                        # slightly past the dilated ROI).
                         if (args.prgb and roi_mask_img is not None
-                                and n > 0):
+                                and n > 0
+                                and not args.prgb_skip_centroid_check):
                             keep_c = np.ones(n, dtype=bool)
                             roi_h_full, roi_w_full = roi_mask_img.shape[:2]
                             for ci in range(n):
