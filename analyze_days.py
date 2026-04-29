@@ -3673,7 +3673,25 @@ def main():
                     print(f"[{total_imgs}] {day}/{category}/{session}/{img_path.name} "
                           f"({time.time()-t_img:.2f}s/img, {rate:.2f} img/s overall)")
             except Exception as e:
-                print(f"[ERR] {img_path}: {e}", file=sys.stderr)
+                # Print the full traceback (not just the exception
+                # message) for the FIRST few errors so debugging
+                # CUDA / dtype / tile-NMS issues doesn't require a
+                # separate reproducer script. After 5 errors, fall
+                # back to one-liners to keep the log readable.
+                if not hasattr(main, "_err_count"):
+                    main._err_count = 0  # type: ignore[attr-defined]
+                main._err_count += 1  # type: ignore[attr-defined]
+                if main._err_count <= 5:
+                    import traceback as _tb
+                    print(
+                        f"[ERR] {img_path}: {e}\n"
+                        f"      (full traceback below; later errors "
+                        f"abbreviated)",
+                        file=sys.stderr,
+                    )
+                    _tb.print_exc(file=sys.stderr)
+                else:
+                    print(f"[ERR] {img_path}: {e}", file=sys.stderr)
     finally:
         f.close()
         if rejection_log_f is not None:
