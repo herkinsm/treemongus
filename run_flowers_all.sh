@@ -20,6 +20,15 @@
 
 cd ~/sam3-apple-analysis && git pull
 
+# Make PyTorch use all the CPUs we asked SLURM for. Without this,
+# OMP / MKL default to 1 thread and SAM 3 inference is single-
+# threaded -- which is what makes bulk CPU runs feel painfully
+# slow even on multi-core nodes.
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+echo "[batch] threading: OMP/MKL/OPENBLAS=$OMP_NUM_THREADS"
+
 # Activate the sam3 conda env. SLURM batch jobs start with a fresh
 # shell, so even if the user has `conda activate sam3` in their
 # interactive session, the job won't inherit it. Source conda's
@@ -57,7 +66,7 @@ echo "[batch] Using python: $PY"
 "$PY" analyze_days.py \
   --root "/fs/scratch/PAS0228" \
   --out "$HOME/sam3_all_v29" \
-  --save-overlays --save-masks \
+  --save-overlays \
   --depth --tree-mask --prgb \
   --require-all-modalities --skip-no-roi \
   --sample-per-session 100 \
@@ -82,5 +91,4 @@ echo "[batch] Using python: $PY"
   --flower-context-depth-tol-mm 2000 \
   --flower-petal-ndvi-mean 0.05 --flower-petal-ndvi-std 0.30 \
   --flower-canopy-ndvi-min 0.20 \
-  --debug-rejection-log --debug-overlay \
   --track --show-roi
