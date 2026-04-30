@@ -85,6 +85,10 @@ echo "[batch] Using python: $PY"
   --flower-g-minus-r-max 12 --flower-top-frame-penalty-row 100 \
   --flower-phenology auto --flower-bloom-peak-doy 125 \
   --flower-fill-anther-holes \
+  --split-clusters --split-min-blossom-area-px 30 \
+  --split-min-marker-distance-px 5 --split-seed-dilate-px 5 \
+  --split-area-cap --flower-area-per-flower-px 200 \
+  --flower-max-ground-row 400 --flower-min-confirmed-pct-ground 10.0 \
   --flower-min-circularity 0.35 --flower-min-mask-density 0.20 \
   --flower-refine-min-area-px 10 --flower-refine-max-aspect 4.5 \
   --flower-min-soft-score 0.15 --flower-soft-w-sam 1.0 \

@@ -1871,7 +1871,8 @@ def split_cluster_mask(mask: np.ndarray, rgb_arr: np.ndarray,
                         min_marker_distance_px: int = 5,
                         intensity_weight: float = 5.0,
                         edge_weight: float = 0.5,
-                        use_otsu: bool = True) -> list[np.ndarray]:
+                        use_otsu: bool = True,
+                        seed_dilate_px: int = 0) -> list[np.ndarray]:
     """Split a cluster mask into per-blossom sub-masks using marker-controlled
     watershed segmentation, fusing four cues:
 
@@ -1932,6 +1933,29 @@ def split_cluster_mask(mask: np.ndarray, rgb_arr: np.ndarray,
     n_labels, markers = cv2.connectedComponents(local_max.astype(np.uint8))
     if n_labels <= 2:  # 0 = background, 1 = single peak → no split needed
         return [mb]
+
+    # Optional seed dilation — gives each marker a multi-pixel buffer
+    # before watershed so the resulting boundaries are placed cleanly
+    # halfway between adjacent peaks instead of clinging to single-
+    # pixel seeds. Mirrors the reference flower_detector's
+    # cv2.dilate(seed, MORPH_ELLIPSE 5x5) before cv2.watershed. Each
+    # label is dilated separately to preserve label IDs.
+    if seed_dilate_px > 0:
+        seed_kern = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * int(seed_dilate_px) + 1, 2 * int(seed_dilate_px) + 1),
+        )
+        new_markers = np.zeros_like(markers)
+        # Dilate in label-id order so larger labels don't overwrite
+        # smaller ones at overlap points (they shouldn't overlap at
+        # this stage, but defensive).
+        for lid in range(1, n_labels):
+            single = (markers == lid).astype(np.uint8)
+            dilated = cv2.dilate(single, seed_kern, iterations=1)
+            # Restrict dilation to the cluster mask so we don't seed
+            # outside the blossom boundary.
+            new_markers[(dilated > 0) & sub & (new_markers == 0)] = lid
+        markers = new_markers
 
     # Sobel edges → watershed barriers.
     gx = cv2.Sobel(v, cv2.CV_32F, 1, 0, ksize=3)
@@ -2704,6 +2728,34 @@ def main():
     ap.add_argument("--split-min-marker-distance-px", type=int, default=5,
                     help="Minimum pixel separation between two blossom-center "
                          "markers before they get merged (default 5).")
+    ap.add_argument("--split-seed-dilate-px", type=int, default=5,
+                    help="Pixels to dilate each watershed marker seed before "
+                         "running watershed. Mirrors the reference sprayer "
+                         "pipeline's cv2.dilate(seed, MORPH_ELLIPSE 5x5). "
+                         "Larger values give cleaner boundaries between "
+                         "adjacent peaks; 0 disables. Default 5.")
+    ap.add_argument("--split-area-cap", action="store_true",
+                    help="Cap the number of sub-masks from a single cluster "
+                         "to ceil(parent_area / area-per-flower-px). Watershed "
+                         "occasionally over-splits a single blossom into 2-3 "
+                         "sub-peaks (petal ridge irregularities, partial "
+                         "anther holes). With this flag, only the LARGEST "
+                         "sub-masks are kept up to the area cap.")
+    # Ground-row rejection (filter, not splitter). Catches dandelions /
+    # grass wildflowers whose detections sit in the bottom of the frame.
+    ap.add_argument("--flower-max-ground-row", type=int, default=0,
+                    help="Reject flower clusters whose centroid row is "
+                         "below this Y (default 0 = disabled). When ON, "
+                         "a cluster below this row is dropped UNLESS its "
+                         "strict-color core covers at least "
+                         "--flower-min-confirmed-pct-ground percent of "
+                         "the cluster area (real low blossoms get "
+                         "confirmed; grass wildflowers fail). The "
+                         "sprayer pipeline reference uses 400.")
+    ap.add_argument("--flower-min-confirmed-pct-ground", type=float,
+                    default=10.0,
+                    help="Strict-core percentage required for a below-"
+                         "ground-row cluster to survive. Default 10%%.")
     args = ap.parse_args()
 
     sample = None if args.sample_per_session == 0 else args.sample_per_session
@@ -3713,6 +3765,61 @@ def main():
                                 if boxes_np is not None:
                                     boxes_np = boxes_np[keep_d]
                                 n = int(keep_d.sum())
+                        # Ground-row rejection. Catches dandelions /
+                        # grass wildflowers in the bottom of the
+                        # frame. A cluster whose centroid is below
+                        # --flower-max-ground-row is dropped UNLESS
+                        # its strict-core (blossom_pix) coverage is
+                        # at least --flower-min-confirmed-pct-ground
+                        # %. Real low-hanging blossoms confirm; grass
+                        # wildflowers don't (their HSV mostly fails
+                        # the strict bloom rule). Mirrors the
+                        # reference flower_detector ground filter.
+                        if (args.flower_max_ground_row > 0
+                                and n > 0
+                                and "blossom_pix" in dir()
+                                and blossom_pix is not None):
+                            keep_gr = np.ones(n, dtype=bool)
+                            for gri in range(n):
+                                mb_g = masks_np[gri].astype(bool)
+                                if mb_g.ndim == 3:
+                                    mb_g = mb_g.any(axis=0)
+                                if not mb_g.any():
+                                    continue
+                                ys_g, _ = np.where(mb_g)
+                                cy_g = float(ys_g.mean())
+                                if cy_g <= args.flower_max_ground_row:
+                                    continue
+                                area_g = int(mb_g.sum())
+                                # Tiny clusters skip the strict-core
+                                # check (consistent with reference's
+                                # `area > 200` guard).
+                                if area_g <= 200:
+                                    continue
+                                core_g = int(
+                                    (mb_g & blossom_pix).sum()
+                                )
+                                conf_pct = (
+                                    100.0 * core_g / area_g
+                                    if area_g > 0 else 0.0
+                                )
+                                if (conf_pct
+                                        < args.flower_min_confirmed_pct_ground):
+                                    keep_gr[gri] = False
+                            audit.apply(keep_gr, "ground_row")
+                            if not keep_gr.all():
+                                rt_key = (day, category, session, prompt)
+                                rt = rejection_totals.setdefault(rt_key, {})
+                                rt["ground_row"] = (
+                                    rt.get("ground_row", 0)
+                                    + int((~keep_gr).sum())
+                                )
+                                masks_np = masks_np[keep_gr]
+                                if scores_np is not None:
+                                    scores_np = scores_np[keep_gr]
+                                if boxes_np is not None:
+                                    boxes_np = boxes_np[keep_gr]
+                                n = int(keep_gr.sum())
                         # Soft-score gate. Continuous quality score
                         # combining SAM 3 confidence, shape, color,
                         # contextual depth, and NDVI. See
@@ -3910,6 +4017,13 @@ def main():
                         new_scores: list[float] = []
                         new_boxes: list[list[float]] = []
                         new_areas: list[int] = []
+                        # Track which parent index each sub-mask
+                        # came from so the audit's surviving-original-
+                        # SAM-index map stays consistent. After
+                        # splitting, audit.remap_after_split() rebuilds
+                        # surviving so each sub-mask points back to
+                        # the right original SAM detection.
+                        parent_per_sub: list[int] = []
                         for idx, m in enumerate(masks_np):
                             mb = m.astype(bool)
                             if mb.ndim == 3:
@@ -3922,12 +4036,28 @@ def main():
                                 if boxes_np is not None:
                                     new_boxes.append(list(boxes_np[idx]))
                                 new_areas.append(cluster_area)
+                                parent_per_sub.append(idx)
                                 continue
                             subs = split_cluster_mask(
                                 m, rgb_arr_for_split,
                                 min_blossom_area_px=args.split_min_blossom_area_px,
                                 min_marker_distance_px=args.split_min_marker_distance_px,
+                                seed_dilate_px=args.split_seed_dilate_px,
                             )
+                            # Per-CC area cap: a 250-px blossom that
+                            # over-splits to 2-3 sub-peaks (petal ridge
+                            # noise, partial anther holes) shouldn't
+                            # be counted as 2-3 flowers. Cap at
+                            # ceil(parent_area / area_per_flower) and
+                            # keep the largest sub-masks.
+                            if args.split_area_cap and len(subs) > 1:
+                                per = max(1, int(args.flower_area_per_flower_px))
+                                cap = max(1, (cluster_area + per - 1) // per)
+                                if len(subs) > cap:
+                                    subs = sorted(
+                                        subs,
+                                        key=lambda s: -int(np.asarray(s).sum()),
+                                    )[:cap]
                             for sub in subs:
                                 new_masks.append(sub.astype(masks_np.dtype))
                                 if scores_np is not None:
@@ -3939,6 +4069,7 @@ def main():
                                 else:
                                     new_boxes.append([0.0, 0.0, 0.0, 0.0])
                                 new_areas.append(int(sub.sum()))
+                                parent_per_sub.append(idx)
                         if new_masks:
                             masks_np = np.stack(new_masks, axis=0)
                             scores_np = (np.asarray(new_scores, dtype=np.float32)
@@ -3951,6 +4082,14 @@ def main():
                                       if scores_np is not None and len(scores_np) else 0.0)
                             max_s = (float(np.max(scores_np))
                                      if scores_np is not None and len(scores_np) else 0.0)
+                            # Tell the audit each new sub-mask's
+                            # original SAM index so per-mask rejection
+                            # log + debug overlay stay coherent across
+                            # the split.
+                            try:
+                                audit.remap_after_split(parent_per_sub)
+                            except Exception:
+                                pass
 
                     # Density-based individual flower estimate per cluster.
                     if is_flower_prompt and kept_areas:
