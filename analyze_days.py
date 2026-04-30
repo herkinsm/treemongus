@@ -2223,6 +2223,41 @@ def main():
                     help="Min HSV value for the 'pink blossom' mask "
                          "(default 130). Lower for shadowed/sidelit "
                          "blossoms.")
+    # Cool-shadow + green-dominance + leaf-bud rules ported from the
+    # sprayer pipeline's flower_detector. b_minus_r and g_minus_r are
+    # signed RGB differences. These reject most non-flower bright
+    # objects (specular leaf glints, sun-bleached cuticles, white
+    # cars, building paint) that pass the HSV + depth checks.
+    ap.add_argument("--flower-b-minus-r-max", type=int, default=10,
+                    help="Max value of (B - R) for a pixel to count as "
+                         "a WHITE petal. Real apple petals reflect "
+                         "cool/blue sky onto their undersides, so they "
+                         "test as B >= R or only slightly warmer. "
+                         "Specular leaf glints, sun-bleached white "
+                         "objects, and warm-toned false positives have "
+                         "B - R > 0. The reference sprayer pipeline "
+                         "uses 0 (very strict) during full bloom; we "
+                         "default to 10 to be friendlier with the "
+                         "lighting variation in your dataset, but "
+                         "drop to 0 or -2 if you still see warm-toned "
+                         "FPs sneaking through.")
+    ap.add_argument("--flower-pink-b-minus-r-max", type=int, default=0,
+                    help="Max (B - R) for a PINK pixel. Pink petals "
+                         "are reddish but still cool-shifted; warm-leaf "
+                         "glints that test as 'red hue' are excluded. "
+                         "Default 0.")
+    ap.add_argument("--flower-g-minus-r-max", type=int, default=12,
+                    help="Max (G - R) before a pixel is treated as "
+                         "GREEN-DOMINANT (foliage) and excluded from "
+                         "blossom masks. Bright greenish leaves that "
+                         "happen to pass the low-S gate get killed by "
+                         "this. Default 12 matches the reference.")
+    ap.add_argument("--flower-top-frame-penalty-row", type=int, default=100,
+                    help="In rows 0..N (top of frame), apply a stricter "
+                         "white-petal rule (S<15, V>200, B-R<=-5). "
+                         "Specular leaf glints concentrate at the "
+                         "canopy crown where sun strikes waxy cuticles "
+                         "at near-grazing angles. Set 0 to disable.")
     ap.add_argument("--flower-refine-min-area-px", type=int, default=15,
                     help="After HSV-refining a SAM flower mask to its "
                          "blossom-color subset, drop the mask if the "
@@ -3065,32 +3100,85 @@ def main():
                                 Hc = hsv_full[..., 0]
                                 Sc = hsv_full[..., 1]
                                 Vc = hsv_full[..., 2]
-                                # HSV thresholds match
-                                # flower_quality_keep defaults.
-                                # Tightened to match the
-                                # flower_quality_keep defaults: real
-                                # blossom petals are nearly pure
-                                # white (S < 20) and bright (V > 180);
-                                # pink blossoms are saturated
-                                # (S >= 30). Glossy leaf highlights
-                                # (S 20-50) and brownish branch tips
-                                # (low-saturation red) no longer
-                                # qualify.
-                                # Overlap the white & pink windows
-                                # at S ∈ [20, 30] so pale-pink petal
-                                # edges (which fall between near-
-                                # white and saturated-pink) are not
-                                # lost.
+                                # B-R and G-R signed differences,
+                                # ported from the sprayer pipeline's
+                                # flower_detector. They give us two
+                                # signals HSV alone can't:
+                                #
+                                #   b_minus_r <= 0 : pixel is COOL /
+                                #     blue-shifted. Real apple petals
+                                #     reflect cool sky onto their
+                                #     undersides; specular leaf
+                                #     glints, sun-bleached cuticles,
+                                #     and most warm-tone false
+                                #     positives have b_minus_r > 0.
+                                #
+                                #   g_minus_r > 12 : green dominates,
+                                #     so this is foliage. Excludes
+                                #     bright greenish leaves that
+                                #     happen to pass the low-S gate.
+                                R_chan = rgb_arr[..., 0].astype(np.int16)
+                                G_chan = rgb_arr[..., 1].astype(np.int16)
+                                B_chan = rgb_arr[..., 2].astype(np.int16)
+                                b_minus_r = B_chan - R_chan
+                                g_minus_r = G_chan - R_chan
+                                green_dominant = (
+                                    g_minus_r > args.flower_g_minus_r_max
+                                )
+                                # Leaf-bud exclusion: yellowish-green
+                                # spring growth with H ∈ [20, 50] and
+                                # S >= 15 -- bright but not a flower.
+                                leaf_bud = (
+                                    (Hc >= 20) & (Hc <= 50)
+                                    & (Sc >= 15)
+                                    & (g_minus_r >= -5)
+                                )
+                                # White petal mask. The b_minus_r
+                                # check is the killer addition --
+                                # without it, distant-tree foliage
+                                # glints sneak past depth filters.
                                 white_mask = (
                                     (Sc <= args.flower_white_s_max)
                                     & (Vc >= args.flower_white_v_min)
+                                    & (b_minus_r <= args.flower_b_minus_r_max)
+                                    & ~green_dominant
+                                    & ~leaf_bud
                                 )
+                                # Pink petal mask. Pink petals are
+                                # also slightly cool (B > R is
+                                # unusual but pink-shifted reds have
+                                # b_minus_r near 0; -10 cutoff keeps
+                                # them while excluding warm-leaf
+                                # glints that test as "red hue").
                                 pink_mask = (
                                     (((Hc >= 0) & (Hc <= 30))
                                      | ((Hc >= 150) & (Hc <= 179)))
                                     & ((Sc >= 20) & (Sc <= 100))
                                     & (Vc >= args.flower_pink_v_min)
+                                    & (b_minus_r < args.flower_pink_b_minus_r_max)
+                                    & ~green_dominant
+                                    & ~leaf_bud
                                 )
+                                # Top-frame penalty: rows 0..N have
+                                # the worst specular-leaf-glint
+                                # density (sun strikes waxy cuticles
+                                # at near-grazing angles). Use a
+                                # stricter rule there.
+                                if args.flower_top_frame_penalty_row > 0:
+                                    top_n = int(
+                                        args.flower_top_frame_penalty_row
+                                    )
+                                    if top_n > 0 and top_n < hsv_full.shape[0]:
+                                        top_strict = (
+                                            (Sc < 15)
+                                            & (Vc > 200)
+                                            & (b_minus_r <= -5)
+                                            & ~green_dominant
+                                        )
+                                        white_mask[:top_n, :] = (
+                                            white_mask[:top_n, :]
+                                            & top_strict[:top_n, :]
+                                        )
                                 # Yellow is intentionally NOT in the
                                 # blossom set: trunk bark, dry leaves,
                                 # ground straw all produce yellow-
@@ -3414,15 +3502,37 @@ def main():
                                 _Hc, _Sc, _Vc = (
                                     _hsv[..., 0], _hsv[..., 1], _hsv[..., 2],
                                 )
+                                # Match the in-loop refinement's
+                                # color rules: HSV + b_minus_r cool-
+                                # shadow + green-dominance + leaf-bud
+                                # exclusion. See the refinement block
+                                # for full rationale.
+                                _R = rgb_arr[..., 0].astype(np.int16)
+                                _G = rgb_arr[..., 1].astype(np.int16)
+                                _B = rgb_arr[..., 2].astype(np.int16)
+                                _bmr = _B - _R
+                                _gmr = _G - _R
+                                _green_dom = _gmr > args.flower_g_minus_r_max
+                                _leaf_bud = (
+                                    (_Hc >= 20) & (_Hc <= 50)
+                                    & (_Sc >= 15)
+                                    & (_gmr >= -5)
+                                )
                                 _white = (
                                     (_Sc <= args.flower_white_s_max)
                                     & (_Vc >= args.flower_white_v_min)
+                                    & (_bmr <= args.flower_b_minus_r_max)
+                                    & ~_green_dom
+                                    & ~_leaf_bud
                                 )
                                 _pink = (
                                     (((_Hc >= 0) & (_Hc <= 30))
                                      | ((_Hc >= 150) & (_Hc <= 179)))
                                     & ((_Sc >= 20) & (_Sc <= 100))
                                     & (_Vc >= args.flower_pink_v_min)
+                                    & (_bmr < args.flower_pink_b_minus_r_max)
+                                    & ~_green_dom
+                                    & ~_leaf_bud
                                 )
                                 _blossom_pix = _white | _pink
                             except Exception as _bp_err:
