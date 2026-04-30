@@ -678,7 +678,19 @@ def find_images(root: Path, only_rgb_folders: bool = True,
     frame_range overrides sample_per_session when supplied.
     """
     root = Path(root)
-    for day_dir in sorted(root.glob("2023 day *")):
+    # Support --root pointing at either the dataset parent (containing
+    # multiple "2023 day *" folders) OR at a single day folder
+    # directly. The latter is useful for test runs scoped to one day.
+    if root.is_dir() and root.name.lower().startswith("2023 day"):
+        day_dirs = [root]
+    else:
+        day_dirs = sorted(root.glob("2023 day *"))
+    if not day_dirs:
+        print(
+            f"[scan] WARNING: no '2023 day *' folders found under {root}",
+            file=sys.stderr,
+        )
+    for day_dir in day_dirs:
         inner = day_dir / day_dir.name
         day_root = inner if inner.is_dir() else day_dir
         for category_dir in sorted(p for p in day_root.iterdir() if p.is_dir()):
