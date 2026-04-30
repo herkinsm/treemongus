@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=sam3_yolo_balanced
 #SBATCH --account=PAS0228
-#SBATCH --time=12:00:00
+#SBATCH --time=16:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -83,7 +83,7 @@ echo "[batch] Using python: $PY"
   --flower-white-s-max 40 --flower-white-v-min 140 --flower-pink-v-min 100 \
   --flower-b-minus-r-max 5 --flower-pink-b-minus-r-max 0 \
   --flower-g-minus-r-max 12 --flower-top-frame-penalty-row 50 \
-  --flower-phenology auto --flower-bloom-peak-doy 125 \
+  --flower-phenology off --flower-bloom-peak-doy 125 \
   --flower-fill-anther-holes \
   --split-clusters --split-min-blossom-area-px 30 \
   --split-min-marker-distance-px 5 --split-seed-dilate-px 5 \
@@ -92,6 +92,7 @@ echo "[batch] Using python: $PY"
   --flower-use-texture --flower-texture-threshold 2.5 --flower-edge-threshold 6.0 \
   --flower-ir-positive-min 80 --flower-ir-petal-min 100 --flower-ir-sky-ceil 60 \
   --flower-confirmed-real --flower-near-tree-radius-px 25 \
+  --flower-depth-coverage-threshold 0.20 \
   --flower-exclude-sky-smooth --flower-exclude-sky-warm \
   --flower-exclude-sky-upper --flower-exclude-sky-overcast \
   --flower-exclude-sky-grey \

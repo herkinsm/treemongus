@@ -2700,6 +2700,22 @@ def main():
                     help="Apply the 'confirmed_real = valid_depth OR "
                          "(near_tree AND has_texture)' spatial gate. "
                          "Recovers IR-overexposed flowers near branches.")
+    ap.add_argument("--flower-depth-coverage-threshold", type=float, default=0.0,
+                    help="Per-frame depth-coverage fallback. When the "
+                         "fraction of frame pixels with valid canopy "
+                         "depth (in [depth-min, depth-max] mm) is below "
+                         "this threshold, ALL depth-dependent gates for "
+                         "the frame are skipped automatically: "
+                         "depth-near-frac, local-depth-std, "
+                         "confirmed_real, and the soft-score depth "
+                         "component. Catches the edge case where the "
+                         "D455 sensor returns sparse depth (frame at "
+                         "transitional view, distant trees, sensor edge "
+                         "artifacts) and the cascade of depth-based "
+                         "rejections produces n=0 even when SAM saw real "
+                         "flowers. Default 0.0 = disabled (always use "
+                         "depth gates). Try 0.20 = skip when < 20%% of "
+                         "frame has valid depth.")
     ap.add_argument("--flower-near-tree-radius-px", type=int, default=15,
                     help="Dilation radius for 'near_tree' band. Pixels "
                          "within this many px of a valid-depth pixel can "
@@ -3379,6 +3395,31 @@ def main():
                         max_row_width_frac=args.canopy_max_row_width_frac,
                     )
 
+                # Depth-coverage fallback: if the frame has too little
+                # valid depth (sparse D455 returns at frame edges,
+                # distant scenes, sensor failures), skip every gate
+                # that uses depth so a cascade of depth-based
+                # rejections doesn't kill all the SAM detections.
+                # Computed once per frame, consulted by every depth
+                # gate downstream.
+                _low_depth_coverage = False
+                if (args.flower_depth_coverage_threshold > 0
+                        and depth_mm is not None):
+                    _vd_pix = (
+                        (depth_mm >= args.flower_depth_min_mm)
+                        & (depth_mm <= args.flower_depth_max_mm)
+                    )
+                    _coverage = float(_vd_pix.sum()) / float(depth_mm.size)
+                    if _coverage < args.flower_depth_coverage_threshold:
+                        _low_depth_coverage = True
+                        print(
+                            f"[depth-fallback] {img_path.name}: "
+                            f"{_coverage*100:.1f}% < "
+                            f"{args.flower_depth_coverage_threshold*100:.0f}% "
+                            f"valid -- skipping depth gates",
+                            file=sys.stderr,
+                        )
+
                 # IR + NDVI for the soft-score NDVI component. Loaded
                 # once per image and reused across prompts. NDVI gives
                 # us a positive vegetation/petal signal that depth
@@ -3435,7 +3476,8 @@ def main():
                     # the canopy band (background trees, far ground, etc.).
                     near_mean: float | str = ""
                     near_max: float | str = ""
-                    if args.depth and depth_mm is not None and n_raw > 0:
+                    if (args.depth and depth_mm is not None and n_raw > 0
+                            and not _low_depth_coverage):
                         fracs = near_frac_per_mask(
                             masks_np, depth_mm, args.depth_min_mm, args.depth_max_mm
                         )
@@ -3467,8 +3509,10 @@ def main():
                     apply_local_depth = (
                         is_flower_for_depth_check
                         and args.flower_min_local_depth_std_mm > 0
+                        and not _low_depth_coverage
                     )
                     if (depth_mm is not None and n > 0
+                            and not _low_depth_coverage
                             and (args.mask_min_depth_spread_mm > 0
                                  or args.mask_max_depth_row_corr < 1.0
                                  or apply_local_depth)):
@@ -3802,7 +3846,12 @@ def main():
                                 _no_depth_pix = None
                                 _near_tree = None
                                 _confirmed_real = None
-                                if depth_mm is not None:
+                                # Skip depth-derived signals on low-
+                                # coverage frames so confirmed_real
+                                # doesn't reject every flower when
+                                # depth is too sparse to be meaningful.
+                                if (depth_mm is not None
+                                        and not _low_depth_coverage):
                                     _vd = (
                                         (depth_mm >= args.flower_depth_min_mm)
                                         & (depth_mm <= args.flower_depth_max_mm)
@@ -4210,7 +4259,8 @@ def main():
                         # a sky patch IS blob-shaped.
                         if (args.depth and depth_mm is not None
                                 and args.flower_min_valid_depth_frac > 0
-                                and n > 0):
+                                and n > 0
+                                and not _low_depth_coverage):
                             keep_d = np.ones(n, dtype=bool)
                             d_lo = float(args.flower_depth_min_mm)
                             d_hi = float(args.flower_depth_max_mm)
@@ -4392,7 +4442,8 @@ def main():
                                     mb, sam_s,
                                     rgb_arr, _hsv if _hsv is not None else rgb_arr,
                                     _blossom_pix,
-                                    depth_mm, ndvi_arr,
+                                    None if _low_depth_coverage else depth_mm,
+                                    ndvi_arr,
                                     circ_center=args.flower_soft_circ_center,
                                     circ_softness=args.flower_soft_circ_softness,
                                     density_center=args.flower_soft_density_center,
