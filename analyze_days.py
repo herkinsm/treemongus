@@ -2712,6 +2712,25 @@ def main():
                     help="Apply the 'confirmed_real = valid_depth OR "
                          "(near_tree AND has_texture)' spatial gate. "
                          "Recovers IR-overexposed flowers near branches.")
+    ap.add_argument("--flower-max-depth-cap-mm", type=float, default=0.0,
+                    help="Per-mask maximum-depth cap. ALWAYS runs, even "
+                         "when --flower-depth-coverage-threshold has "
+                         "triggered fallback. For each kept flower mask, "
+                         "if at least --flower-max-depth-cap-min-pixels "
+                         "pixels of the mask have valid depth AND the "
+                         "median of those valid-depth pixels is greater "
+                         "than this cap, reject the mask. Catches "
+                         "background-row trees with valid depth in the "
+                         "5-10 m range that the global fallback would "
+                         "otherwise let through. Default 0.0 = disabled. "
+                         "Try 3500 (mm) when fallback is on; the cap is "
+                         "the actual bound rather than the band-min.")
+    ap.add_argument("--flower-max-depth-cap-min-pixels", type=int, default=20,
+                    help="Minimum number of valid-depth pixels in the "
+                         "mask before --flower-max-depth-cap-mm fires. "
+                         "Below this, we don't have enough depth info "
+                         "to decide -- give the mask the benefit of the "
+                         "doubt. Default 20.")
     ap.add_argument("--flower-depth-coverage-threshold", type=float, default=0.0,
                     help="Per-frame depth-coverage fallback. When the "
                          "fraction of frame pixels with valid canopy "
@@ -4310,6 +4329,50 @@ def main():
                                 if boxes_np is not None:
                                     boxes_np = boxes_np[keep_d]
                                 n = int(keep_d.sum())
+                        # Per-mask MAX-depth cap. Runs ALWAYS, even when
+                        # --flower-depth-coverage-threshold has triggered
+                        # the global depth-fallback. Catches the case
+                        # where the global fallback bypassed all depth
+                        # gates but a SPECIFIC mask still has enough
+                        # valid-depth pixels to decide the mask is on
+                        # a far background tree.
+                        #
+                        # Logic: if mask has >= min_pixels valid-depth
+                        # pixels, compute their median; if median >
+                        # cap, reject. If too few valid-depth pixels,
+                        # don't decide (benefit of doubt).
+                        if (args.flower_max_depth_cap_mm > 0
+                                and depth_mm is not None and n > 0):
+                            keep_cap = np.ones(n, dtype=bool)
+                            cap_mm = float(args.flower_max_depth_cap_mm)
+                            min_px = int(args.flower_max_depth_cap_min_pixels)
+                            valid_pix_global = (depth_mm > 0) & (depth_mm < 60000)
+                            for mi_cap in range(n):
+                                mb_cap = masks_np[mi_cap].astype(bool)
+                                if mb_cap.ndim == 3:
+                                    mb_cap = mb_cap.any(axis=0)
+                                valid_in_mask = mb_cap & valid_pix_global
+                                if int(valid_in_mask.sum()) < min_px:
+                                    continue  # not enough info
+                                med = float(
+                                    np.median(depth_mm[valid_in_mask])
+                                )
+                                if med > cap_mm:
+                                    keep_cap[mi_cap] = False
+                            audit.apply(keep_cap, "max_depth_cap")
+                            if not keep_cap.all():
+                                rt_key = (day, category, session, prompt)
+                                rt = rejection_totals.setdefault(rt_key, {})
+                                rt["max_depth_cap"] = (
+                                    rt.get("max_depth_cap", 0)
+                                    + int((~keep_cap).sum())
+                                )
+                                masks_np = masks_np[keep_cap]
+                                if scores_np is not None:
+                                    scores_np = scores_np[keep_cap]
+                                if boxes_np is not None:
+                                    boxes_np = boxes_np[keep_cap]
+                                n = int(keep_cap.sum())
                         # Ground-row rejection. Catches dandelions /
                         # grass wildflowers in the bottom of the
                         # frame. A cluster whose centroid is below
