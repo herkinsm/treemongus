@@ -92,7 +92,7 @@ echo "[batch] Using python: $PY"
   --flower-use-texture --flower-texture-threshold 2.5 --flower-edge-threshold 6.0 \
   --flower-ir-positive-min 80 --flower-ir-petal-min 100 --flower-ir-sky-ceil 60 \
   --flower-confirmed-real --flower-near-tree-radius-px 25 \
-  --flower-depth-coverage-threshold 0.20 \
+  --flower-depth-coverage-threshold 0.40 \
   --flower-exclude-sky-smooth --flower-exclude-sky-warm \
   --flower-exclude-sky-upper --flower-exclude-sky-overcast \
   --flower-exclude-sky-grey \
