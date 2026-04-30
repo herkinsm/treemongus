@@ -68,7 +68,7 @@ echo "[batch] Using python: $PY"
   --save-overlays --save-empty-overlays --save-masks \
   --depth --tree-mask \
   --require-all-modalities --require-info-modality \
-  --sample-per-session 100 --sample-mode sequential \
+  --sample-per-session 0 --sample-mode stride --sample-stride 20 \
   --threshold 0.005 \
   --prompts flower \
   --flower-multi-prompts flower blossom "apple blossom" \
@@ -82,7 +82,7 @@ echo "[batch] Using python: $PY"
   --flower-max-area-px 12000 --flower-max-bbox-area-px 60000 \
   --flower-white-s-max 40 --flower-white-v-min 140 --flower-pink-v-min 100 \
   --flower-b-minus-r-max 5 --flower-pink-b-minus-r-max 0 \
-  --flower-g-minus-r-max 12 --flower-top-frame-penalty-row 100 \
+  --flower-g-minus-r-max 12 --flower-top-frame-penalty-row 50 \
   --flower-phenology auto --flower-bloom-peak-doy 125 \
   --flower-fill-anther-holes \
   --split-clusters --split-min-blossom-area-px 30 \
@@ -91,7 +91,7 @@ echo "[batch] Using python: $PY"
   --flower-max-ground-row 400 --flower-min-confirmed-pct-ground 10.0 \
   --flower-use-texture --flower-texture-threshold 2.5 --flower-edge-threshold 6.0 \
   --flower-ir-positive-min 80 --flower-ir-petal-min 100 --flower-ir-sky-ceil 60 \
-  --flower-confirmed-real --flower-near-tree-radius-px 15 \
+  --flower-confirmed-real --flower-near-tree-radius-px 25 \
   --flower-exclude-sky-smooth --flower-exclude-sky-warm \
   --flower-exclude-sky-upper --flower-exclude-sky-overcast \
   --flower-exclude-sky-grey \

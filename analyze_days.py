@@ -653,7 +653,8 @@ def find_images(root: Path, only_rgb_folders: bool = True,
                 frame_range: tuple[int, int] | None = None,
                 require_all_modalities: bool = False,
                 require_info_modality: bool = False,
-                sample_mode: str = "sequential"):
+                sample_mode: str = "sequential",
+                sample_stride: int = 20):
     """Yield (day, category, session, image_path) tuples.
 
     When require_all_modalities is True, the per-session image list
@@ -736,6 +737,17 @@ def find_images(root: Path, only_rgb_folders: bool = True,
                         a = max(0, a)
                         b = min(len(imgs), b)
                         idxs = list(range(a, b))
+                    elif sample_mode == "stride":
+                        # Take every Nth complete frame in
+                        # chronological order. Per-session count
+                        # varies by session length; spacing is
+                        # uniform across the orchard pass so we
+                        # see every tree exactly once if the rig
+                        # moved at constant speed. Independent of
+                        # --sample-per-session (the count is
+                        # determined by session length / stride).
+                        stride = max(1, int(sample_stride))
+                        idxs = list(range(0, len(imgs), stride))
                     elif sample_per_session is None or sample_per_session <= 0:
                         idxs = list(range(len(imgs)))
                     elif sample_mode == "sequential":
@@ -2463,12 +2475,22 @@ def main():
                          "N chronologically-ordered complete frames. With "
                          "--sample-mode even, evenly spaces N across the "
                          "whole session. Use 0 for all frames.")
-    ap.add_argument("--sample-mode", choices=("sequential", "even"),
+    ap.add_argument("--sample-mode", choices=("sequential", "even", "stride"),
                     default="sequential",
                     help="How --sample-per-session picks frames. 'sequential' "
                          "= the first N (matches typical 'first 100 frames' "
                          "intuition). 'even' = N evenly-spaced (good for "
-                         "characterizing a whole session timeline).")
+                         "characterizing a whole session timeline). "
+                         "'stride' = take every --sample-stride-th valid "
+                         "frame (ignores --sample-per-session; gives "
+                         "consistent temporal density per session).")
+    ap.add_argument("--sample-stride", type=int, default=20,
+                    help="When --sample-mode is 'stride', take every Nth "
+                         "complete frame in chronological order (default "
+                         "20 = ~5%% of frames). Per-session count varies "
+                         "by session length, but each frame is roughly "
+                         "20 frames apart so coverage is uniform across "
+                         "the orchard pass.")
     ap.add_argument("--frame-range", nargs=2, type=int, metavar=("START", "END"),
                     help="Process consecutive frames imgs[START:END] from each "
                          "session instead of sampling. Tracker-friendly "
@@ -3211,6 +3233,7 @@ def main():
             require_all_modalities=args.require_all_modalities,
             require_info_modality=args.require_info_modality,
             sample_mode=args.sample_mode,
+            sample_stride=args.sample_stride,
         ):
             if args.max_images is not None and total_imgs >= args.max_images:
                 break
