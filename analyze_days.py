@@ -288,6 +288,134 @@ def parse_frame_timestamp(path: Path) -> tuple[int, ...]:
     return tuple(out)
 
 
+def doy_from_path(path: Path) -> int | None:
+    """Extract day-of-year (1-366) from a frame's filename
+    timestamp. Used by the DOY-based phenology stage selector to
+    pick blossom-detection thresholds appropriate for early bloom
+    / bloom / petal fall / fruiting. Returns None when the
+    filename can't be parsed (sorted-fallback path)."""
+    ts = parse_frame_timestamp(path)
+    if ts == (0,) * 7:
+        return None
+    y, m, d = ts[0], ts[1], ts[2]
+    if y < 2000 or y > 2100 or m < 1 or m > 12 or d < 1 or d > 31:
+        return None
+    import datetime
+    try:
+        return datetime.date(y, m, d).timetuple().tm_yday
+    except ValueError:
+        return None
+
+
+def phenol_stage_from_doy(
+    doy: int, bloom_peak_doy: int = 125,
+    pre_days: int = 10, post_days: int = 6,
+    petal_fall_days: int = 14,
+) -> str:
+    """Map day-of-year to phenological stage. Window widths come
+    from the sprayer pipeline's flower_detector defaults so the
+    boundaries match the reference implementation:
+
+        early_bloom : doy <= peak - pre_days
+        bloom       : peak - pre_days < doy <= peak + post_days
+        petal_fall  : peak + post_days < doy <= peak + post_days + petal_fall_days
+        fruiting    : doy > peak + post_days + petal_fall_days
+    """
+    doy = int(doy)
+    peak = int(bloom_peak_doy)
+    pre = int(pre_days)
+    post = int(post_days)
+    pf = int(petal_fall_days)
+    if doy <= peak - pre:
+        return "early_bloom"
+    if doy <= peak + post:
+        return "bloom"
+    if doy <= peak + post + pf:
+        return "petal_fall"
+    return "fruiting"
+
+
+def hsv_thresholds_for_stage(stage: str) -> dict:
+    """Stage-specific HSV / b_minus_r thresholds for the white +
+    pink petal masks. Ported from the sprayer pipeline's
+    flower_detector. Each stage has been independently tuned
+    against the reference operator's data:
+
+      early_bloom : leaf buds dominate; STRICT thresholds.
+      bloom       : open petals dominate; GENEROUS thresholds.
+      petal_fall  : few petals remain; VERY STRICT to avoid FPs.
+      fruiting    : essentially zero petals; TIGHTEST.
+
+    Returns a dict that callers merge into args. Use 'pink_disabled'
+    True for fruiting (where any pink hue is foliage / wildflower,
+    not blossoms)."""
+    if stage == "early_bloom":
+        return {
+            "white_s_max": 30, "white_v_min": 170,
+            "pink_s_min": 5, "pink_s_max": 45, "pink_v_min": 130,
+            "b_minus_r_max": 5, "pink_b_minus_r_max": -10,
+            "pink_disabled": False,
+        }
+    if stage == "bloom":
+        return {
+            "white_s_max": 35, "white_v_min": 160,
+            "pink_s_min": 5, "pink_s_max": 80, "pink_v_min": 80,
+            "b_minus_r_max": 0, "pink_b_minus_r_max": 0,
+            "pink_disabled": False,
+        }
+    if stage == "petal_fall":
+        return {
+            "white_s_max": 10, "white_v_min": 205,
+            "pink_s_min": 5, "pink_s_max": 22, "pink_v_min": 170,
+            "b_minus_r_max": -2, "pink_b_minus_r_max": -22,
+            "pink_disabled": False,
+        }
+    if stage == "fruiting":
+        return {
+            "white_s_max": 4, "white_v_min": 240,
+            "pink_s_min": 999, "pink_s_max": 0, "pink_v_min": 999,
+            "b_minus_r_max": 0, "pink_b_minus_r_max": -999,
+            "pink_disabled": True,
+        }
+    return {}
+
+
+def fill_anther_holes(mask_u8: np.ndarray) -> np.ndarray:
+    """Flood-fill interior holes in a binary uint8 mask.
+
+    Real apple blossoms have yellow anthers / pollen in the center
+    that fail the white S < N rule, leaving 5-10 px donut or
+    crescent gaps in the refined mask. The distance transform of
+    a donut produces 2-3 opposite-side ridge peaks that get
+    counted as separate flowers; for YOLO bbox the donut shape
+    also produces inflated bbox counts and lower mask density.
+
+    Implementation: pad the mask with a 1-pixel 0-border so the
+    frame edge is never treated as interior, then flood-fill the
+    background from (0, 0). After the flood, exterior background
+    is 255 and interior holes are still 0; bitwise NOT gives a
+    holes-only mask that we OR back into the original. Adjacent
+    blossoms stay separate because the background between them
+    connects to the frame exterior (an exterior region), not
+    interior holes.
+
+    Falls back to the input unchanged if cv2 isn't available or
+    the mask is empty."""
+    try:
+        import cv2 as _cv2_fh
+    except Exception:
+        return mask_u8
+    if mask_u8.size == 0 or not mask_u8.any():
+        return mask_u8
+    h, w = mask_u8.shape[:2]
+    padded = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    padded[1:-1, 1:-1] = mask_u8
+    flood_aux = np.zeros((h + 4, w + 4), dtype=np.uint8)
+    _cv2_fh.floodFill(padded, flood_aux, (0, 0), 255)
+    interior_holes = _cv2_fh.bitwise_not(padded)[1:-1, 1:-1]
+    return _cv2_fh.bitwise_or(mask_u8, interior_holes)
+
+
 def info_path_for(img_path: Path) -> Path:
     """Given .../<session>/RGB/<stem>-RGB-BP.<ext>, return
     .../<session>/Info/<bare_timestamp>.txt.
@@ -2258,6 +2386,42 @@ def main():
                          "Specular leaf glints concentrate at the "
                          "canopy crown where sun strikes waxy cuticles "
                          "at near-grazing angles. Set 0 to disable.")
+    # Phenology / DOY adaptation. The sprayer pipeline's
+    # flower_detector adapts every threshold to bloom stage; we
+    # ported those stage-specific values into hsv_thresholds_for_stage.
+    ap.add_argument("--flower-phenology",
+                    choices=("off", "auto", "early_bloom", "bloom",
+                             "petal_fall", "fruiting"),
+                    default="off",
+                    help="Adapt HSV / B-R thresholds to apple bloom "
+                         "stage. 'off' = use the explicit CLI flags "
+                         "as-is (default, preserves back-compat). "
+                         "'auto' = parse DOY from each frame's filename "
+                         "and pick the stage. Or force a specific "
+                         "stage. The reference sprayer pipeline uses "
+                         "auto and adapts every day separately -- this "
+                         "is the single biggest accuracy lever across "
+                         "phenologies.")
+    ap.add_argument("--flower-bloom-peak-doy", type=int, default=125,
+                    help="Day-of-year for full-bloom peak. Bloom window "
+                         "is [peak-10, peak+6]; petal_fall extends 14 "
+                         "more days; fruiting after that. Default 125 "
+                         "for a 'normal' Ohio apple year. Adjust per "
+                         "season / variety.")
+    # Anther hole fill. Real blossoms have yellow centers that fail
+    # the white-petal S threshold, producing donut-shaped masks. The
+    # distance transform on a donut gets multiple peaks (one blossom
+    # counted as multiple flowers).
+    ap.add_argument("--flower-fill-anther-holes", action="store_true",
+                    help="Flood-fill interior holes in the refined "
+                         "petal mask before downstream processing. "
+                         "Closes the 5-10 px gaps left by yellow "
+                         "anthers / pollen in the center of real "
+                         "blossoms (which fail the low-S white rule). "
+                         "Improves mask density, stabilizes bbox area "
+                         "estimates, and prevents donut-shaped masks "
+                         "from being peak-counted as 2-3 flowers. "
+                         "Recommended on for flower YOLO labeling.")
     ap.add_argument("--flower-refine-min-area-px", type=int, default=15,
                     help="After HSV-refining a SAM flower mask to its "
                          "blossom-color subset, drop the mask if the "
@@ -3082,6 +3246,49 @@ def main():
                     kept_areas: list[int] = []
                     if is_flower_prompt and n > 0:
                         rgb_arr = np.asarray(img)
+                        # Phenology stage selector. When
+                        # --flower-phenology is 'auto' or a specific
+                        # stage name, override the white/pink
+                        # thresholds with stage-tuned values from
+                        # the sprayer pipeline reference. Otherwise
+                        # use the args defaults as-is.
+                        _stage_overrides: dict = {}
+                        _stage_label = "off"
+                        if args.flower_phenology != "off":
+                            if args.flower_phenology == "auto":
+                                _doy = doy_from_path(img_path)
+                                if _doy is not None:
+                                    _stage_label = phenol_stage_from_doy(
+                                        _doy, args.flower_bloom_peak_doy,
+                                    )
+                            else:
+                                _stage_label = args.flower_phenology
+                            _stage_overrides = hsv_thresholds_for_stage(
+                                _stage_label,
+                            )
+                        # Local thresholds: stage overrides win when
+                        # provided; otherwise fall back to args.*.
+                        _white_s_max = _stage_overrides.get(
+                            "white_s_max", args.flower_white_s_max,
+                        )
+                        _white_v_min = _stage_overrides.get(
+                            "white_v_min", args.flower_white_v_min,
+                        )
+                        _pink_v_min = _stage_overrides.get(
+                            "pink_v_min", args.flower_pink_v_min,
+                        )
+                        _pink_s_min = _stage_overrides.get("pink_s_min", 20)
+                        _pink_s_max = _stage_overrides.get("pink_s_max", 100)
+                        _b_minus_r_max = _stage_overrides.get(
+                            "b_minus_r_max", args.flower_b_minus_r_max,
+                        )
+                        _pink_bmr_max = _stage_overrides.get(
+                            "pink_b_minus_r_max",
+                            args.flower_pink_b_minus_r_max,
+                        )
+                        _pink_disabled = _stage_overrides.get(
+                            "pink_disabled", False,
+                        )
                         # Refine masks to only contain real blossom-
                         # color pixels. SAM 3 sometimes returns a
                         # mask that wraps the flower AND surrounding
@@ -3137,10 +3344,13 @@ def main():
                                 # check is the killer addition --
                                 # without it, distant-tree foliage
                                 # glints sneak past depth filters.
+                                # Thresholds use _stage-adjusted
+                                # locals when --flower-phenology is
+                                # on, else args defaults.
                                 white_mask = (
-                                    (Sc <= args.flower_white_s_max)
-                                    & (Vc >= args.flower_white_v_min)
-                                    & (b_minus_r <= args.flower_b_minus_r_max)
+                                    (Sc <= _white_s_max)
+                                    & (Vc >= _white_v_min)
+                                    & (b_minus_r <= _b_minus_r_max)
                                     & ~green_dominant
                                     & ~leaf_bud
                                 )
@@ -3150,15 +3360,21 @@ def main():
                                 # b_minus_r near 0; -10 cutoff keeps
                                 # them while excluding warm-leaf
                                 # glints that test as "red hue").
-                                pink_mask = (
-                                    (((Hc >= 0) & (Hc <= 30))
-                                     | ((Hc >= 150) & (Hc <= 179)))
-                                    & ((Sc >= 20) & (Sc <= 100))
-                                    & (Vc >= args.flower_pink_v_min)
-                                    & (b_minus_r < args.flower_pink_b_minus_r_max)
-                                    & ~green_dominant
-                                    & ~leaf_bud
-                                )
+                                # Disabled in the 'fruiting' stage
+                                # where any pink-hue pixel is more
+                                # likely a wildflower or fading leaf.
+                                if _pink_disabled:
+                                    pink_mask = np.zeros_like(white_mask)
+                                else:
+                                    pink_mask = (
+                                        (((Hc >= 0) & (Hc <= 30))
+                                         | ((Hc >= 150) & (Hc <= 179)))
+                                        & ((Sc >= _pink_s_min) & (Sc <= _pink_s_max))
+                                        & (Vc >= _pink_v_min)
+                                        & (b_minus_r < _pink_bmr_max)
+                                        & ~green_dominant
+                                        & ~leaf_bud
+                                    )
                                 # Top-frame penalty: rows 0..N have
                                 # the worst specular-leaf-glint
                                 # density (sun strikes waxy cuticles
@@ -3248,6 +3464,27 @@ def main():
                                         refine_reject[mi] = "refine_empty"
                                         continue
                                     m_ref_raw = m_orig & blossom_pix
+                                    # Optional anther hole-fill.
+                                    # Closes 5-10 px gaps left by
+                                    # yellow stamens at petal centers
+                                    # (which fail the low-S white
+                                    # rule). One blossom = one
+                                    # connected mask after this.
+                                    if (args.flower_fill_anther_holes
+                                            and m_ref_raw.any()):
+                                        m_filled_u8 = fill_anther_holes(
+                                            m_ref_raw.astype(np.uint8) * 255
+                                        )
+                                        # Only keep filled pixels
+                                        # that are inside the original
+                                        # SAM mask -- the flood fill
+                                        # can't accidentally claim
+                                        # surrounding leaves because
+                                        # the SAM mask bounds the
+                                        # candidate region.
+                                        m_ref_raw = (
+                                            m_filled_u8 > 0
+                                        ) & m_orig
                                     refined_area = int(m_ref_raw.sum())
                                     # 80 px minimum: trunk specular
                                     # spots and leaf glints sit in

@@ -83,6 +83,8 @@ echo "[batch] Using python: $PY"
   --flower-white-s-max 40 --flower-white-v-min 140 --flower-pink-v-min 100 \
   --flower-b-minus-r-max 5 --flower-pink-b-minus-r-max 0 \
   --flower-g-minus-r-max 12 --flower-top-frame-penalty-row 100 \
+  --flower-phenology auto --flower-bloom-peak-doy 125 \
+  --flower-fill-anther-holes \
   --flower-min-circularity 0.35 --flower-min-mask-density 0.20 \
   --flower-refine-min-area-px 10 --flower-refine-max-aspect 4.5 \
   --flower-min-soft-score 0.15 --flower-soft-w-sam 1.0 \
