@@ -89,6 +89,15 @@ echo "[batch] Using python: $PY"
   --split-min-marker-distance-px 5 --split-seed-dilate-px 5 \
   --split-area-cap --flower-area-per-flower-px 200 \
   --flower-max-ground-row 400 --flower-min-confirmed-pct-ground 10.0 \
+  --flower-use-texture --flower-texture-threshold 2.5 --flower-edge-threshold 6.0 \
+  --flower-ir-positive-min 80 --flower-ir-petal-min 100 --flower-ir-sky-ceil 60 \
+  --flower-confirmed-real --flower-near-tree-radius-px 15 \
+  --flower-exclude-sky-smooth --flower-exclude-sky-warm \
+  --flower-exclude-sky-upper --flower-exclude-sky-overcast \
+  --flower-exclude-sky-grey \
+  --flower-two-tier-mask \
+  --flower-exclude-bark --flower-exclude-dark --flower-exclude-ground-grass \
+  --flower-compute-density-score --flower-confidence-scale \
   --flower-min-circularity 0.35 --flower-min-mask-density 0.20 \
   --flower-refine-min-area-px 10 --flower-refine-max-aspect 4.5 \
   --flower-min-soft-score 0.15 --flower-soft-w-sam 1.0 \

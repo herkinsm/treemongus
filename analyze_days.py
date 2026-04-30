@@ -380,6 +380,219 @@ def hsv_thresholds_for_stage(stage: str) -> dict:
     return {}
 
 
+def compute_texture_signals(
+    rgb_arr: np.ndarray, V: np.ndarray,
+    ir_arr: np.ndarray | None = None,
+    win: int = 9,
+    texture_threshold: float = 2.5,
+    edge_threshold: float = 6.0,
+) -> dict:
+    """Per-pixel texture / edge signals used to discriminate real
+    flower petals from smooth sky and uniform foliage.
+
+    Real petals have local intensity variation (small bright/dark
+    structure between petals) AND sharp edges (petal-petal
+    boundaries, anther/petal contrast). Smooth sky and uniform
+    cloud have NEITHER. The four signals computed here -- V std,
+    IR std, V-channel Sobel gradient, IR-channel Sobel gradient --
+    each catch a different texture mode; the union (`has_texture`)
+    is the strongest single per-pixel discriminator we have when
+    HSV alone fails.
+
+    Ported from the reference lai_estimation_system87 detector.
+    Returns a dict so the caller can pass individual signals to
+    other gates (e.g. confirmed_real which needs has_texture +
+    valid_depth)."""
+    try:
+        import cv2 as _cv2_t
+        from scipy.ndimage import uniform_filter
+    except Exception:
+        # Fall back to a permissive signal so callers don't break
+        # if scipy is unavailable.
+        return {
+            "V_std": None, "IR_std": None,
+            "edge_mag": None, "ir_edge_mag": None,
+            "has_texture": np.ones(V.shape[:2], dtype=bool),
+        }
+    V_f = V.astype(np.float32)
+    V_mean = uniform_filter(V_f, size=win)
+    V_var = uniform_filter(V_f ** 2, size=win) - V_mean ** 2
+    V_std = np.sqrt(np.maximum(V_var, 0))
+
+    gray = _cv2_t.cvtColor(rgb_arr, _cv2_t.COLOR_RGB2GRAY)
+    sobx = _cv2_t.Sobel(gray, _cv2_t.CV_32F, 1, 0, ksize=3)
+    soby = _cv2_t.Sobel(gray, _cv2_t.CV_32F, 0, 1, ksize=3)
+    edge_mag = np.sqrt(sobx ** 2 + soby ** 2)
+
+    IR_std = None
+    ir_edge_mag = None
+    if ir_arr is not None:
+        IR_f = ir_arr.astype(np.float32)
+        # Bring to 0-255 scale if it's normalized to [0, 1].
+        if IR_f.max() <= 1.5:
+            IR_f = IR_f * 255.0
+        IR_mean = uniform_filter(IR_f, size=win)
+        IR_var = uniform_filter(IR_f ** 2, size=win) - IR_mean ** 2
+        IR_std = np.sqrt(np.maximum(IR_var, 0))
+        ir_sobx = _cv2_t.Sobel(IR_f, _cv2_t.CV_32F, 1, 0, ksize=3)
+        ir_soby = _cv2_t.Sobel(IR_f, _cv2_t.CV_32F, 0, 1, ksize=3)
+        ir_edge_mag = np.sqrt(ir_sobx ** 2 + ir_soby ** 2)
+
+    has_texture = (V_std > texture_threshold) | (edge_mag > edge_threshold)
+    if IR_std is not None:
+        has_texture = (
+            has_texture
+            | (IR_std > texture_threshold)
+            | (ir_edge_mag > edge_threshold)
+        )
+    return {
+        "V_std": V_std, "IR_std": IR_std,
+        "edge_mag": edge_mag, "ir_edge_mag": ir_edge_mag,
+        "has_texture": has_texture,
+    }
+
+
+def compute_sky_exclusions(
+    H: np.ndarray, S: np.ndarray, V: np.ndarray,
+    b_minus_r: np.ndarray, ir_8bit: np.ndarray | None,
+    no_depth: np.ndarray, has_texture: np.ndarray,
+    near_tree: np.ndarray | None,
+    *,
+    enable_smooth: bool = True,
+    enable_warm: bool = True,
+    enable_upper: bool = True,
+    enable_overcast: bool = True,
+    enable_grey: bool = True,
+    enable_br: bool = True,
+    ir_sky_ceil: int = 60,
+    upper_frac: float = 0.30,
+) -> np.ndarray:
+    """Combine the multiple sky-failure-mode exclusions from the
+    reference detector. Each sub-rule catches a different visual
+    failure: smooth bright sky, warm golden-hour sky, top-strip
+    cropped sky, overcast cloud, bright cloud edge, blue-tinted sky.
+    The union goes into the not_flower exclusion combined with
+    foliage / leaf-bud / etc. Disable individual sub-rules via
+    flags if a specific mode mis-fires on your data."""
+    h_img, w_img = H.shape[:2]
+    sky = np.zeros_like(H, dtype=bool)
+    # Smooth bright sky: no texture, no depth, low IR.
+    if enable_smooth and ir_8bit is not None:
+        sky_smooth = (~has_texture) & no_depth & (ir_8bit < ir_sky_ceil)
+        sky |= sky_smooth
+    # Warm / golden-hour sky: no depth, V high, IR low.
+    if enable_warm and ir_8bit is not None:
+        sky_warm = no_depth & (V > 80) & (ir_8bit < 70)
+        sky |= sky_warm
+    # Top-strip sky: top fraction of image, no depth, not near tree.
+    if enable_upper:
+        upper = np.zeros_like(no_depth)
+        upper[: int(h_img * upper_frac), :] = True
+        if near_tree is not None:
+            sky_upper = upper & no_depth & (~near_tree) & (S < 50) & (V > 80)
+        else:
+            sky_upper = upper & no_depth & (S < 50) & (V > 80)
+        sky |= sky_upper
+    # Overcast cloud: no depth, very low S, V in cloud range.
+    if enable_overcast:
+        sky_overcast = no_depth & (S < 12) & (V > 140) & (V <= 200)
+        sky |= sky_overcast
+    # Bright grey cloud: depth=0, V very high, S low, IR moderate.
+    if enable_grey and ir_8bit is not None:
+        sky_grey = no_depth & (V > 200) & (S < 20) & (ir_8bit < 100)
+        sky |= sky_grey
+    # B-R-positive sky catch-all: low S, high V, no depth, blue-shifted.
+    if enable_br:
+        sky_br = no_depth & (b_minus_r > 0) & (S < 30) & (V > 150)
+        sky |= sky_br
+    return sky
+
+
+def compute_negative_pixel_masks(
+    H: np.ndarray, S: np.ndarray, V: np.ndarray,
+    *,
+    enable_bark: bool = True,
+    enable_dark: bool = True,
+    enable_ground: bool = True,
+) -> np.ndarray:
+    """Per-pixel negative masks: things a flower can never be.
+    Combines bark, dark material, and ground-grass exclusions
+    from the reference detector. Returned as a single boolean
+    mask suitable for OR-ing with other exclusions."""
+    out = np.zeros_like(H, dtype=bool)
+    if enable_bark:
+        bark_brown = (
+            (H >= 8) & (H <= 35) & (S > 50) & (V < 100)
+        )
+        out |= bark_brown
+    if enable_dark:
+        dark_material = V < 45
+        out |= dark_material
+    if enable_ground:
+        ground_grass = (
+            (H >= 25) & (H <= 95) & (V < 100) & (S > 20)
+        )
+        out |= ground_grass
+    return out
+
+
+def compute_confirmed_real(
+    valid_depth: np.ndarray,
+    has_texture: np.ndarray,
+    near_tree_radius_px: int = 15,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Spatial confirmation gate: a pixel is "real on the tree"
+    iff it has valid depth OR (it's near a valid-depth pixel AND
+    it has local texture).
+
+    The dilated near_tree band catches IR-overexposed flower
+    pixels (depth=0 because the petal saturated the IR projector)
+    that are textured AND adjacent to branches with valid depth.
+    Without this, those flowers get rejected by depth filters.
+
+    Returns (confirmed_real, near_tree).
+    """
+    try:
+        import cv2 as _cv2_c
+    except Exception:
+        return valid_depth.copy(), valid_depth.copy()
+    k = max(1, 2 * int(near_tree_radius_px) + 1)
+    kern = _cv2_c.getStructuringElement(_cv2_c.MORPH_ELLIPSE, (k, k))
+    near_tree = _cv2_c.dilate(
+        valid_depth.astype(np.uint8), kern, iterations=1,
+    ).astype(bool)
+    confirmed_real = valid_depth | (near_tree & has_texture)
+    return confirmed_real, near_tree
+
+
+def compute_density_score(
+    masks_np: np.ndarray, frame_hw: tuple[int, int],
+    sigma: float = 4.0, kernel_size: int = 15,
+) -> float:
+    """Estrada-style density score: union all kept flower masks
+    into a binary image, Gaussian-blur it, sum. Provides an
+    alternative counting metric robust to over- / under-
+    segmentation. Returns 0.0 if no masks."""
+    try:
+        import cv2 as _cv2_d
+    except Exception:
+        return 0.0
+    if masks_np is None or len(masks_np) == 0:
+        return 0.0
+    union = np.zeros(frame_hw, dtype=np.uint8)
+    for m in masks_np:
+        mb = m.astype(bool)
+        if mb.ndim == 3:
+            mb = mb.any(axis=0)
+        union |= mb.astype(np.uint8)
+    union *= 255
+    k = int(kernel_size)
+    if k % 2 == 0:
+        k += 1
+    blurred = _cv2_d.GaussianBlur(union.astype(np.float32), (k, k), sigmaX=sigma)
+    return float(blurred.sum() / 255.0)
+
+
 def fill_anther_holes(mask_u8: np.ndarray) -> np.ndarray:
     """Flood-fill interior holes in a binary uint8 mask.
 
@@ -2436,6 +2649,72 @@ def main():
     # the white-petal S threshold, producing donut-shaped masks. The
     # distance transform on a donut gets multiple peaks (one blossom
     # counted as multiple flowers).
+    # Reference-detector additions: texture map, IR positive signal,
+    # multiple sky exclusions, confirmed_real gate, two-tier core mask,
+    # density score, confidence scaling, negative pixel masks.
+    ap.add_argument("--flower-use-texture", action="store_true",
+                    help="Compute V_std + IR_std + Sobel gradient maps and "
+                         "require pixels to have texture (or valid depth) to "
+                         "count as flower. Single biggest discriminator "
+                         "between real petals and smooth sky/cloud.")
+    ap.add_argument("--flower-texture-threshold", type=float, default=2.5,
+                    help="Min V_std / IR_std for a pixel to be 'textured'. "
+                         "Default 2.5 from reference detector.")
+    ap.add_argument("--flower-edge-threshold", type=float, default=6.0,
+                    help="Min Sobel gradient magnitude for 'edge'. "
+                         "Default 6.0 from reference detector.")
+    ap.add_argument("--flower-ir-positive-min", type=int, default=80,
+                    help="If a pixel's IR > this AND it's in fg_flower, "
+                         "treat as flower (positive signal). Petals reflect "
+                         "NIR strongly. Default 80; set 256 to disable.")
+    ap.add_argument("--flower-ir-petal-min", type=int, default=100,
+                    help="Tier 3 of REGION mask: pixels with IR > this AND "
+                         "V > 50 AND S < 70 are 'IR-confirmed petals'. "
+                         "Captures dim shaded blossoms that fail HSV.")
+    ap.add_argument("--flower-ir-sky-ceil", type=int, default=60,
+                    help="Pixels with IR < this AND no_depth AND no texture "
+                         "are smooth-sky. Default 60.")
+    ap.add_argument("--flower-confirmed-real", action="store_true",
+                    help="Apply the 'confirmed_real = valid_depth OR "
+                         "(near_tree AND has_texture)' spatial gate. "
+                         "Recovers IR-overexposed flowers near branches.")
+    ap.add_argument("--flower-near-tree-radius-px", type=int, default=15,
+                    help="Dilation radius for 'near_tree' band. Pixels "
+                         "within this many px of a valid-depth pixel can "
+                         "still pass confirmed_real if textured.")
+    # Multiple sky exclusion sub-rules (each opt-in independently):
+    ap.add_argument("--flower-exclude-sky-smooth", action="store_true",
+                    help="Exclude smooth bright sky (~has_texture & no_depth & low_IR).")
+    ap.add_argument("--flower-exclude-sky-warm", action="store_true",
+                    help="Exclude warm/golden-hour sky (no_depth & V>80 & IR<70).")
+    ap.add_argument("--flower-exclude-sky-upper", action="store_true",
+                    help="Exclude top-strip sky (top 30%% & no_depth & low_S & V>80).")
+    ap.add_argument("--flower-exclude-sky-overcast", action="store_true",
+                    help="Exclude overcast cloud (no_depth & S<12 & V 140-200).")
+    ap.add_argument("--flower-exclude-sky-grey", action="store_true",
+                    help="Exclude bright grey cloud (no_depth & V>200 & S<20 & IR<100).")
+    # Two-tier REGION + CORE masks:
+    ap.add_argument("--flower-two-tier-mask", action="store_true",
+                    help="Compute a REGION mask (broad, for area / bbox) plus "
+                         "a CORE mask (strict white/pink only, for confident "
+                         "individual flower counting). The CORE coverage "
+                         "percentage drives the confidence-scaling "
+                         "adjustment to est_flowers per cluster.")
+    # Negative pixel masks (per-rule opt-in):
+    ap.add_argument("--flower-exclude-bark", action="store_true",
+                    help="Exclude bark-brown pixels (H 8-35, S>50, V<100).")
+    ap.add_argument("--flower-exclude-dark", action="store_true",
+                    help="Exclude dark-material pixels (V<45).")
+    ap.add_argument("--flower-exclude-ground-grass", action="store_true",
+                    help="Exclude ground-grass pixels (H 25-95, V<100, S>20).")
+    # Density score and confidence scaling:
+    ap.add_argument("--flower-compute-density-score", action="store_true",
+                    help="Compute Estrada-style Gaussian-blur density score "
+                         "and write to results.csv as 'flower_density_sum'.")
+    ap.add_argument("--flower-confidence-scale", action="store_true",
+                    help="Scale a cluster's est_flowers count down when its "
+                         "CORE coverage is < 50%% and area > 500 px. Reduces "
+                         "over-count on warm-petal/foliage-mixed clusters.")
     ap.add_argument("--flower-fill-anther-holes", action="store_true",
                     help="Flood-fill interior holes in the refined "
                          "petal mask before downstream processing. "
@@ -2845,6 +3124,7 @@ def main():
     zone_cols = zone_count_csv_keys(n_cols=2, n_rows=5)
     fieldnames = ["day", "category", "session", "image", "prompt",
                   "n_detections", "n_raw", "est_flowers",
+                  "flower_density_sum",
                   "mean_score", "max_score", "elapsed_s",
                   "near_frac_mean", "near_frac_max",
                   "canopy_overlap_mean", "roi_overlap_mean", "track_ids"]
@@ -3457,6 +3737,168 @@ def main():
                                 # still has plenty of white petal
                                 # pixels for the refined mask.
                                 blossom_pix = white_mask | pink_mask
+
+                                # ============================================
+                                # Reference-detector enhancements:
+                                #   - has_texture (V_std + IR_std + Sobel)
+                                #   - IR > N positive flower signal
+                                #   - Multiple sky-type exclusions
+                                #   - confirmed_real spatial gate
+                                #   - Negative pixel masks (bark / dark / ground)
+                                #   - Two-tier REGION + CORE
+                                # All gated by their respective opt-in flags
+                                # so back-compat is preserved.
+                                # ============================================
+                                _ir_8bit = None
+                                if ir_arr is not None:
+                                    _ir_norm = ir_arr.astype(np.float32)
+                                    if _ir_norm.max() <= 1.5:
+                                        _ir_8bit = np.clip(
+                                            _ir_norm * 255.0, 0, 255,
+                                        ).astype(np.uint8)
+                                    else:
+                                        _ir_8bit = np.clip(
+                                            _ir_norm, 0, 255,
+                                        ).astype(np.uint8)
+                                # Texture map (only computed when used).
+                                _has_texture = None
+                                if (args.flower_use_texture
+                                        or args.flower_confirmed_real
+                                        or args.flower_exclude_sky_smooth
+                                        or args.flower_exclude_sky_warm
+                                        or args.flower_exclude_sky_upper):
+                                    _tex = compute_texture_signals(
+                                        rgb_arr, Vc, ir_arr,
+                                        win=9,
+                                        texture_threshold=args.flower_texture_threshold,
+                                        edge_threshold=args.flower_edge_threshold,
+                                    )
+                                    _has_texture = _tex.get("has_texture")
+                                # Depth helpers for confirmed_real and sky.
+                                _valid_depth_pix = None
+                                _no_depth_pix = None
+                                _near_tree = None
+                                _confirmed_real = None
+                                if depth_mm is not None:
+                                    _vd = (
+                                        (depth_mm >= args.flower_depth_min_mm)
+                                        & (depth_mm <= args.flower_depth_max_mm)
+                                    )
+                                    _valid_depth_pix = _vd
+                                    _no_depth_pix = ~_vd
+                                    if (args.flower_confirmed_real
+                                            and _has_texture is not None):
+                                        _confirmed_real, _near_tree = (
+                                            compute_confirmed_real(
+                                                _vd, _has_texture,
+                                                near_tree_radius_px=args.flower_near_tree_radius_px,
+                                            )
+                                        )
+                                # IR positive flower signal (REGION tier 3).
+                                # Captures dim shaded blossoms whose HSV
+                                # alone is borderline -- petals reflect NIR
+                                # strongly so high-IR pixels with V > 50 and
+                                # low-S still qualify.
+                                _ir_petal = None
+                                if (_ir_8bit is not None
+                                        and args.flower_ir_petal_min < 256):
+                                    _ir_petal = (
+                                        (_ir_8bit > args.flower_ir_petal_min)
+                                        & (Vc > 50) & (Sc < 70)
+                                        & ~green_dominant & ~leaf_bud
+                                    )
+                                    blossom_pix = blossom_pix | _ir_petal
+                                # IR > N positive signal added to the gate
+                                # so a pixel can pass on color OR IR alone.
+                                if (_ir_8bit is not None
+                                        and args.flower_ir_positive_min < 256):
+                                    _ir_positive = (
+                                        (_ir_8bit > args.flower_ir_positive_min)
+                                        & ~green_dominant & ~leaf_bud
+                                    )
+                                    # Combined OR with current blossom_pix.
+                                    blossom_pix = blossom_pix | _ir_positive
+                                # Multiple sky-type exclusions.
+                                if (_no_depth_pix is not None
+                                        and (args.flower_exclude_sky_smooth
+                                             or args.flower_exclude_sky_warm
+                                             or args.flower_exclude_sky_upper
+                                             or args.flower_exclude_sky_overcast
+                                             or args.flower_exclude_sky_grey)):
+                                    _sky_mask = compute_sky_exclusions(
+                                        Hc, Sc, Vc, b_minus_r, _ir_8bit,
+                                        _no_depth_pix,
+                                        _has_texture if _has_texture is not None
+                                            else np.zeros_like(Vc, dtype=bool),
+                                        _near_tree,
+                                        enable_smooth=args.flower_exclude_sky_smooth,
+                                        enable_warm=args.flower_exclude_sky_warm,
+                                        enable_upper=args.flower_exclude_sky_upper,
+                                        enable_overcast=args.flower_exclude_sky_overcast,
+                                        enable_grey=args.flower_exclude_sky_grey,
+                                        enable_br=False,  # already covered by white_mask b_minus_r
+                                        ir_sky_ceil=args.flower_ir_sky_ceil,
+                                    )
+                                    blossom_pix = blossom_pix & ~_sky_mask
+                                # Negative pixel masks (bark / dark / ground).
+                                if (args.flower_exclude_bark
+                                        or args.flower_exclude_dark
+                                        or args.flower_exclude_ground_grass):
+                                    _neg = compute_negative_pixel_masks(
+                                        Hc, Sc, Vc,
+                                        enable_bark=args.flower_exclude_bark,
+                                        enable_dark=args.flower_exclude_dark,
+                                        enable_ground=args.flower_exclude_ground_grass,
+                                    )
+                                    blossom_pix = blossom_pix & ~_neg
+                                # confirmed_real spatial gate.
+                                if (args.flower_confirmed_real
+                                        and _confirmed_real is not None):
+                                    blossom_pix = blossom_pix & _confirmed_real
+                                # has_texture gate (per-pixel).
+                                if (args.flower_use_texture
+                                        and _has_texture is not None):
+                                    blossom_pix = blossom_pix & _has_texture
+
+                                # ── Two-tier mask: CORE for counting ────
+                                # CORE = strict white/pink-only intersection
+                                # with the broad blossom_pix REGION.
+                                # core_pct per cluster drives the confidence
+                                # scaling and is also a downstream feature.
+                                _flower_core = None
+                                if args.flower_two_tier_mask:
+                                    _white_core = (
+                                        (Sc < 20) & (Vc > 150)
+                                        & (b_minus_r <= 10)
+                                        & ~green_dominant & ~leaf_bud
+                                    )
+                                    _pink_core = (
+                                        (((Hc <= 12) | (Hc >= 160)))
+                                        & (Sc >= 10) & (Sc <= 50)
+                                        & (Vc > 130) & (b_minus_r < -10)
+                                        & ~green_dominant & ~leaf_bud
+                                    )
+                                    if _valid_depth_pix is not None:
+                                        _deep_pink_core = (
+                                            (((Hc <= 20) | (Hc >= 150)))
+                                            & (Sc >= 40) & (Sc <= 110)
+                                            & (Vc > 80)
+                                            & (b_minus_r < -20)
+                                            & _valid_depth_pix
+                                            & ~green_dominant & ~leaf_bud
+                                        )
+                                    else:
+                                        _deep_pink_core = (
+                                            (((Hc <= 20) | (Hc >= 150)))
+                                            & (Sc >= 40) & (Sc <= 110)
+                                            & (Vc > 80)
+                                            & (b_minus_r < -20)
+                                            & ~green_dominant & ~leaf_bud
+                                        )
+                                    _flower_core = (
+                                        (_white_core | _pink_core | _deep_pink_core)
+                                        & blossom_pix
+                                    )
                                 # NO pink-content gate -- most apple
                                 # cultivars produce nearly pure-
                                 # white blossoms (Gala, Honeycrisp,
@@ -3516,6 +3958,24 @@ def main():
                                         refine_reject[mi] = "refine_empty"
                                         continue
                                     m_ref_raw = m_orig & blossom_pix
+                                    # Per-mask CORE coverage (used by
+                                    # the confidence-scaling step
+                                    # below). _flower_core is the
+                                    # strict-only mask from the
+                                    # two-tier block; if disabled, we
+                                    # skip core_pct entirely.
+                                    if _flower_core is not None:
+                                        _core_in_mask = int(
+                                            (m_orig & _flower_core).sum()
+                                        )
+                                        _orig_area = int(m_orig.sum())
+                                        _core_pct = (
+                                            100.0 * _core_in_mask / _orig_area
+                                            if _orig_area > 0 else 0.0
+                                        )
+                                        audit.set_meta(
+                                            mi, core_pct=float(_core_pct),
+                                        )
                                     # Optional anther hole-fill.
                                     # Closes 5-10 px gaps left by
                                     # yellow stamens at petal centers
@@ -4092,11 +4552,46 @@ def main():
                                 pass
 
                     # Density-based individual flower estimate per cluster.
+                    # With --flower-confidence-scale, scale each cluster's
+                    # area-based estimate down when its CORE coverage is
+                    # < 50% AND the cluster is large (>500 px). Reduces
+                    # over-count on warm-petal / foliage-mixed clusters.
+                    # Mirrors the reference detector's behaviour.
                     if is_flower_prompt and kept_areas:
                         per = args.flower_area_per_flower_px
-                        est_flowers = int(sum(max(1, round(a / per)) for a in kept_areas))
+                        if args.flower_confidence_scale and n > 0:
+                            est_flowers = 0
+                            kept_orig = audit.kept_originals()
+                            for ki, a in enumerate(kept_areas):
+                                count = max(1, round(a / per))
+                                if a > 500 and ki < len(kept_orig):
+                                    orig_i = int(kept_orig[ki])
+                                    cp = audit.meta.get(
+                                        orig_i, {}).get("core_pct", 100.0)
+                                    if cp < 50.0:
+                                        scale = max(0.5, cp / 100.0 + 0.3)
+                                        count = max(1, round(count * scale))
+                                est_flowers += int(count)
+                        else:
+                            est_flowers = int(sum(
+                                max(1, round(a / per)) for a in kept_areas
+                            ))
                     else:
                         est_flowers = n if not is_flower_prompt else 0
+                    # Density score (Estrada-style Gaussian-blur sum).
+                    # Optional alternative counting metric written to the
+                    # CSV under 'flower_density_sum'. Sum over the union
+                    # of all kept flower masks.
+                    flower_density_sum: float | str = ""
+                    if (args.flower_compute_density_score
+                            and is_flower_prompt and n > 0):
+                        flower_density_sum = round(
+                            compute_density_score(
+                                masks_np, (img.height, img.width),
+                                sigma=4.0, kernel_size=15,
+                            ),
+                            3,
+                        )
 
                     # Tracker step (after depth + flower-quality filters, so we
                     # only track real near-field, properly-sized flowers).
@@ -4317,6 +4812,7 @@ def main():
                         "n_detections": n,
                         "n_raw": n_raw,
                         "est_flowers": est_flowers,
+                        "flower_density_sum": flower_density_sum,
                         "mean_score": round(mean_s, 4),
                         "max_score": round(max_s, 4),
                         "elapsed_s": round(inf_elapsed + (time.time() - t0), 3),
