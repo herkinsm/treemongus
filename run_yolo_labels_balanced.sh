@@ -1,0 +1,93 @@
+#!/bin/bash
+#SBATCH --job-name=sam3_yolo_balanced
+#SBATCH --account=PAS0228
+#SBATCH --time=12:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --output=%x_%j.log
+
+# Balanced YOLO labeling run -- snapshot of run_yolo_labels.sh after
+# the recall/precision iteration converged. Settings here aim to:
+#   - Catch most flowers on the foreground tree (recall)
+#   - Reject most background-row trees (precision)
+#   - Handle varied lighting (golden hour, overcast) and tree
+#     conditions (sparse young, dense mature)
+#
+# Differs from run_flowers_all.sh:
+#   - NO --prgb (whole-image labels for YOLO).
+#   - Wider HSV thresholds for off-color / low-light petals.
+#   - Disabled NDVI / canopy-context (sparse trees).
+#   - Tighter depth filtering (depth-max 3 m, local-depth-std 80
+#     mm, depth-near-frac 0.40) to reject distant trees.
+#   - Soft-score gate at 0.15 with w_sam=1.0 admits moderate-SAM
+#     real flowers while letting shape/color/depth carry weight.
+#
+# After this job: assemble the YOLO dataset with track stability:
+#   python make_yolo_dataset.py --in $HOME/sam3_yolo_labels \
+#       --out $HOME/yolo_dataset --val-frac 0.2 --min-track-frames 3
+
+cd ~/sam3-apple-analysis && git pull
+
+# CPU threading
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+echo "[batch] threading: OMP/MKL/OPENBLAS=$OMP_NUM_THREADS"
+
+# Conda env
+if [ -f "$HOME/.conda/envs/sam3/bin/python" ]; then
+    PY="$HOME/.conda/envs/sam3/bin/python"
+elif [ -f "/users/PAS0228/mherkins/.conda/envs/sam3/bin/python" ]; then
+    PY="/users/PAS0228/mherkins/.conda/envs/sam3/bin/python"
+else
+    PY="python"
+fi
+for conda_init in \
+    "$HOME/miniconda3/etc/profile.d/conda.sh" \
+    "$HOME/anaconda3/etc/profile.d/conda.sh" \
+    "$HOME/.conda/etc/profile.d/conda.sh" \
+    "/apps/anaconda3/etc/profile.d/conda.sh" \
+    "/users/PAS0228/mherkins/.conda/etc/profile.d/conda.sh"
+do
+    if [ -f "$conda_init" ]; then
+        # shellcheck disable=SC1090
+        . "$conda_init"
+        conda activate sam3 2>/dev/null && break
+    fi
+done
+
+echo "[batch] Using python: $PY"
+"$PY" -c "import sam3; print('[batch] sam3 OK')" \
+    || { echo "[batch] sam3 import failed -- aborting"; exit 1; }
+
+"$PY" analyze_days.py \
+  --root "/fs/scratch/PAS0228" \
+  --out "$HOME/sam3_yolo_labels" \
+  --save-overlays --save-empty-overlays --save-masks \
+  --depth --tree-mask \
+  --require-all-modalities --require-info-modality \
+  --sample-per-session 100 --sample-mode sequential \
+  --threshold 0.005 \
+  --prompts flower \
+  --flower-multi-prompts flower blossom "apple blossom" \
+  --flower-require-blossom-color --flower-min-blossom-color-frac 0.10 \
+  --flower-min-area-px 4 --no-flower-reject-yellow \
+  --depth-min-mm 600 --depth-max-mm 3000 --depth-near-frac 0.40 \
+  --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
+  --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
+  --tree-mask-min-overlap 0.10 \
+  --flower-y-min 0 --flower-y-max 380 \
+  --flower-max-area-px 12000 --flower-max-bbox-area-px 60000 \
+  --flower-white-s-max 40 --flower-white-v-min 140 --flower-pink-v-min 100 \
+  --flower-min-circularity 0.35 --flower-min-mask-density 0.20 \
+  --flower-refine-min-area-px 10 --flower-refine-max-aspect 4.5 \
+  --flower-min-soft-score 0.15 --flower-soft-w-sam 1.0 \
+  --flower-context-ring-px 20 --flower-context-min-canopy-frac 0.0 \
+  --flower-context-depth-tol-mm 3000 \
+  --flower-petal-ndvi-mean 0.05 --flower-petal-ndvi-std 0.50 \
+  --flower-canopy-ndvi-min 0.0 --flower-canopy-ndvi-softness 0.0 \
+  --flower-min-local-depth-std-mm 80 \
+  --debug-rejection-log \
+  --track --track-min-frames 3
