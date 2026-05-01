@@ -2551,6 +2551,15 @@ def main():
     ap.add_argument("--tree-mask-min-overlap", type=float, default=0.5,
                     help="Keep a detection only if >= this fraction of its mask pixels "
                          "lie inside the canopy mask (default 0.5).")
+    ap.add_argument("--tree-mask-dilate-px", type=int, default=0,
+                    help="Dilate the canopy mask by this many pixels "
+                         "BEFORE the overlap check. Catches flowers on "
+                         "branches / twigs that extend slightly past "
+                         "the bulk of the canopy mask -- those would "
+                         "otherwise fail tree-mask-min-overlap because "
+                         "the canopy mask CC filter dropped the thin "
+                         "branch as a small fragment. Recommended 20-40 "
+                         "for whole-image YOLO labeling. Default 0.")
     ap.add_argument("--use-build-tree-mask", action="store_true",
                     help="Use the more robust tree_mask.build_tree_mask "
                          "function instead of compute_canopy_mask. Adds "
@@ -3470,6 +3479,33 @@ def main():
                             min_cc_area_px=args.canopy_min_cc_area_px,
                             max_row_width_frac=args.canopy_max_row_width_frac,
                         )
+                    # Optional dilation of the canopy mask. Catches
+                    # flowers on lateral/forward branches whose mask
+                    # extends slightly past what build_tree_mask
+                    # captured as canopy. Without this, those flowers
+                    # fail --tree-mask-min-overlap because the canopy
+                    # CC filter dropped the thin branches.
+                    if (canopy_mask_img is not None
+                            and args.tree_mask_dilate_px > 0):
+                        try:
+                            import cv2 as _cv2_dil
+                            _k = max(
+                                1,
+                                2 * int(args.tree_mask_dilate_px) + 1,
+                            )
+                            _kern = _cv2_dil.getStructuringElement(
+                                _cv2_dil.MORPH_ELLIPSE, (_k, _k),
+                            )
+                            canopy_mask_img = _cv2_dil.dilate(
+                                canopy_mask_img.astype(np.uint8),
+                                _kern, iterations=1,
+                            ).astype(bool)
+                        except Exception as _dil_err:
+                            print(
+                                f"[warn] canopy mask dilation failed "
+                                f"({_dil_err!r}); using undilated mask",
+                                file=sys.stderr,
+                            )
 
                 # Depth-coverage fallback: if the frame has too little
                 # valid depth (sparse D455 returns at frame edges,
