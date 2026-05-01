@@ -2473,6 +2473,76 @@ class IoUTracker:
         return [{"track_id": tid, **t} for tid, t in self.tracks.items()]
 
 
+def filter_painted_stake_trunks(
+    trunk_boxes: list,
+    trunk_scores: list,
+    rgb_arr: np.ndarray,
+    *,
+    max_green_dominant_pct: float = 0.35,
+    green_dominance_threshold: int = 15,
+    min_brown_pct: float = 0.20,
+) -> tuple[list, list]:
+    """Reject trunk bboxes that are predominantly green-painted
+    (apple-orchard support stakes) rather than wooden trunks.
+
+    Heuristic: real apple trunks read brown/grey/red-shifted in
+    RGB (R near or above G, slight blue deficit). Painted green
+    stakes have G consistently dominant by 15+ over R and B.
+
+    For each trunk bbox, count pixels that are:
+      - GREEN-DOMINANT: G > R + 15 AND G > B + 15
+      - BROWN/GREY:     R near G near B (within 20) OR R > G + 10
+
+    Reject the trunk if more than --max-green-dominant-pct of its
+    bbox pixels are green-dominant AND it has insufficient brown/
+    grey pixels (less than --min-brown-pct). The dual check
+    handles edge cases like a trunk with foliage in front (lots
+    of green but also brown).
+
+    Returns (kept_boxes, kept_scores) -- same shape as input but
+    filtered.
+    """
+    if not trunk_boxes:
+        return [], []
+    kept_boxes: list = []
+    kept_scores: list = []
+    H_img, W_img = rgb_arr.shape[:2]
+    for box, score in zip(trunk_boxes, trunk_scores):
+        x1, y1, x2, y2 = [int(round(float(v))) for v in box]
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(W_img, x2); y2 = min(H_img, y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = rgb_arr[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        r = crop[..., 0].astype(np.int16)
+        g = crop[..., 1].astype(np.int16)
+        b = crop[..., 2].astype(np.int16)
+        green_dom = (
+            (g > r + green_dominance_threshold)
+            & (g > b + green_dominance_threshold)
+        )
+        # Brown/grey detection: either R, G, B nearly equal (grey/
+        # neutral wood) OR R > G + 10 AND R > B + 10 (red-shifted
+        # warm bark).
+        gray_ish = (np.abs(r - g) < 20) & (np.abs(g - b) < 20)
+        red_warm = (r > g + 10) & (r > b + 10)
+        brown_ish = gray_ish | red_warm
+        total = float(crop.shape[0] * crop.shape[1])
+        if total <= 0:
+            continue
+        green_pct = float(green_dom.sum()) / total
+        brown_pct = float(brown_ish.sum()) / total
+        # Reject if too green AND not enough brown to override.
+        if (green_pct > max_green_dominant_pct
+                and brown_pct < min_brown_pct):
+            continue
+        kept_boxes.append(box)
+        kept_scores.append(score)
+    return kept_boxes, kept_scores
+
+
 def partition_canopy_by_trunks(
     canopy_mask: np.ndarray,
     trunk_boxes: list,
@@ -2854,6 +2924,34 @@ def main():
                     help="Text prompt used to detect trunks for "
                          "canopy partitioning when "
                          "--canopy-track-method=trunk.")
+    ap.add_argument("--canopy-trunk-reject-green-stakes",
+                    action="store_true",
+                    help="Apply a color filter that rejects 'trunk' "
+                         "detections matching painted-green support "
+                         "stakes. Apple orchards routinely use green-"
+                         "painted metal stakes next to young trees; "
+                         "SAM 3 with the trunk prompt picks them up "
+                         "as trunks. Without this filter, stake "
+                         "positions become Voronoi anchors and the "
+                         "canopy partition gets mis-assigned.")
+    ap.add_argument("--canopy-trunk-max-green-pct", type=float,
+                    default=0.35,
+                    help="Reject trunk if more than this fraction of "
+                         "its bbox pixels are green-dominant "
+                         "(G > R+threshold AND G > B+threshold). "
+                         "Default 0.35 = 35%%.")
+    ap.add_argument("--canopy-trunk-green-threshold", type=int,
+                    default=15,
+                    help="A pixel is 'green-dominant' if G exceeds R "
+                         "and B by at least this many counts. "
+                         "Default 15.")
+    ap.add_argument("--canopy-trunk-min-brown-pct", type=float,
+                    default=0.20,
+                    help="Override the green rejection if at least "
+                         "this fraction of bbox pixels are brown / "
+                         "grey / red-warm (real wooden trunk colors). "
+                         "Catches trunks with foliage in front. "
+                         "Default 0.20 = 20%%.")
     ap.add_argument("--use-build-tree-mask", action="store_true",
                     help="Use the more robust tree_mask.build_tree_mask "
                          "function instead of compute_canopy_mask. Adds "
@@ -3885,6 +3983,7 @@ def main():
                             _trunk_infer.get("scores") if _trunk_infer else None
                         )
                         _kept_trunk_boxes: list = []
+                        _kept_trunk_scores: list = []
                         if (_trunk_boxes_all is not None
                                 and len(_trunk_boxes_all)):
                             _scores = (
@@ -3897,6 +3996,24 @@ def main():
                                     _kept_trunk_boxes.append(
                                         [float(x) for x in tb]
                                     )
+                                    _kept_trunk_scores.append(float(ts))
+                            # Filter out painted-green support stakes
+                            # before they get used as canopy anchors.
+                            # Stakes look like trunks to SAM 3 but
+                            # would mis-anchor the Voronoi partition.
+                            if (args.canopy_trunk_reject_green_stakes
+                                    and _kept_trunk_boxes):
+                                _rgb_arr_for_stake = np.asarray(img)
+                                _kept_trunk_boxes, _kept_trunk_scores = (
+                                    filter_painted_stake_trunks(
+                                        _kept_trunk_boxes,
+                                        _kept_trunk_scores,
+                                        _rgb_arr_for_stake,
+                                        max_green_dominant_pct=args.canopy_trunk_max_green_pct,
+                                        green_dominance_threshold=args.canopy_trunk_green_threshold,
+                                        min_brown_pct=args.canopy_trunk_min_brown_pct,
+                                    )
+                                )
                         if _kept_trunk_boxes:
                             frame_canopy_components, _part_labels = (
                                 partition_canopy_by_trunks(
