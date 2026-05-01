@@ -2477,64 +2477,97 @@ def filter_painted_stake_trunks(
     trunk_boxes: list,
     trunk_scores: list,
     rgb_arr: np.ndarray,
+    trunk_masks: np.ndarray | None = None,
     *,
     max_green_dominant_pct: float = 0.35,
     green_dominance_threshold: int = 15,
     min_brown_pct: float = 0.20,
 ) -> tuple[list, list]:
-    """Reject trunk bboxes that are predominantly green-painted
-    (apple-orchard support stakes) rather than wooden trunks.
+    """Reject trunk detections that are predominantly green-
+    painted (apple-orchard support stakes) rather than wooden
+    trunks.
 
     Heuristic: real apple trunks read brown/grey/red-shifted in
     RGB (R near or above G, slight blue deficit). Painted green
     stakes have G consistently dominant by 15+ over R and B.
 
-    For each trunk bbox, count pixels that are:
+    Color statistics are computed on the SAM 3 INSTANCE MASK
+    when one is provided, NOT just the bbox. This is critical:
+    a real trunk with leaves draped in front would have ~70%
+    green pixels in its bbox (because the bbox includes the
+    leaves), but only ~5-10% green in the actual trunk mask
+    (which is just bark pixels). Mask-based stats correctly
+    keep real trunks; bbox-based stats would over-reject.
+
+    Falls back to bbox-based stats if no mask provided (e.g.,
+    a future detector that returns boxes only).
+
+    For each trunk pixel set, count pixels that are:
       - GREEN-DOMINANT: G > R + 15 AND G > B + 15
       - BROWN/GREY:     R near G near B (within 20) OR R > G + 10
 
-    Reject the trunk if more than --max-green-dominant-pct of its
-    bbox pixels are green-dominant AND it has insufficient brown/
-    grey pixels (less than --min-brown-pct). The dual check
-    handles edge cases like a trunk with foliage in front (lots
-    of green but also brown).
+    Reject the trunk if more than --max-green-dominant-pct of
+    its pixels are green-dominant AND it has insufficient brown/
+    grey pixels (less than --min-brown-pct). Dual check handles
+    edge cases like a trunk with foliage in front (lots of green
+    but also brown).
 
-    Returns (kept_boxes, kept_scores) -- same shape as input but
-    filtered.
+    Returns (kept_boxes, kept_scores) -- same shape as input
+    but filtered.
     """
     if not trunk_boxes:
         return [], []
     kept_boxes: list = []
     kept_scores: list = []
     H_img, W_img = rgb_arr.shape[:2]
-    for box, score in zip(trunk_boxes, trunk_scores):
-        x1, y1, x2, y2 = [int(round(float(v))) for v in box]
-        x1 = max(0, x1); y1 = max(0, y1)
-        x2 = min(W_img, x2); y2 = min(H_img, y2)
-        if x2 <= x1 or y2 <= y1:
-            continue
-        crop = rgb_arr[y1:y2, x1:x2]
-        if crop.size == 0:
-            continue
-        r = crop[..., 0].astype(np.int16)
-        g = crop[..., 1].astype(np.int16)
-        b = crop[..., 2].astype(np.int16)
+    use_masks = (
+        trunk_masks is not None
+        and len(trunk_masks) == len(trunk_boxes)
+    )
+    for i, (box, score) in enumerate(zip(trunk_boxes, trunk_scores)):
+        # Source pixels: prefer mask if available so leaves
+        # adjacent to the trunk don't pollute the color stats.
+        if use_masks:
+            m = trunk_masks[i]
+            if hasattr(m, "ndim") and m.ndim == 3:
+                m = m.any(axis=0)
+            mb = np.asarray(m).astype(bool)
+            if mb.shape != (H_img, W_img):
+                # Some checkpoints return per-mask sized arrays;
+                # fall back to bbox if dims don't match.
+                pixels = None
+            else:
+                ys_t, xs_t = np.where(mb)
+                if ys_t.size == 0:
+                    continue
+                pixels = rgb_arr[ys_t, xs_t]
+        else:
+            pixels = None
+        if pixels is None:
+            x1, y1, x2, y2 = [int(round(float(v))) for v in box]
+            x1 = max(0, x1); y1 = max(0, y1)
+            x2 = min(W_img, x2); y2 = min(H_img, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = rgb_arr[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            pixels = crop.reshape(-1, 3)
+        r = pixels[:, 0].astype(np.int16)
+        g = pixels[:, 1].astype(np.int16)
+        b = pixels[:, 2].astype(np.int16)
         green_dom = (
             (g > r + green_dominance_threshold)
             & (g > b + green_dominance_threshold)
         )
-        # Brown/grey detection: either R, G, B nearly equal (grey/
-        # neutral wood) OR R > G + 10 AND R > B + 10 (red-shifted
-        # warm bark).
         gray_ish = (np.abs(r - g) < 20) & (np.abs(g - b) < 20)
         red_warm = (r > g + 10) & (r > b + 10)
         brown_ish = gray_ish | red_warm
-        total = float(crop.shape[0] * crop.shape[1])
+        total = float(pixels.shape[0])
         if total <= 0:
             continue
         green_pct = float(green_dom.sum()) / total
         brown_pct = float(brown_ish.sum()) / total
-        # Reject if too green AND not enough brown to override.
         if (green_pct > max_green_dominant_pct
                 and brown_pct < min_brown_pct):
             continue
@@ -3982,8 +4015,12 @@ def main():
                         _trunk_scores_all = (
                             _trunk_infer.get("scores") if _trunk_infer else None
                         )
+                        _trunk_masks_all = (
+                            _trunk_infer.get("masks") if _trunk_infer else None
+                        )
                         _kept_trunk_boxes: list = []
                         _kept_trunk_scores: list = []
+                        _kept_trunk_masks: list = []
                         if (_trunk_boxes_all is not None
                                 and len(_trunk_boxes_all)):
                             _scores = (
@@ -3991,24 +4028,41 @@ def main():
                                 if _trunk_scores_all is not None
                                 else [1.0] * len(_trunk_boxes_all)
                             )
-                            for tb, ts in zip(_trunk_boxes_all, _scores):
+                            for ti, (tb, ts) in enumerate(
+                                zip(_trunk_boxes_all, _scores)
+                            ):
                                 if float(ts) >= args.canopy_trunk_min_score:
                                     _kept_trunk_boxes.append(
                                         [float(x) for x in tb]
                                     )
                                     _kept_trunk_scores.append(float(ts))
+                                    if (_trunk_masks_all is not None
+                                            and ti < len(_trunk_masks_all)):
+                                        _kept_trunk_masks.append(
+                                            _trunk_masks_all[ti]
+                                        )
                             # Filter out painted-green support stakes
                             # before they get used as canopy anchors.
-                            # Stakes look like trunks to SAM 3 but
-                            # would mis-anchor the Voronoi partition.
+                            # Color stats run on the SAM mask (just
+                            # trunk pixels) NOT the bbox, so leaves
+                            # in front of a real trunk don't mis-flag
+                            # it as a stake.
                             if (args.canopy_trunk_reject_green_stakes
                                     and _kept_trunk_boxes):
                                 _rgb_arr_for_stake = np.asarray(img)
+                                _masks_for_filter = (
+                                    np.stack(_kept_trunk_masks, axis=0)
+                                    if (_kept_trunk_masks
+                                        and len(_kept_trunk_masks)
+                                            == len(_kept_trunk_boxes))
+                                    else None
+                                )
                                 _kept_trunk_boxes, _kept_trunk_scores = (
                                     filter_painted_stake_trunks(
                                         _kept_trunk_boxes,
                                         _kept_trunk_scores,
                                         _rgb_arr_for_stake,
+                                        trunk_masks=_masks_for_filter,
                                         max_green_dominant_pct=args.canopy_trunk_max_green_pct,
                                         green_dominance_threshold=args.canopy_trunk_green_threshold,
                                         min_brown_pct=args.canopy_trunk_min_brown_pct,
