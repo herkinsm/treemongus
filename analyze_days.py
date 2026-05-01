@@ -2473,6 +2473,72 @@ class IoUTracker:
         return [{"track_id": tid, **t} for tid, t in self.tracks.items()]
 
 
+def partition_canopy_by_trunks(
+    canopy_mask: np.ndarray,
+    trunk_boxes: list,
+    min_trunk_area_px: int = 1,
+) -> tuple[list[dict], np.ndarray]:
+    """Partition a canopy mask via Voronoi-style nearest-trunk
+    assignment. Each canopy pixel is labeled with the index of
+    the closest trunk's centroid.
+
+    Returns (components, partition_labels) where:
+      components is one dict per trunk-anchored canopy region:
+        {"bbox": (x1, y1, x2, y2), "area": int, "label_id": int,
+         "labels": partition_labels, "trunk_box": (x1, y1, x2, y2)}
+      partition_labels is an (H, W) int32 array where 0 = outside
+      canopy and 1..K = canopy pixels assigned to trunk index K-1.
+
+    The partition uses L2 distance from each canopy pixel to each
+    trunk's bbox centroid. Trunks merge their canopy region only
+    if they're so close their nearest-neighbor cells contain no
+    canopy pixels (rare with real trunks). Touching/overlapping
+    canopies of physically separate trees get split because their
+    trunks are spatially distinct.
+    """
+    h, w = canopy_mask.shape
+    out_labels = np.zeros((h, w), dtype=np.int32)
+    if not trunk_boxes:
+        return [], out_labels
+    centers = np.array(
+        [
+            [(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0]
+            for b in trunk_boxes
+        ],
+        dtype=np.float32,
+    )
+    ys, xs = np.where(canopy_mask)
+    if ys.size == 0:
+        return [], out_labels
+    pix = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+    # (N, K) squared distances:
+    diffs = pix[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sum(diffs * diffs, axis=2)
+    nearest = np.argmin(dists, axis=1)  # (N,)
+    # Label the partition (1-based so 0 = bg).
+    out_labels[ys, xs] = (nearest + 1).astype(np.int32)
+    components: list[dict] = []
+    for t_idx, tbox in enumerate(trunk_boxes):
+        sel = nearest == t_idx
+        if not sel.any():
+            continue
+        cy = ys[sel]
+        cx = xs[sel]
+        area = int(cy.size)
+        if area < min_trunk_area_px:
+            continue
+        bbox = (int(cx.min()), int(cy.min()),
+                int(cx.max()), int(cy.max()))
+        components.append({
+            "bbox": bbox,
+            "area": area,
+            "label_id": int(t_idx + 1),
+            "labels": out_labels,
+            "trunk_box": tuple(int(round(x)) for x in tbox),
+        })
+    return components, out_labels
+
+
 def extract_canopy_components(
     canopy_mask: np.ndarray, min_area_px: int = 500,
 ) -> list[dict]:
@@ -2766,6 +2832,28 @@ def main():
                     help="Minimum CC pixel area to count as a tree. "
                          "Below this, treat as canopy noise / fragment "
                          "and skip.")
+    ap.add_argument("--canopy-track-method",
+                    choices=("cc", "trunk"), default="cc",
+                    help="How to partition the canopy mask into per-"
+                         "tree regions. 'cc' = connected components "
+                         "(default; cheap, fails on physically-touching "
+                         "tree canopies). 'trunk' = SAM 3 detects "
+                         "trunks per frame and the canopy is partitioned "
+                         "by nearest-trunk assignment (Voronoi). 'trunk' "
+                         "correctly distinguishes overlapping trees "
+                         "because trunks remain spatially distinct even "
+                         "when canopies merge in 2D. Adds ~1-2 sec/frame "
+                         "of SAM 3 inference for the trunk prompt.")
+    ap.add_argument("--canopy-trunk-min-score", type=float, default=0.20,
+                    help="Min SAM 3 score for a trunk detection to be "
+                         "used as a canopy partition anchor (default "
+                         "0.20). Higher = fewer false trunks, lower = "
+                         "more recall on partial-frame trunks.")
+    ap.add_argument("--canopy-trunk-prompt", type=str,
+                    default="apple tree trunk",
+                    help="Text prompt used to detect trunks for "
+                         "canopy partitioning when "
+                         "--canopy-track-method=trunk.")
     ap.add_argument("--use-build-tree-mask", action="store_true",
                     help="Use the more robust tree_mask.build_tree_mask "
                          "function instead of compute_canopy_mask. Adds "
@@ -3333,6 +3421,20 @@ def main():
 
     sample = None if args.sample_per_session == 0 else args.sample_per_session
     prompts = list(args.prompts)
+    # Auto-add the trunk prompt when --canopy-track-method=trunk is on
+    # (we need SAM 3 to detect trunks per frame). Also auto-track the
+    # trunk prompt so its bboxes get IoU-followed across frames if the
+    # user wants per-tree analytics later. Avoid duplication if user
+    # already passed it.
+    if (args.track_canopy
+            and args.canopy_track_method == "trunk"
+            and args.canopy_trunk_prompt not in prompts):
+        prompts.append(args.canopy_trunk_prompt)
+        print(
+            f"[init] --canopy-track-method=trunk: auto-added "
+            f"prompt {args.canopy_trunk_prompt!r}",
+            file=sys.stderr,
+        )
     prompt_slugs = {p: slugify(p) for p in prompts}
 
     # Resolve which prompts the IoU tracker should run on. Default: any prompt
@@ -3746,13 +3848,21 @@ def main():
                                 file=sys.stderr,
                             )
 
-                # Per-frame canopy tracking. Extract connected
-                # components from the canopy mask, run the
-                # session-scoped CanopyTracker over them. Each tree
-                # gets a stable tree_id followed across frames.
-                # `frame_canopy_components` and `frame_tree_ids`
-                # are reused below to assign each kept flower mask
-                # to its containing tree.
+                # Per-frame canopy tracking. Either:
+                #   cc method:    extract connected components from
+                #                 the canopy mask (cheap; fails on
+                #                 physically-touching tree canopies).
+                #   trunk method: SAM 3 detected trunks this frame
+                #                 are used as Voronoi anchors to
+                #                 partition the canopy. Distinguishes
+                #                 overlapping trees because trunks
+                #                 stay spatially distinct.
+                # In both modes the session-scoped CanopyTracker
+                # follows each region across frames. The tracker is
+                # fed BBOXES from either the CC (cc mode) or the
+                # TRUNK (trunk mode) so trunk-mode tracking is
+                # extra-stable (trunks are slim and shift little
+                # vs canopy bboxes that flop around).
                 frame_canopy_components: list[dict] = []
                 frame_tree_ids: list[int] = []
                 if (args.track_canopy and canopy_mask_img is not None):
@@ -3761,13 +3871,68 @@ def main():
                             iou_threshold=args.canopy_track_iou,
                             max_age=args.canopy_track_max_age,
                         )
-                    frame_canopy_components = extract_canopy_components(
-                        canopy_mask_img,
-                        min_area_px=args.canopy_track_min_cc_area,
-                    )
-                    frame_tree_ids = current_canopy_tracker.step(
-                        frame_canopy_components,
-                    )
+                    if args.canopy_track_method == "trunk":
+                        # Pull confident trunks from this frame's
+                        # SAM 3 results.
+                        _trunk_key = args.canopy_trunk_prompt
+                        _trunk_infer = infer.get(_trunk_key) if isinstance(
+                            infer, dict
+                        ) else None
+                        _trunk_boxes_all = (
+                            _trunk_infer.get("boxes") if _trunk_infer else None
+                        )
+                        _trunk_scores_all = (
+                            _trunk_infer.get("scores") if _trunk_infer else None
+                        )
+                        _kept_trunk_boxes: list = []
+                        if (_trunk_boxes_all is not None
+                                and len(_trunk_boxes_all)):
+                            _scores = (
+                                _trunk_scores_all
+                                if _trunk_scores_all is not None
+                                else [1.0] * len(_trunk_boxes_all)
+                            )
+                            for tb, ts in zip(_trunk_boxes_all, _scores):
+                                if float(ts) >= args.canopy_trunk_min_score:
+                                    _kept_trunk_boxes.append(
+                                        [float(x) for x in tb]
+                                    )
+                        if _kept_trunk_boxes:
+                            frame_canopy_components, _part_labels = (
+                                partition_canopy_by_trunks(
+                                    canopy_mask_img, _kept_trunk_boxes,
+                                    min_trunk_area_px=args.canopy_track_min_cc_area,
+                                )
+                            )
+                            # Track on TRUNK bboxes (most stable
+                            # cross-frame anchor; canopy partition
+                            # bbox can flop around as branches sway).
+                            _track_input = [
+                                {"bbox": c["trunk_box"], "area": c["area"]}
+                                for c in frame_canopy_components
+                            ]
+                            frame_tree_ids = current_canopy_tracker.step(
+                                _track_input,
+                            )
+                        else:
+                            # No confident trunks this frame --
+                            # fall back to CC partition for tree
+                            # tracking continuity.
+                            frame_canopy_components = extract_canopy_components(
+                                canopy_mask_img,
+                                min_area_px=args.canopy_track_min_cc_area,
+                            )
+                            frame_tree_ids = current_canopy_tracker.step(
+                                frame_canopy_components,
+                            )
+                    else:
+                        frame_canopy_components = extract_canopy_components(
+                            canopy_mask_img,
+                            min_area_px=args.canopy_track_min_cc_area,
+                        )
+                        frame_tree_ids = current_canopy_tracker.step(
+                            frame_canopy_components,
+                        )
                     # Per-frame log row for trees_per_frame.csv.
                     for cc, tid in zip(
                         frame_canopy_components, frame_tree_ids,
