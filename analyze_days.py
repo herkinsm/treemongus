@@ -2724,6 +2724,105 @@ def partition_canopy_by_trunks(
     return components, out_labels
 
 
+def augment_canopy_with_edge_trees(
+    canopy_mask: np.ndarray,
+    depth_mm: np.ndarray,
+    rgb_arr: np.ndarray | None,
+    *,
+    depth_min_mm: float = 600.0,
+    depth_max_mm: float = 3000.0,
+    min_area_px: int = 500,
+    edge_band_px: int = 20,
+) -> np.ndarray:
+    """Add foreground-depth components touching the left/right
+    frame edges to the canopy mask.
+
+    build_tree_mask uses a center-anchored algorithm that rejects
+    components outside ``center_depth +/- DEPTH_BAND_HALF_MM``.
+    With multiple trees at different depths in frame, the median
+    falls between them and BOTH get cut. Half-trees at the frame
+    edges then disappear from the canopy mask, which makes
+    --flower-require-tree-in-frame zero out every flower in the
+    frame even though there is clearly a foreground tree.
+
+    This wrapper bypasses that depth-band logic for components
+    that touch the frame edge, since those are by construction
+    half-trees with their canopy partly outside the field of view.
+    They get added back to the canopy mask if they are large
+    enough and have valid foreground depth.
+    """
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return canopy_mask
+    if canopy_mask is None or depth_mm is None:
+        return canopy_mask
+    h, w = depth_mm.shape
+    fg = (
+        (depth_mm.astype(np.float32) >= float(depth_min_mm))
+        & (depth_mm.astype(np.float32) <= float(depth_max_mm))
+    )
+    if rgb_arr is not None and rgb_arr.shape[:2] == (h, w):
+        try:
+            hsv = _cv2.cvtColor(
+                rgb_arr.astype(np.uint8), _cv2.COLOR_RGB2HSV,
+            )
+            H_c, S_c, V_c = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+            sky_blue = (H_c >= 85) & (H_c <= 145) & (S_c > 8)
+            sky_bright = (V_c > 185) & (S_c < 15)
+            fg = fg & ~(sky_blue | sky_bright)
+        except Exception:
+            pass
+    fg_u8 = fg.astype(np.uint8) * 255
+    n_cc, labels, stats, _ = _cv2.connectedComponentsWithStats(
+        fg_u8, connectivity=8,
+    )
+    if n_cc <= 1:
+        return canopy_mask
+    augmented = canopy_mask.astype(bool).copy()
+    added = False
+    for cc_id in range(1, n_cc):
+        x, y, ww, _hh, area = stats[cc_id]
+        if area < min_area_px:
+            continue
+        x_max = x + ww - 1
+        if x <= edge_band_px or x_max >= w - 1 - edge_band_px:
+            augmented |= (labels == cc_id)
+            added = True
+    if not added:
+        return canopy_mask
+    return augmented
+
+
+def canopy_component_depth_medians(
+    components: list[dict], depth_mm: np.ndarray,
+    *, min_pixels: int = 50,
+) -> dict[int, float]:
+    """Return {label_id: median_depth_mm} for each canopy
+    component, computed only over pixels with valid (>0, finite,
+    < 60000 mm) depth. Components with fewer than ``min_pixels``
+    valid-depth pixels are omitted from the result so callers
+    can fall back to other heuristics for them.
+    """
+    out: dict[int, float] = {}
+    if not components or depth_mm is None:
+        return out
+    labels_img = components[0].get("labels")
+    if labels_img is None:
+        return out
+    valid = (depth_mm > 0) & (depth_mm < 60000)
+    for c in components:
+        lid = int(c.get("label_id", 0))
+        if lid <= 0:
+            continue
+        pix = (labels_img == lid) & valid
+        n = int(pix.sum())
+        if n < min_pixels:
+            continue
+        out[lid] = float(np.median(depth_mm[pix]))
+    return out
+
+
 def extract_canopy_components(
     canopy_mask: np.ndarray, min_area_px: int = 500,
 ) -> list[dict]:
@@ -3029,6 +3128,39 @@ def main():
                          "3-5 m; this depth check rejects it. Set 0 "
                          "to disable the depth side of the check "
                          "(canopy size alone gates).")
+    ap.add_argument("--canopy-include-edge-trees", action="store_true",
+                    help="After build_tree_mask runs, also add "
+                         "foreground-depth connected components that "
+                         "touch the LEFT or RIGHT frame edges to the "
+                         "canopy mask. Recovers half-trees at frame "
+                         "edges that the sprayer pipeline's center-"
+                         "anchored algorithm rejects: when multiple "
+                         "trees are in frame at different depths the "
+                         "median center_depth falls between them and "
+                         "the +/- 500 mm band excludes both. Edge "
+                         "trees are by construction half-cropped, so "
+                         "this gate exempts them from the global "
+                         "depth-band check.")
+    ap.add_argument("--canopy-edge-tree-min-area-px", type=int,
+                    default=500,
+                    help="Minimum area for an edge-touching CC to be "
+                         "added as canopy by --canopy-include-edge-"
+                         "trees. Default 500 px filters small noise.")
+    ap.add_argument("--flower-max-behind-foreground-mm",
+                    type=float, default=0.0,
+                    help="After flowers are assigned to canopy "
+                         "components (--track-canopy with trunk or "
+                         "cc method), reject any flower whose host "
+                         "tree's median depth is more than this many "
+                         "mm behind the FOREGROUND tree (= the "
+                         "closest canopy component in the frame). "
+                         "Catches the 'flower on a background tree' "
+                         "case: the per-mask depth cap passes if the "
+                         "background tree is within the depth_max "
+                         "limit, but the foreground tree is closer, "
+                         "so this gate rejects flowers on the farther "
+                         "tree relative to the closest one. Default "
+                         "0.0 = disabled. Try 1000 mm.")
     # Canopy (per-tree) tracking. Assigns a tree_id to each canopy
     # connected component and follows it across frames via IoU on
     # the bbox of the CC. Each kept flower is then assigned to its
@@ -4121,6 +4253,33 @@ def main():
                             print(
                                 f"[warn] canopy mask dilation failed "
                                 f"({_dil_err!r}); using undilated mask",
+                                file=sys.stderr,
+                            )
+
+                    # Edge-tree augmentation. build_tree_mask uses a
+                    # global center_depth band that excludes half-
+                    # trees at the frame edges when multiple trees
+                    # at different depths are in view. This wrapper
+                    # adds foreground-depth components touching the
+                    # left/right edges back to the canopy mask.
+                    if (args.canopy_include_edge_trees
+                            and canopy_mask_img is not None
+                            and depth_mm is not None):
+                        try:
+                            _rgb_aug = np.asarray(img)
+                            canopy_mask_img = augment_canopy_with_edge_trees(
+                                canopy_mask_img,
+                                depth_mm,
+                                _rgb_aug,
+                                depth_min_mm=args.depth_min_mm,
+                                depth_max_mm=args.depth_max_mm,
+                                min_area_px=args.canopy_edge_tree_min_area_px,
+                            )
+                        except Exception as _edge_err:
+                            print(
+                                f"[warn] edge-tree canopy augmentation "
+                                f"failed ({_edge_err!r}); using "
+                                f"unaugmented mask",
                                 file=sys.stderr,
                             )
 
@@ -5791,6 +5950,87 @@ def main():
                             masks_np, frame_canopy_components,
                             frame_tree_ids,
                         )
+
+                        # Per-tree foreground-relative depth gate.
+                        # Reject flowers whose host canopy is
+                        # significantly farther back than the
+                        # closest canopy in the frame. Catches the
+                        # "flower on background tree" case that the
+                        # per-mask depth cap misses when the
+                        # background tree is within the global
+                        # depth_max limit (e.g., foreground at
+                        # 1.5 m, background row at 2.5 m -- both
+                        # pass --flower-max-depth-cap-mm 3500 but
+                        # the background tree's flowers are wrong).
+                        if (args.flower_max_behind_foreground_mm > 0
+                                and depth_mm is not None
+                                and flower_tree_ids
+                                and n > 0):
+                            comp_depths = canopy_component_depth_medians(
+                                frame_canopy_components, depth_mm,
+                            )
+                            if comp_depths:
+                                fg_depth = min(comp_depths.values())
+                                max_behind = float(
+                                    args.flower_max_behind_foreground_mm
+                                )
+                                tid_to_depth: dict[int, float] = {}
+                                for c, _tid in zip(
+                                    frame_canopy_components,
+                                    frame_tree_ids,
+                                ):
+                                    lid = int(c.get("label_id", 0))
+                                    if lid in comp_depths:
+                                        tid_to_depth[int(_tid)] = (
+                                            comp_depths[lid]
+                                        )
+                                keep_fd = np.ones(n, dtype=bool)
+                                for fi, t_id in enumerate(flower_tree_ids):
+                                    if t_id < 0:
+                                        # Unassigned flower -- benefit
+                                        # of doubt; the gate only
+                                        # fires on confidently
+                                        # assigned background-tree
+                                        # flowers.
+                                        continue
+                                    d_tree = tid_to_depth.get(int(t_id))
+                                    if d_tree is None:
+                                        continue
+                                    if d_tree > fg_depth + max_behind:
+                                        keep_fd[fi] = False
+                                if not keep_fd.all():
+                                    audit.apply(
+                                        keep_fd, "max_behind_fg",
+                                    )
+                                    rt_key = (
+                                        day, category, session, prompt,
+                                    )
+                                    rt = rejection_totals.setdefault(
+                                        rt_key, {},
+                                    )
+                                    rt["max_behind_fg"] = (
+                                        rt.get("max_behind_fg", 0)
+                                        + int((~keep_fd).sum())
+                                    )
+                                    masks_np = masks_np[keep_fd]
+                                    if scores_np is not None:
+                                        scores_np = scores_np[keep_fd]
+                                    if boxes_np is not None:
+                                        boxes_np = boxes_np[keep_fd]
+                                    flower_tree_ids = [
+                                        t for t, k in zip(
+                                            flower_tree_ids, keep_fd,
+                                        ) if k
+                                    ]
+                                    if (track_ids
+                                            and len(track_ids) == len(keep_fd)):
+                                        track_ids = [
+                                            t for t, k in zip(
+                                                track_ids, keep_fd,
+                                            ) if k
+                                        ]
+                                    n = int(keep_fd.sum())
+
                         # Update flower-track -> tree-id mapping
                         # (use the most-common tree_id per track).
                         if track_ids and len(track_ids) == len(flower_tree_ids):
