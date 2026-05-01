@@ -2948,6 +2948,15 @@ def main():
                          "<session>/Info/) alongside RGB/depth/IR/PRGB. Only "
                          "applies when --require-all-modalities is also set.")
     ap.add_argument("--save-masks", action="store_true")
+    ap.add_argument("--save-canopy-masks", action="store_true",
+                    help="Save the per-frame canopy mask as a .npz file "
+                         "at <out>/canopy_masks/<rel_path>.npz so it "
+                         "can be reused downstream (Label Studio "
+                         "polygon overlays, per-tree analytics, "
+                         "external visualization). Each .npz contains "
+                         "a single 'canopy' boolean array and "
+                         "optionally per-tree partition labels and "
+                         "trunk bboxes when --track-canopy is on.")
     ap.add_argument("--save-overlays", action="store_true")
     ap.add_argument("--save-empty-overlays", action="store_true",
                     help="Also save overlay JPGs for frames where the "
@@ -3719,10 +3728,13 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     masks_dir = out_dir / "masks"
     overlays_dir = out_dir / "overlays"
+    canopy_masks_dir = out_dir / "canopy_masks"
     if args.save_masks:
         masks_dir.mkdir(exist_ok=True)
     if args.save_overlays:
         overlays_dir.mkdir(exist_ok=True)
+    if args.save_canopy_masks:
+        canopy_masks_dir.mkdir(exist_ok=True)
 
     print(f"[init] device={args.device} threshold={args.threshold} sample/session={sample}")
     print(f"[init] prompts: {prompts}")
@@ -4292,6 +4304,58 @@ def main():
                             "bbox_x1": bx1, "bbox_y1": by1,
                             "area_px": int(cc["area"]),
                         })
+
+                # Save the per-frame canopy mask for downstream use
+                # (Label Studio polygon overlays, per-tree analytics,
+                # debugging). One .npz per frame at
+                # <out>/canopy_masks/<rel_path>.npz.
+                if (args.save_canopy_masks
+                        and canopy_mask_img is not None):
+                    try:
+                        rel_canopy = (
+                            img_path.relative_to(args.root)
+                            .with_suffix(".npz")
+                        )
+                        cp_path = canopy_masks_dir / rel_canopy
+                        cp_path.parent.mkdir(parents=True, exist_ok=True)
+                        # Build the partition labels image if we
+                        # tracked trunks; otherwise we can rebuild
+                        # it from the canopy CC labels at view time.
+                        _save_extras: dict = {
+                            "canopy": canopy_mask_img.astype(bool),
+                        }
+                        if frame_canopy_components:
+                            _labels_img = frame_canopy_components[0].get(
+                                "labels"
+                            )
+                            if _labels_img is not None:
+                                _save_extras["partition_labels"] = (
+                                    np.asarray(_labels_img, dtype=np.int32)
+                                )
+                            _trunk_bboxes_save = []
+                            for cc in frame_canopy_components:
+                                tb = cc.get("trunk_box")
+                                if tb is not None:
+                                    _trunk_bboxes_save.append(
+                                        list(tb) + [int(cc.get("label_id", 0))]
+                                    )
+                            if _trunk_bboxes_save:
+                                _save_extras["trunk_bboxes_with_label"] = (
+                                    np.asarray(
+                                        _trunk_bboxes_save, dtype=np.int32,
+                                    )
+                                )
+                            if frame_tree_ids:
+                                _save_extras["tree_ids"] = np.asarray(
+                                    frame_tree_ids, dtype=np.int64,
+                                )
+                        np.savez_compressed(cp_path, **_save_extras)
+                    except Exception as _cp_err:
+                        print(
+                            f"[warn] could not save canopy mask for "
+                            f"{img_path.name}: {_cp_err!r}",
+                            file=sys.stderr,
+                        )
 
                 # No-tree-in-frame detector: if neither a meaningful
                 # FOREGROUND canopy NOR any close-foreground trunks
