@@ -2551,6 +2551,16 @@ def main():
     ap.add_argument("--tree-mask-min-overlap", type=float, default=0.5,
                     help="Keep a detection only if >= this fraction of its mask pixels "
                          "lie inside the canopy mask (default 0.5).")
+    ap.add_argument("--use-build-tree-mask", action="store_true",
+                    help="Use the more robust tree_mask.build_tree_mask "
+                         "function instead of compute_canopy_mask. Adds "
+                         "HSV-based sky exclusion + ROI-anchored region "
+                         "growing + forward-branch recovery on top of "
+                         "the depth band, which captures partial-frame "
+                         "trees that compute_canopy_mask drops because "
+                         "of D455 sensor edge artifacts. Recommended "
+                         "for whole-image YOLO labeling runs where "
+                         "canopy mask is the primary spatial gate.")
     ap.add_argument("--canopy-min-cc-area-px", type=int, default=2000,
                     help="Connected-component size filter inside compute_canopy_mask. "
                          "Canopy regions smaller than this many pixels are dropped "
@@ -3419,12 +3429,47 @@ def main():
                 if args.depth or args.tree_mask:
                     depth_mm = load_depth_mm(depth_path_for(img_path), (img.height, img.width))
                 if args.tree_mask and depth_mm is not None:
-                    canopy_mask_img = compute_canopy_mask(
-                        depth_mm,
-                        min_mm=args.depth_min_mm, max_mm=args.depth_max_mm,
-                        min_cc_area_px=args.canopy_min_cc_area_px,
-                        max_row_width_frac=args.canopy_max_row_width_frac,
-                    )
+                    if args.use_build_tree_mask:
+                        # Robust canopy detection from tree_mask.py:
+                        # depth band + HSV sky exclusion + ROI-anchored
+                        # region growing + forward-branch recovery.
+                        # Handles partial-frame trees much better than
+                        # the simple depth-only compute_canopy_mask.
+                        try:
+                            from tree_mask import build_tree_mask as _btm
+                            _rgb_for_canopy = np.asarray(img)
+                            # Pass full-frame columns as roi_cols so
+                            # the function detects ANY tree, not just
+                            # one anchored at the sprayer pipeline's
+                            # default ROI columns.
+                            _h, _w = depth_mm.shape
+                            _btm_u8 = _btm(
+                                depth_mm.astype(np.uint16),
+                                rgb=_rgb_for_canopy,
+                                roi_cols=(0, _w - 1),
+                            )
+                            canopy_mask_img = _btm_u8.astype(bool)
+                        except Exception as _btm_err:
+                            print(
+                                f"[warn] build_tree_mask failed "
+                                f"({_btm_err!r}); falling back to "
+                                f"compute_canopy_mask",
+                                file=sys.stderr,
+                            )
+                            canopy_mask_img = compute_canopy_mask(
+                                depth_mm,
+                                min_mm=args.depth_min_mm,
+                                max_mm=args.depth_max_mm,
+                                min_cc_area_px=args.canopy_min_cc_area_px,
+                                max_row_width_frac=args.canopy_max_row_width_frac,
+                            )
+                    else:
+                        canopy_mask_img = compute_canopy_mask(
+                            depth_mm,
+                            min_mm=args.depth_min_mm, max_mm=args.depth_max_mm,
+                            min_cc_area_px=args.canopy_min_cc_area_px,
+                            max_row_width_frac=args.canopy_max_row_width_frac,
+                        )
 
                 # Depth-coverage fallback: if the frame has too little
                 # valid depth (sparse D455 returns at frame edges,

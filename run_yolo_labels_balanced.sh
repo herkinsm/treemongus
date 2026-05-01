@@ -77,7 +77,7 @@ echo "[batch] Using python: $PY"
   --depth-min-mm 600 --depth-max-mm 3000 --depth-near-frac 0.40 \
   --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
-  --tree-mask-min-overlap 0.0 \
+  --use-build-tree-mask --tree-mask-min-overlap 0.10 \
   --flower-y-min 0 --flower-y-max 380 \
   --flower-max-area-px 12000 --flower-max-bbox-area-px 60000 \
   --flower-white-s-max 40 --flower-white-v-min 140 --flower-pink-v-min 100 \
