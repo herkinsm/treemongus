@@ -85,7 +85,7 @@ echo "[batch] Using python: $PY"
   --canopy-trunk-max-depth-mm 3000 --canopy-trunk-depth-min-pixels 5 \
   --flower-y-min 0 --flower-y-max 380 \
   --flower-max-area-px 12000 --flower-max-bbox-area-px 60000 \
-  --flower-white-s-max 40 --flower-white-v-min 140 --flower-pink-v-min 100 \
+  --flower-white-s-max 50 --flower-white-v-min 120 --flower-pink-v-min 90 \
   --flower-b-minus-r-max 5 --flower-pink-b-minus-r-max 0 \
   --flower-g-minus-r-max 12 --flower-top-frame-penalty-row 50 \
   --flower-phenology off --flower-bloom-peak-doy 125 \

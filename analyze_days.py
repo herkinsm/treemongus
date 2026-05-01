@@ -4485,13 +4485,16 @@ def main():
 
                     # Tree-mask canopy filter (applies to ALL prompts — every
                     # category benefits from rejecting ground/sky/bg).
-                    # Skip when:
-                    #   1) frame is in depth-coverage fallback (depth-
-                    #      derived canopy mask is unreliable here)
-                    #   2) canopy mask is empty or tiny (< 1% of frame)
-                    #      meaning build_tree_mask couldn't capture the
-                    #      partial tree -- relying on the tree-mask
-                    #      gate would falsely reject every detection.
+                    # Only skip when the CANOPY MASK ITSELF is unreliable
+                    # (tiny / empty -- build_tree_mask couldn't capture
+                    # the tree). Do NOT skip just because depth coverage
+                    # is globally low: the canopy mask may still be
+                    # fine, and disabling tree-mask in that case lets
+                    # background grass-wildflowers leak through. The
+                    # per-mask depth cap and ground-row gate still
+                    # handle other failure modes; tree-mask is the
+                    # primary canopy/ground separator and should
+                    # remain active whenever it's usable.
                     canopy_overlap_mean: float | str = ""
                     _skip_tree_mask = False
                     if canopy_mask_img is not None:
@@ -4501,8 +4504,6 @@ def main():
                         )
                         if _canopy_frac < args.tree_mask_min_canopy_frac:
                             _skip_tree_mask = True
-                    if _low_depth_coverage:
-                        _skip_tree_mask = True
                     if (args.tree_mask and canopy_mask_img is not None
                             and n > 0 and not _skip_tree_mask):
                         overlaps = canopy_overlap_per_mask(masks_np, canopy_mask_img)
