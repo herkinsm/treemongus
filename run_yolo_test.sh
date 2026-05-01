@@ -76,6 +76,7 @@ echo "[batch] Using python: $PY"
   --canopy-track-method trunk --canopy-trunk-min-score 0.20 --canopy-trunk-prompt "apple tree trunk" \
   --canopy-trunk-reject-green-stakes --canopy-trunk-max-green-pct 0.35 \
   --canopy-trunk-green-threshold 15 --canopy-trunk-min-brown-pct 0.20 \
+  --canopy-trunk-max-depth-mm 3000 --canopy-trunk-depth-min-pixels 5 \
   --flower-y-min 0 --flower-y-max 380 \
   --flower-max-area-px 12000 --flower-max-bbox-area-px 60000 \
   --flower-white-s-max 40 --flower-white-v-min 140 --flower-pink-v-min 100 \

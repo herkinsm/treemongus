@@ -2473,6 +2473,69 @@ class IoUTracker:
         return [{"track_id": tid, **t} for tid, t in self.tracks.items()]
 
 
+def filter_far_trunks(
+    trunk_boxes: list,
+    trunk_scores: list,
+    depth_mm: np.ndarray | None,
+    trunk_masks: np.ndarray | None = None,
+    *,
+    max_depth_mm: float = 3000.0,
+    min_valid_pixels: int = 5,
+) -> tuple[list, list]:
+    """Reject trunks whose median valid depth is beyond max_depth_mm.
+    Targets the failure mode where SAM 3 detects trunks on background
+    trees (5-10 m back-row) and they become Voronoi anchors,
+    capturing background-canopy regions that then leak through the
+    canopy-overlap gate as 'real' flower detections on the wrong tree.
+
+    Asymmetric on purpose: only rejects when we have CONFIRMED far
+    depth. Trunks with insufficient valid-depth pixels (<5) get the
+    benefit of the doubt -- a thin partial-frame trunk may have
+    sparse depth on its actual mask but be on the foreground tree.
+
+    Returns (kept_boxes, kept_scores) -- same shape as input.
+    """
+    if not trunk_boxes or depth_mm is None or max_depth_mm <= 0:
+        return trunk_boxes, trunk_scores
+    H_img, W_img = depth_mm.shape[:2]
+    use_masks = (
+        trunk_masks is not None
+        and len(trunk_masks) == len(trunk_boxes)
+    )
+    kept_boxes: list = []
+    kept_scores: list = []
+    for i, (box, score) in enumerate(zip(trunk_boxes, trunk_scores)):
+        if use_masks:
+            m = trunk_masks[i]
+            if hasattr(m, "ndim") and m.ndim == 3:
+                m = m.any(axis=0)
+            mb = np.asarray(m).astype(bool)
+            if mb.shape != (H_img, W_img):
+                mb = None
+        else:
+            mb = None
+        if mb is not None:
+            d_in = depth_mm[mb]
+        else:
+            x1, y1, x2, y2 = [int(round(float(v))) for v in box]
+            x1 = max(0, x1); y1 = max(0, y1)
+            x2 = min(W_img, x2); y2 = min(H_img, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            d_in = depth_mm[y1:y2, x1:x2].ravel()
+        valid = d_in[(d_in > 0) & (d_in < 60000)]
+        if valid.size < min_valid_pixels:
+            kept_boxes.append(box)
+            kept_scores.append(score)
+            continue
+        med = float(np.median(valid))
+        if med > max_depth_mm:
+            continue
+        kept_boxes.append(box)
+        kept_scores.append(score)
+    return kept_boxes, kept_scores
+
+
 def filter_painted_stake_trunks(
     trunk_boxes: list,
     trunk_scores: list,
@@ -2985,6 +3048,26 @@ def main():
                          "grey / red-warm (real wooden trunk colors). "
                          "Catches trunks with foliage in front. "
                          "Default 0.20 = 20%%.")
+    ap.add_argument("--canopy-trunk-max-depth-mm", type=float,
+                    default=3000.0,
+                    help="Reject trunk detections whose median valid "
+                         "depth exceeds this many millimeters. Targets "
+                         "the failure mode where SAM 3 detects trunks "
+                         "on background-row trees (5+ m) and they "
+                         "become Voronoi anchors, capturing background "
+                         "canopy and leaking background flowers into "
+                         "the count. Default 3000 (3 m). Set 0 to "
+                         "disable. Asymmetric: only rejects when we "
+                         "have CONFIRMED far depth -- partial-frame "
+                         "trunks with sparse depth get the benefit "
+                         "of the doubt.")
+    ap.add_argument("--canopy-trunk-depth-min-pixels", type=int,
+                    default=5,
+                    help="Min valid-depth pixels required in a trunk "
+                         "mask before --canopy-trunk-max-depth-mm "
+                         "fires. Default 5: avoids over-rejecting "
+                         "thin partial-frame trunks where most of "
+                         "the trunk has no valid depth return.")
     ap.add_argument("--use-build-tree-mask", action="store_true",
                     help="Use the more robust tree_mask.build_tree_mask "
                          "function instead of compute_canopy_mask. Adds "
@@ -4066,6 +4149,47 @@ def main():
                                         max_green_dominant_pct=args.canopy_trunk_max_green_pct,
                                         green_dominance_threshold=args.canopy_trunk_green_threshold,
                                         min_brown_pct=args.canopy_trunk_min_brown_pct,
+                                    )
+                                )
+                                # ALSO drop the matching masks so the
+                                # depth-filter sees the right ones.
+                                if _masks_for_filter is not None:
+                                    _kept_trunk_masks = [
+                                        m for m, b in zip(
+                                            _kept_trunk_masks,
+                                            list(_kept_trunk_boxes)
+                                            + [None] * (
+                                                len(_kept_trunk_masks)
+                                                - len(_kept_trunk_boxes)
+                                            ),
+                                        )
+                                        if b is not None
+                                    ][:len(_kept_trunk_boxes)]
+                            # Reject background-row trunks by depth.
+                            # A real foreground trunk sits in the
+                            # canopy depth band (~1-3 m). A back-row
+                            # trunk at 5+ m would otherwise become a
+                            # Voronoi anchor and capture the
+                            # background canopy region, leaking
+                            # background flowers into the count.
+                            if (args.canopy_trunk_max_depth_mm > 0
+                                    and depth_mm is not None
+                                    and _kept_trunk_boxes):
+                                _masks_for_dfilter = (
+                                    np.stack(_kept_trunk_masks, axis=0)
+                                    if (_kept_trunk_masks
+                                        and len(_kept_trunk_masks)
+                                            == len(_kept_trunk_boxes))
+                                    else None
+                                )
+                                _kept_trunk_boxes, _kept_trunk_scores = (
+                                    filter_far_trunks(
+                                        _kept_trunk_boxes,
+                                        _kept_trunk_scores,
+                                        depth_mm,
+                                        trunk_masks=_masks_for_dfilter,
+                                        max_depth_mm=args.canopy_trunk_max_depth_mm,
+                                        min_valid_pixels=args.canopy_trunk_depth_min_pixels,
                                     )
                                 )
                         if _kept_trunk_boxes:
