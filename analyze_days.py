@@ -2473,6 +2473,184 @@ class IoUTracker:
         return [{"track_id": tid, **t} for tid, t in self.tracks.items()]
 
 
+def extract_canopy_components(
+    canopy_mask: np.ndarray, min_area_px: int = 500,
+) -> list[dict]:
+    """Split a per-frame canopy mask into per-tree connected
+    components and return one dict per tree:
+        {"bbox": (x1, y1, x2, y2), "area": int, "label_id": int,
+         "labels": np.ndarray}
+    Used by the per-session canopy IoU tracker so each tree
+    gets a stable tree_id followed across frames.
+
+    The label-id and full label image are returned so the caller
+    can assign individual flower masks to the right tree by max
+    pixel overlap, instead of relying on bbox-only IoU."""
+    try:
+        import cv2 as _cv2_cc
+    except Exception:
+        return []
+    if canopy_mask is None or not canopy_mask.any():
+        return []
+    u8 = canopy_mask.astype(np.uint8)
+    n_cc, labels, stats, _ = _cv2_cc.connectedComponentsWithStats(
+        u8, connectivity=8,
+    )
+    out: list[dict] = []
+    for cc_id in range(1, n_cc):
+        x, y, w, h, area = stats[cc_id]
+        if area < min_area_px:
+            continue
+        out.append({
+            "bbox": (int(x), int(y), int(x + w), int(y + h)),
+            "area": int(area),
+            "label_id": int(cc_id),
+            "labels": labels,
+        })
+    return out
+
+
+class CanopyTracker:
+    """IoU tracker for per-frame canopy connected components.
+    Assigns a tree_id to each canopy CC and follows it across
+    frames as the camera moves down the orchard row.
+
+    Same greedy IoU matching as IoUTracker; bigger max_age
+    default since trees are slower-moving relative to the
+    camera than individual flowers, and the canopy mask can
+    transiently shrink (e.g., tree clipped at frame edge for a
+    few frames)."""
+
+    def __init__(self, iou_threshold: float = 0.3, max_age: int = 5):
+        self.iou_threshold = iou_threshold
+        self.max_age = max_age
+        self.tracks: dict[int, dict] = {}
+        self.next_id = 0
+        self.frame = 0
+
+    @staticmethod
+    def _iou(a, b) -> float:
+        x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        inter = (x2 - x1) * (y2 - y1)
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        union = area_a + area_b - inter
+        return float(inter) / float(union) if union > 0 else 0.0
+
+    def step(self, components: list[dict]) -> list[int]:
+        """Update with one frame's CCs. Returns tree_id per CC,
+        in the same order as the input list."""
+        self.frame += 1
+        if not components:
+            return []
+        active = [
+            (tid, t) for tid, t in self.tracks.items()
+            if self.frame - t["last_frame"] <= self.max_age + 1
+        ]
+        active.sort(key=lambda x: -x[1].get("max_area", 0))
+        n = len(components)
+        det_to_tid = [-1] * n
+        used = [False] * n
+        for tid, t in active:
+            best_iou = self.iou_threshold
+            best_d = -1
+            for d in range(n):
+                if used[d]:
+                    continue
+                iou = self._iou(t["bbox"], components[d]["bbox"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_d = d
+            if best_d >= 0:
+                used[best_d] = True
+                det_to_tid[best_d] = tid
+                t["bbox"] = components[best_d]["bbox"]
+                t["last_frame"] = self.frame
+                t["n_frames"] += 1
+                a = int(components[best_d]["area"])
+                if a > t.get("max_area", 0):
+                    t["max_area"] = a
+        for d in range(n):
+            if used[d]:
+                continue
+            tid = self.next_id
+            self.next_id += 1
+            self.tracks[tid] = {
+                "bbox": tuple(int(x) for x in components[d]["bbox"]),
+                "first_frame": self.frame,
+                "last_frame": self.frame,
+                "n_frames": 1,
+                "max_area": int(components[d]["area"]),
+            }
+            det_to_tid[d] = tid
+        return det_to_tid
+
+    def n_unique(self, min_frames: int = 1) -> int:
+        return sum(
+            1 for t in self.tracks.values()
+            if t["n_frames"] >= min_frames
+        )
+
+    def summary(self) -> list[dict]:
+        return [
+            {"tree_id": tid, **t}
+            for tid, t in self.tracks.items()
+        ]
+
+
+def assign_flowers_to_trees(
+    flower_masks: np.ndarray,
+    components: list[dict],
+    tree_ids: list[int],
+) -> list[int]:
+    """For each flower mask, return the tree_id of the canopy
+    component it MOST overlaps with (by pixel count). Returns
+    -1 for masks with zero overlap on any component (e.g., a
+    flower somehow outside all canopies; ought to be rare with
+    the tree-mask gate active).
+
+    Uses the labels image from extract_canopy_components so a
+    flower mask is assigned to its actual containing tree
+    rather than just the bbox-IoU best-match (which would mis-
+    assign a flower at the boundary of two adjacent trees)."""
+    if not components:
+        return [-1] * len(flower_masks)
+    # All components share the same labels image (it's the
+    # connected-components result for this frame's canopy
+    # mask). Take it from the first one.
+    labels = components[0].get("labels")
+    if labels is None:
+        return [-1] * len(flower_masks)
+    label_to_tree: dict[int, int] = {
+        c["label_id"]: tid for c, tid in zip(components, tree_ids)
+    }
+    out: list[int] = []
+    for m in flower_masks:
+        mb = m.astype(bool)
+        if mb.ndim == 3:
+            mb = mb.any(axis=0)
+        if not mb.any():
+            out.append(-1)
+            continue
+        # Count pixels in each component's CC label.
+        flower_labels = labels[mb]
+        if flower_labels.size == 0:
+            out.append(-1)
+            continue
+        unique, counts = np.unique(
+            flower_labels[flower_labels > 0], return_counts=True,
+        )
+        if unique.size == 0:
+            out.append(-1)
+            continue
+        best_label = int(unique[counts.argmax()])
+        out.append(int(label_to_tree.get(best_label, -1)))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=r"C:\Users\matth\OneDrive\Desktop\Postdoc\Image\All2023")
@@ -2560,6 +2738,34 @@ def main():
                          "the canopy mask CC filter dropped the thin "
                          "branch as a small fragment. Recommended 20-40 "
                          "for whole-image YOLO labeling. Default 0.")
+    # Canopy (per-tree) tracking. Assigns a tree_id to each canopy
+    # connected component and follows it across frames via IoU on
+    # the bbox of the CC. Each kept flower is then assigned to its
+    # containing tree by max pixel overlap with the CC labels image.
+    ap.add_argument("--track-canopy", action="store_true",
+                    help="Enable per-tree tracking. Per session, the "
+                         "CanopyTracker runs over canopy connected "
+                         "components in each frame, assigning each tree "
+                         "a tree_id followed across frames. Flowers "
+                         "are then assigned to their containing tree's "
+                         "id via max pixel overlap. Adds two output "
+                         "CSVs: trees_summary.csv (one row per session "
+                         "x tree) and trees_per_frame.csv (one row per "
+                         "tree-frame appearance). Requires --tree-mask.")
+    ap.add_argument("--canopy-track-iou", type=float, default=0.3,
+                    help="IoU threshold for matching canopy CCs to "
+                         "existing tree tracks across frames. Default "
+                         "0.3 -- canopy bboxes shift more frame-to-"
+                         "frame than flowers.")
+    ap.add_argument("--canopy-track-max-age", type=int, default=5,
+                    help="Frames a tree can be unseen before its "
+                         "tree_id retires. Higher than the flower "
+                         "tracker default (3) because trees can be "
+                         "transiently clipped at frame edges.")
+    ap.add_argument("--canopy-track-min-cc-area", type=int, default=500,
+                    help="Minimum CC pixel area to count as a tree. "
+                         "Below this, treat as canopy noise / fragment "
+                         "and skip.")
     ap.add_argument("--use-build-tree-mask", action="store_true",
                     help="Use the more robust tree_mask.build_tree_mask "
                          "function instead of compute_canopy_mask. Adds "
@@ -3281,6 +3487,18 @@ def main():
 
     current_session_key = None
     current_trackers: dict[str, IoUTracker] = {}
+    # Per-session canopy tracker. Reinstantiated per session so
+    # tree IDs are scoped to one orchard-pass.
+    current_canopy_tracker: CanopyTracker | None = None
+    # Per-(session, tree_id) summary for the new trees CSV.
+    tree_summaries: list[dict] = []
+    # Per-frame, per-tree row for trees_per_frame CSV.
+    tree_per_frame_rows: list[dict] = []
+    # tracks_detail entries get a "tree_id" column populated
+    # when canopy tracking is on; collect alongside flower
+    # tracks so the per-track CSV can show which tree each
+    # blossom track lives on.
+    flower_track_tree_id: dict[tuple, int] = {}  # (session_key, prompt, track_id) -> tree_id
 
     if args.track and (sample is not None and sample < 50):
         print(f"[warn] --track with --sample-per-session {sample} produces "
@@ -3310,8 +3528,29 @@ def main():
             if args.track and session_key != current_session_key:
                 if current_session_key is not None:
                     flush_session_trackers(current_session_key, current_trackers)
+                    # Flush the CANOPY tracker too: aggregate one
+                    # row per (session, tree_id) into tree_summaries.
+                    if (args.track_canopy
+                            and current_canopy_tracker is not None):
+                        d_prev, c_prev, s_prev = current_session_key
+                        for trk in current_canopy_tracker.summary():
+                            tree_summaries.append({
+                                "day": d_prev, "category": c_prev,
+                                "session": s_prev,
+                                "tree_id": trk["tree_id"],
+                                "first_frame": trk["first_frame"],
+                                "last_frame": trk["last_frame"],
+                                "n_frames": trk["n_frames"],
+                                "max_area_px": trk.get("max_area", 0),
+                            })
                 current_trackers = {p: IoUTracker(args.track_iou, args.track_max_age)
                                     for p in tracked_prompts}
+                current_canopy_tracker = (
+                    CanopyTracker(
+                        iou_threshold=args.canopy_track_iou,
+                        max_age=args.canopy_track_max_age,
+                    ) if args.track_canopy else None
+                )
                 current_session_key = session_key
 
             t_img = time.time()
@@ -3506,6 +3745,43 @@ def main():
                                 f"({_dil_err!r}); using undilated mask",
                                 file=sys.stderr,
                             )
+
+                # Per-frame canopy tracking. Extract connected
+                # components from the canopy mask, run the
+                # session-scoped CanopyTracker over them. Each tree
+                # gets a stable tree_id followed across frames.
+                # `frame_canopy_components` and `frame_tree_ids`
+                # are reused below to assign each kept flower mask
+                # to its containing tree.
+                frame_canopy_components: list[dict] = []
+                frame_tree_ids: list[int] = []
+                if (args.track_canopy and canopy_mask_img is not None):
+                    if current_canopy_tracker is None:
+                        current_canopy_tracker = CanopyTracker(
+                            iou_threshold=args.canopy_track_iou,
+                            max_age=args.canopy_track_max_age,
+                        )
+                    frame_canopy_components = extract_canopy_components(
+                        canopy_mask_img,
+                        min_area_px=args.canopy_track_min_cc_area,
+                    )
+                    frame_tree_ids = current_canopy_tracker.step(
+                        frame_canopy_components,
+                    )
+                    # Per-frame log row for trees_per_frame.csv.
+                    for cc, tid in zip(
+                        frame_canopy_components, frame_tree_ids,
+                    ):
+                        bx0, by0, bx1, by1 = cc["bbox"]
+                        tree_per_frame_rows.append({
+                            "day": day, "category": category,
+                            "session": session,
+                            "image": str(img_path),
+                            "tree_id": int(tid),
+                            "bbox_x0": bx0, "bbox_y0": by0,
+                            "bbox_x1": bx1, "bbox_y1": by1,
+                            "area_px": int(cc["area"]),
+                        })
 
                 # Depth-coverage fallback: if the frame has too little
                 # valid depth (sparse D455 returns at frame edges,
@@ -4833,6 +5109,35 @@ def main():
                             areas=kept_areas if is_flower_prompt else None,
                         )
 
+                    # Assign each kept flower mask to a tree_id via
+                    # max-overlap on the canopy CC labels image.
+                    flower_tree_ids: list[int] = []
+                    if (args.track_canopy and is_flower_prompt and n > 0
+                            and frame_canopy_components):
+                        flower_tree_ids = assign_flowers_to_trees(
+                            masks_np, frame_canopy_components,
+                            frame_tree_ids,
+                        )
+                        # Update flower-track -> tree-id mapping
+                        # (use the most-common tree_id per track).
+                        if track_ids and len(track_ids) == len(flower_tree_ids):
+                            for det_i, (tid, tree_i) in enumerate(
+                                zip(track_ids, flower_tree_ids)
+                            ):
+                                if tid < 0 or tree_i < 0:
+                                    continue
+                                key = (
+                                    (day, category, session), prompt, tid,
+                                )
+                                # Simple "first non-negative wins";
+                                # for max-vote replace this with a
+                                # Counter per track. First-vote is
+                                # adequate when canopy tracking is
+                                # consistent.
+                                flower_track_tree_id.setdefault(
+                                    key, int(tree_i),
+                                )
+
                     slug = prompt_slugs[prompt]
                     if args.save_masks and n > 0:
                         rel = img_path.relative_to(args.root).with_suffix(".npz")
@@ -5098,6 +5403,42 @@ def main():
     # Flush the final session's trackers.
     if args.track and current_session_key is not None:
         flush_session_trackers(current_session_key, current_trackers)
+        if (args.track_canopy and current_canopy_tracker is not None):
+            d_last, c_last, s_last = current_session_key
+            for trk in current_canopy_tracker.summary():
+                tree_summaries.append({
+                    "day": d_last, "category": c_last,
+                    "session": s_last,
+                    "tree_id": trk["tree_id"],
+                    "first_frame": trk["first_frame"],
+                    "last_frame": trk["last_frame"],
+                    "n_frames": trk["n_frames"],
+                    "max_area_px": trk.get("max_area", 0),
+                })
+
+    # ---- per-tree CSVs (when --track-canopy is on) -------------
+    if args.track_canopy and tree_summaries:
+        ts_path = out_dir / "trees_summary.csv"
+        ts_fields = ["day", "category", "session", "tree_id",
+                     "first_frame", "last_frame", "n_frames",
+                     "max_area_px"]
+        with open(ts_path, "w", newline="", encoding="utf-8") as tf_:
+            tw_ = csv.DictWriter(tf_, fieldnames=ts_fields)
+            tw_.writeheader()
+            for r in tree_summaries:
+                tw_.writerow(r)
+        print(f"[done] per-session unique trees -> {ts_path}")
+    if args.track_canopy and tree_per_frame_rows:
+        tpf_path = out_dir / "trees_per_frame.csv"
+        tpf_fields = ["day", "category", "session", "image", "tree_id",
+                      "bbox_x0", "bbox_y0", "bbox_x1", "bbox_y1",
+                      "area_px"]
+        with open(tpf_path, "w", newline="", encoding="utf-8") as pf_:
+            pw_ = csv.DictWriter(pf_, fieldnames=tpf_fields)
+            pw_.writeheader()
+            for r in tree_per_frame_rows:
+                pw_.writerow(r)
+        print(f"[done] per-frame tree appearances -> {tpf_path}")
 
     dt = time.time() - start
     print(f"[done] {total_imgs} images × {len(prompts)} prompts in {dt:.1f}s -> {csv_path}")

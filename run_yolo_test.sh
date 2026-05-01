@@ -72,6 +72,7 @@ echo "[batch] Using python: $PY"
   --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
   --use-build-tree-mask --tree-mask-min-overlap 0.10 --tree-mask-dilate-px 30 \
+  --track-canopy --canopy-track-iou 0.3 --canopy-track-max-age 5 --canopy-track-min-cc-area 500 \
   --flower-y-min 0 --flower-y-max 380 \
   --flower-max-area-px 12000 --flower-max-bbox-area-px 60000 \
   --flower-white-s-max 40 --flower-white-v-min 140 --flower-pink-v-min 100 \
