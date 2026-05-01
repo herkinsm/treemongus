@@ -2312,6 +2312,9 @@ def flower_quality_keep(masks_np: np.ndarray,
                          max_bbox_area_px: int = 0,
                          min_mask_density: float = 0.0,
                          sam3_boxes: np.ndarray | None = None,
+                         max_mask_green_frac: float = 0.0,
+                         green_h_lo: int = 35, green_h_hi: int = 85,
+                         green_s_min: int = 40, green_v_min: int = 35,
                          ) -> tuple[np.ndarray, dict, list[int]]:
     """Boolean keep-array + per-rejection diagnostics + per-mask area, mirroring
     the gates in sprayer_pipeline/flower_detector.py:
@@ -2329,24 +2332,39 @@ def flower_quality_keep(masks_np: np.ndarray,
             "top_row": 0, "ground_row": 0,
             "edge_margin": 0, "circularity": 0, "solidity": 0,
             "yellow_color": 0, "non_blossom_color": 0,
-            "max_bbox_area": 0, "low_density": 0}
+            "max_bbox_area": 0, "low_density": 0,
+            "leaf_green": 0}
     areas: list[int] = []
 
     # Pre-compute the "could be apple blossom" pixel mask once per frame
     # (white OR pink in HSV — ports the bloom-stage gates from
     # flower_detector.py as a POSITIVE color check).
     blossom_pixel_mask = None
-    if require_blossom_color and rgb_arr is not None:
+    green_pixel_mask = None
+    if (require_blossom_color or max_mask_green_frac > 0) and rgb_arr is not None:
         import cv2
         hsv = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2HSV)
         H_ch, S_ch, V_ch = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-        white = (S_ch <= blossom_white_s_max) & (V_ch >= blossom_white_v_min)
-        in_pink_hue = (((H_ch >= blossom_pink_h_lo) & (H_ch <= blossom_pink_h_hi))
-                       | ((H_ch >= blossom_pink_h_lo2) & (H_ch <= blossom_pink_h_hi2)))
-        pink = (in_pink_hue
-                & (S_ch >= blossom_pink_s_lo) & (S_ch <= blossom_pink_s_hi)
-                & (V_ch >= blossom_pink_v_min))
-        blossom_pixel_mask = white | pink
+        if require_blossom_color:
+            white = (S_ch <= blossom_white_s_max) & (V_ch >= blossom_white_v_min)
+            in_pink_hue = (((H_ch >= blossom_pink_h_lo) & (H_ch <= blossom_pink_h_hi))
+                           | ((H_ch >= blossom_pink_h_lo2) & (H_ch <= blossom_pink_h_hi2)))
+            pink = (in_pink_hue
+                    & (S_ch >= blossom_pink_s_lo) & (S_ch <= blossom_pink_s_hi)
+                    & (V_ch >= blossom_pink_v_min))
+            blossom_pixel_mask = white | pink
+        if max_mask_green_frac > 0:
+            # Leaf green: tree foliage. We tag every "obviously green"
+            # pixel and later reject any flower mask whose green-pixel
+            # fraction exceeds max_mask_green_frac. Catches the case
+            # where a leaf with sky/cloud behind it gets segmented as
+            # a "flower" because the bright sky pixels register as
+            # white inside the SAM mask -- the leaf's green pixels
+            # still dominate, so the green-frac gate fires.
+            green_pixel_mask = (
+                (H_ch >= green_h_lo) & (H_ch <= green_h_hi)
+                & (S_ch >= green_s_min) & (V_ch >= green_v_min)
+            )
     for i, m in enumerate(masks_np):
         circ, sol, area, bx, by, bw, bh, cy = _mask_shape_stats(m)
         areas.append(area)
@@ -2404,6 +2422,24 @@ def flower_quality_keep(masks_np: np.ndarray,
                 if frac_blossom < min_blossom_color_frac:
                     keep[i] = False
                     diag["non_blossom_color"] += 1
+                    continue
+        # Leaf-with-sky-behind rejection. A leaf that has bright sky
+        # behind it can pass the blossom-color frac (the sky pixels
+        # inside the mask register as white). But the mask still has
+        # a substantial fraction of green leaf pixels. Reject if the
+        # green-pixel fraction exceeds the cap.
+        if max_mask_green_frac > 0 and green_pixel_mask is not None:
+            mb = np.asarray(m).astype(bool)
+            if mb.ndim == 3:
+                mb = mb.any(axis=0)
+            total = int(mb.sum())
+            if total > 0:
+                frac_green = (
+                    float((mb & green_pixel_mask).sum()) / float(total)
+                )
+                if frac_green > max_mask_green_frac:
+                    keep[i] = False
+                    diag["leaf_green"] += 1
                     continue
     return keep, diag, areas
 
@@ -2741,6 +2777,8 @@ def augment_canopy_with_edge_trees(
     depth_max_mm: float = 3000.0,
     min_area_px: int = 500,
     edge_band_px: int = 20,
+    min_height_px: int = 100,
+    max_top_row: int = 200,
 ) -> np.ndarray:
     """Add foreground-depth components touching the left/right
     frame edges to the canopy mask.
@@ -2790,8 +2828,18 @@ def augment_canopy_with_edge_trees(
     augmented = canopy_mask.astype(bool).copy()
     added = False
     for cc_id in range(1, n_cc):
-        x, y, ww, _hh, area = stats[cc_id]
+        x, y, ww, hh, area = stats[cc_id]
         if area < min_area_px:
+            continue
+        # Tree-shape filter: trees are TALL (height >= min_height_px)
+        # and extend into the upper rows of the frame (bbox top
+        # <= max_top_row). Grass that touches the frame edges is
+        # short and confined to the lower rows, so this filter
+        # rejects the grass CC even though it has foreground
+        # depth and touches the L/R edges.
+        if hh < min_height_px:
+            continue
+        if y > max_top_row:
             continue
         x_max = x + ww - 1
         if x <= edge_band_px or x_max >= w - 1 - edge_band_px:
@@ -3154,6 +3202,22 @@ def main():
                     help="Minimum area for an edge-touching CC to be "
                          "added as canopy by --canopy-include-edge-"
                          "trees. Default 500 px filters small noise.")
+    ap.add_argument("--canopy-edge-tree-min-height-px", type=int,
+                    default=100,
+                    help="Minimum bbox HEIGHT for an edge-touching CC "
+                         "to be added as canopy by --canopy-include-"
+                         "edge-trees. Trees are tall; grass that "
+                         "touches the L/R edges is short and stays "
+                         "in the lower frame. Default 100 px filters "
+                         "out grass strips.")
+    ap.add_argument("--canopy-edge-tree-max-top-row", type=int,
+                    default=200,
+                    help="Maximum bbox TOP ROW for an edge-touching CC "
+                         "to be added as canopy by --canopy-include-"
+                         "edge-trees. Tree CCs extend into the upper "
+                         "frame; grass CCs are confined to the lower "
+                         "rows so their bbox top is well below 200. "
+                         "Default 200 (= upper 42%% of a 480-row frame).")
     ap.add_argument("--flower-max-behind-foreground-mm",
                     type=float, default=0.0,
                     help="After flowers are assigned to canopy "
@@ -3776,6 +3840,31 @@ def main():
     ap.add_argument("--flower-min-blossom-color-frac", type=float, default=0.30,
                     help="Minimum fraction of mask pixels that must be blossom-"
                          "colored for the mask to survive (default 0.30).")
+    # Leaf-with-sky-behind rejection: reject masks whose leaf-green
+    # pixel fraction exceeds a cap. A leaf with bright sky behind it
+    # can pass the blossom-color gate (sky pixels register as
+    # 'white'); checking the green fraction inside the SAM mask
+    # catches that case directly.
+    ap.add_argument("--flower-max-mask-green-frac", type=float, default=0.0,
+                    help="Reject any flower mask whose fraction of "
+                         "leaf-green HSV pixels exceeds this threshold "
+                         "(default 0 = disabled). Catches the 'leaf "
+                         "with sky behind it' false positive: the bright "
+                         "sky inside the mask passes the white-pink "
+                         "blossom color check, but the leaf's green "
+                         "pixels still dominate. Try 0.30 (30%%).")
+    ap.add_argument("--flower-green-hue-min", type=int, default=35,
+                    help="Lower hue bound for the leaf-green pixel "
+                         "definition (OpenCV 0-179; default 35).")
+    ap.add_argument("--flower-green-hue-max", type=int, default=85,
+                    help="Upper hue bound for the leaf-green pixel "
+                         "definition (OpenCV 0-179; default 85).")
+    ap.add_argument("--flower-green-sat-min", type=int, default=40,
+                    help="Minimum saturation for a pixel to count as "
+                         "leaf-green (0-255; default 40).")
+    ap.add_argument("--flower-green-val-min", type=int, default=35,
+                    help="Minimum value (V) for a pixel to count as "
+                         "leaf-green (0-255; default 35).")
     # Multi-prompt union for flowers — run multiple flower-related prompts
     # and NMS-merge their detections under a single canonical 'flower' label.
     # Trades cost for recall: each prompt catches blossoms the others miss.
@@ -4293,6 +4382,8 @@ def main():
                                 depth_min_mm=args.depth_min_mm,
                                 depth_max_mm=args.depth_max_mm,
                                 min_area_px=args.canopy_edge_tree_min_area_px,
+                                min_height_px=args.canopy_edge_tree_min_height_px,
+                                max_top_row=args.canopy_edge_tree_max_top_row,
                             )
                         except Exception as _edge_err:
                             print(
@@ -5794,6 +5885,11 @@ def main():
                             max_bbox_area_px=args.flower_max_bbox_area_px,
                             min_mask_density=args.flower_min_mask_density,
                             sam3_boxes=boxes_np,
+                            max_mask_green_frac=args.flower_max_mask_green_frac,
+                            green_h_lo=args.flower_green_hue_min,
+                            green_h_hi=args.flower_green_hue_max,
+                            green_s_min=args.flower_green_sat_min,
+                            green_v_min=args.flower_green_val_min,
                         )
                         # Roll up rejections per (session, prompt).
                         rt_key = (day, category, session, prompt)
