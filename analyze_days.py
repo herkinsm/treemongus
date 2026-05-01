@@ -476,34 +476,53 @@ def compute_sky_exclusions(
     flags if a specific mode mis-fires on your data."""
     h_img, w_img = H.shape[:2]
     sky = np.zeros_like(H, dtype=bool)
+    # Pixels that are clearly NEAR a tree (within the dilated
+    # near_tree band) get a free pass on every sky exclusion.
+    # Real upper-canopy flowers are silhouetted against sky
+    # behind them, so naively, sky_warm / sky_smooth / sky_grey
+    # fire on the petal pixels themselves and refinement loses
+    # them. near_tree captures "this pixel is on or adjacent to
+    # branches with valid depth"; if so, it's almost certainly
+    # canopy not sky.
+    near_tree_safe = near_tree if near_tree is not None else None
     # Smooth bright sky: no texture, no depth, low IR.
     if enable_smooth and ir_8bit is not None:
         sky_smooth = (~has_texture) & no_depth & (ir_8bit < ir_sky_ceil)
+        if near_tree_safe is not None:
+            sky_smooth = sky_smooth & (~near_tree_safe)
         sky |= sky_smooth
     # Warm / golden-hour sky: no depth, V high, IR low.
     if enable_warm and ir_8bit is not None:
         sky_warm = no_depth & (V > 80) & (ir_8bit < 70)
+        if near_tree_safe is not None:
+            sky_warm = sky_warm & (~near_tree_safe)
         sky |= sky_warm
     # Top-strip sky: top fraction of image, no depth, not near tree.
     if enable_upper:
         upper = np.zeros_like(no_depth)
         upper[: int(h_img * upper_frac), :] = True
-        if near_tree is not None:
-            sky_upper = upper & no_depth & (~near_tree) & (S < 50) & (V > 80)
+        if near_tree_safe is not None:
+            sky_upper = upper & no_depth & (~near_tree_safe) & (S < 50) & (V > 80)
         else:
             sky_upper = upper & no_depth & (S < 50) & (V > 80)
         sky |= sky_upper
     # Overcast cloud: no depth, very low S, V in cloud range.
     if enable_overcast:
         sky_overcast = no_depth & (S < 12) & (V > 140) & (V <= 200)
+        if near_tree_safe is not None:
+            sky_overcast = sky_overcast & (~near_tree_safe)
         sky |= sky_overcast
     # Bright grey cloud: depth=0, V very high, S low, IR moderate.
     if enable_grey and ir_8bit is not None:
         sky_grey = no_depth & (V > 200) & (S < 20) & (ir_8bit < 100)
+        if near_tree_safe is not None:
+            sky_grey = sky_grey & (~near_tree_safe)
         sky |= sky_grey
     # B-R-positive sky catch-all: low S, high V, no depth, blue-shifted.
     if enable_br:
         sky_br = no_depth & (b_minus_r > 0) & (S < 30) & (V > 150)
+        if near_tree_safe is not None:
+            sky_br = sky_br & (~near_tree_safe)
         sky |= sky_br
     return sky
 
@@ -2970,6 +2989,14 @@ def main():
                          "the canopy mask CC filter dropped the thin "
                          "branch as a small fragment. Recommended 20-40 "
                          "for whole-image YOLO labeling. Default 0.")
+    ap.add_argument("--tree-mask-min-canopy-frac", type=float, default=0.01,
+                    help="Skip the tree-mask gate when the canopy mask "
+                         "covers less than this fraction of the frame. "
+                         "Without this, partial-frame trees that produce "
+                         "a tiny canopy mask have ALL their flowers "
+                         "rejected by the 10%% overlap requirement "
+                         "(small canopy * 10%% = essentially none). "
+                         "Default 0.01 = 1%% of frame.")
     # Canopy (per-tree) tracking. Assigns a tree_id to each canopy
     # connected component and follows it across frames via IoU on
     # the bbox of the CC. Each kept flower is then assigned to its
@@ -4458,8 +4485,26 @@ def main():
 
                     # Tree-mask canopy filter (applies to ALL prompts — every
                     # category benefits from rejecting ground/sky/bg).
+                    # Skip when:
+                    #   1) frame is in depth-coverage fallback (depth-
+                    #      derived canopy mask is unreliable here)
+                    #   2) canopy mask is empty or tiny (< 1% of frame)
+                    #      meaning build_tree_mask couldn't capture the
+                    #      partial tree -- relying on the tree-mask
+                    #      gate would falsely reject every detection.
                     canopy_overlap_mean: float | str = ""
-                    if args.tree_mask and canopy_mask_img is not None and n > 0:
+                    _skip_tree_mask = False
+                    if canopy_mask_img is not None:
+                        _canopy_frac = (
+                            float(canopy_mask_img.sum())
+                            / float(canopy_mask_img.size)
+                        )
+                        if _canopy_frac < args.tree_mask_min_canopy_frac:
+                            _skip_tree_mask = True
+                    if _low_depth_coverage:
+                        _skip_tree_mask = True
+                    if (args.tree_mask and canopy_mask_img is not None
+                            and n > 0 and not _skip_tree_mask):
                         overlaps = canopy_overlap_per_mask(masks_np, canopy_mask_img)
                         ov_arr = np.asarray(overlaps, dtype=float)
                         keep = ~np.isnan(ov_arr) & (ov_arr >= args.tree_mask_min_overlap)
