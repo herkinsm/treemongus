@@ -66,14 +66,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def slugify_path(p: Path, prefix: Path | None) -> str:
-    """Convert a full path into a flat filesystem-safe filename."""
+    """Convert a full path into a flat filesystem-safe filename.
+
+    Skips the per-modality folder name (RGB / IR / Depth / PRGB)
+    so the resulting stem matches what make_yolo_dataset.py
+    produces -- this keeps make_labelstudio_tasks.py's stem-based
+    YOLO-label lookup working without slug-rewriting.
+    """
     try:
         rel = p.relative_to(prefix) if prefix is not None else p
     except (ValueError, TypeError):
         rel = Path(p.name)
+    skip_modality = {"RGB", "IR", "Depth", "PRGB", "Info",
+                     "rgb", "ir", "depth", "prgb", "info"}
     parts = [
         part.replace(" ", "_")
         for part in rel.parts
+        if part not in skip_modality
     ]
     flat = "__".join(parts)
     return flat

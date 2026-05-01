@@ -53,13 +53,33 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_yolo_label(stem: str, yolo_dir: Path | None) -> Path | None:
-    """Look up the YOLO label for an image stem in train/ then val/."""
+    """Look up the YOLO label for an image stem in train/ then val/.
+
+    Tries multiple stem variants to absorb the slug-format mismatch
+    between extract_rgb_for_labeling.py (which includes "RGB" as a
+    path part: <day>__<category>__<session>__RGB__<stem>) and
+    make_yolo_dataset.py (which uses only 4 parts:
+    <day>__<category>__<session>__<stem>). Without these variants,
+    every task imports with zero predictions because the image
+    filename's stem never matches the YOLO label filename's stem.
+    """
     if yolo_dir is None:
         return None
-    for split in ("train", "val"):
-        cand = yolo_dir / "labels" / split / f"{stem}.txt"
-        if cand.is_file():
-            return cand
+    variants = [
+        stem,
+        # Strip the RGB folder marker if present anywhere:
+        stem.replace("__RGB__", "__"),
+        stem.replace("__rgb__", "__"),
+    ]
+    seen = set()
+    for cand_stem in variants:
+        if cand_stem in seen:
+            continue
+        seen.add(cand_stem)
+        for split in ("train", "val"):
+            cand = yolo_dir / "labels" / split / f"{cand_stem}.txt"
+            if cand.is_file():
+                return cand
     return None
 
 
