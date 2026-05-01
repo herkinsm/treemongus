@@ -3000,14 +3000,26 @@ def main():
     ap.add_argument("--flower-require-tree-in-frame", action="store_true",
                     help="Reject ALL flower detections in any frame "
                          "where the pipeline finds neither a meaningful "
-                         "canopy mask (>= --tree-mask-min-canopy-frac) "
+                         "FOREGROUND canopy mask (>= --tree-mask-min-"
+                         "canopy-frac AND median depth <= "
+                         "--flower-foreground-canopy-max-depth-mm) "
                          "NOR any detected trunks (when --track-canopy "
-                         "is on). On those 'no tree in view' frames, "
-                         "any 'flower' detection is a false positive "
-                         "(grass weeds, distant orchard rows, dust). "
-                         "Recommended on for whole-image YOLO labeling "
-                         "to prevent spurious training labels from "
-                         "frames the rig was crossing between trees.")
+                         "is on). On those 'no foreground tree in view' "
+                         "frames, any 'flower' detection is a false "
+                         "positive (grass weeds, tiny background tree, "
+                         "distant orchard rows, dust). Recommended on "
+                         "for whole-image YOLO labeling.")
+    ap.add_argument("--flower-foreground-canopy-max-depth-mm",
+                    type=float, default=2500.0,
+                    help="When --flower-require-tree-in-frame is on, "
+                         "the canopy mask is treated as 'foreground' "
+                         "only if its median valid-depth value is at or "
+                         "below this threshold (default 2500 mm = 2.5 "
+                         "m). A tiny background-row canopy patch may "
+                         "still pass the size threshold but sits at "
+                         "3-5 m; this depth check rejects it. Set 0 "
+                         "to disable the depth side of the check "
+                         "(canopy size alone gates).")
     # Canopy (per-tree) tracking. Assigns a tree_id to each canopy
     # connected component and follows it across frames via IoU on
     # the bbox of the CC. Each kept flower is then assigned to its
@@ -4282,11 +4294,19 @@ def main():
                         })
 
                 # No-tree-in-frame detector: if neither a meaningful
-                # canopy mask NOR any detected trunks were found, this
-                # frame contains no foreground tree -- ANY 'flower'
-                # detection is a false positive (background grass
-                # weeds, distant orchard rows, dust, etc.). Used below
-                # to zero out per-prompt detections.
+                # FOREGROUND canopy NOR any close-foreground trunks
+                # were found, this frame has no real subject tree --
+                # ANY 'flower' detection is a false positive (grass
+                # weeds, distant orchard rows, tiny far canopy, dust,
+                # etc.). Used below to zero out per-prompt detections.
+                #
+                # 'Foreground' = canopy median depth within
+                # [depth_min_mm, --flower-foreground-canopy-max-depth-mm].
+                # A tiny background-tree canopy passes the size check
+                # but its median depth is 3-5 m, so the depth check
+                # rejects it. A partial-frame foreground tree with a
+                # tiny but close canopy (median depth ~ 1-2 m) keeps
+                # passing.
                 _no_tree_in_frame = False
                 if args.flower_require_tree_in_frame:
                     _canopy_present = False
@@ -4297,6 +4317,23 @@ def main():
                         )
                         if _cf >= args.tree_mask_min_canopy_frac:
                             _canopy_present = True
+                            # Also require canopy median depth to be
+                            # in the foreground band. Without this, a
+                            # tiny background-row canopy patch passes
+                            # the size check.
+                            if (depth_mm is not None
+                                    and args.flower_foreground_canopy_max_depth_mm > 0):
+                                _cm_bool = canopy_mask_img.astype(bool)
+                                _cm_depth = depth_mm[_cm_bool]
+                                _cm_valid = _cm_depth[
+                                    (_cm_depth >= args.flower_depth_min_mm)
+                                    & (_cm_depth <= 60000)
+                                ]
+                                if _cm_valid.size >= 20:
+                                    _cm_med = float(np.median(_cm_valid))
+                                    if (_cm_med
+                                            > args.flower_foreground_canopy_max_depth_mm):
+                                        _canopy_present = False
                     _trunks_present = (
                         args.track_canopy
                         and bool(frame_canopy_components)
