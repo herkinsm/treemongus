@@ -2997,6 +2997,17 @@ def main():
                          "rejected by the 10%% overlap requirement "
                          "(small canopy * 10%% = essentially none). "
                          "Default 0.01 = 1%% of frame.")
+    ap.add_argument("--flower-require-tree-in-frame", action="store_true",
+                    help="Reject ALL flower detections in any frame "
+                         "where the pipeline finds neither a meaningful "
+                         "canopy mask (>= --tree-mask-min-canopy-frac) "
+                         "NOR any detected trunks (when --track-canopy "
+                         "is on). On those 'no tree in view' frames, "
+                         "any 'flower' detection is a false positive "
+                         "(grass weeds, distant orchard rows, dust). "
+                         "Recommended on for whole-image YOLO labeling "
+                         "to prevent spurious training labels from "
+                         "frames the rig was crossing between trees.")
     # Canopy (per-tree) tracking. Assigns a tree_id to each canopy
     # connected component and follows it across frames via IoU on
     # the bbox of the CC. Each kept flower is then assigned to its
@@ -4270,6 +4281,29 @@ def main():
                             "area_px": int(cc["area"]),
                         })
 
+                # No-tree-in-frame detector: if neither a meaningful
+                # canopy mask NOR any detected trunks were found, this
+                # frame contains no foreground tree -- ANY 'flower'
+                # detection is a false positive (background grass
+                # weeds, distant orchard rows, dust, etc.). Used below
+                # to zero out per-prompt detections.
+                _no_tree_in_frame = False
+                if args.flower_require_tree_in_frame:
+                    _canopy_present = False
+                    if canopy_mask_img is not None:
+                        _cf = (
+                            float(canopy_mask_img.sum())
+                            / float(canopy_mask_img.size)
+                        )
+                        if _cf >= args.tree_mask_min_canopy_frac:
+                            _canopy_present = True
+                    _trunks_present = (
+                        args.track_canopy
+                        and bool(frame_canopy_components)
+                    )
+                    if (not _canopy_present) and (not _trunks_present):
+                        _no_tree_in_frame = True
+
                 # Depth-coverage fallback: if the frame has too little
                 # valid depth (sparse D455 returns at frame edges,
                 # distant scenes, sensor failures), skip every gate
@@ -4323,6 +4357,38 @@ def main():
                     n = n_raw
                     mean_s = float(np.mean(scores_np)) if scores_np is not None and len(scores_np) else 0.0
                     max_s = float(np.max(scores_np)) if scores_np is not None and len(scores_np) else 0.0
+
+                    # No-tree-in-frame zero-out: if the frame contains
+                    # no foreground tree (no canopy mask, no detected
+                    # trunks), every flower detection is a false
+                    # positive. Force n=0 for flower prompts. Other
+                    # prompts (e.g., trunk inference itself) are
+                    # untouched -- we still want trunk results so
+                    # tracking continuity works on subsequent frames.
+                    is_flower_for_no_tree = (
+                        "flower" in prompt.lower()
+                        or "blossom" in prompt.lower()
+                    )
+                    if (_no_tree_in_frame and is_flower_for_no_tree
+                            and n > 0):
+                        # Drop all detections via an all-False keep.
+                        keep_nt = np.zeros(n, dtype=bool)
+                        # Audit before mutating arrays.
+                        for _i in range(n):
+                            orig_i = int(_i)  # surviving == identity here
+                        audit_was_set = False
+                        # Empty all detection arrays; preserve types.
+                        masks_np = masks_np[keep_nt]
+                        if scores_np is not None:
+                            scores_np = scores_np[keep_nt]
+                        if boxes_np is not None:
+                            boxes_np = boxes_np[keep_nt]
+                        n = 0
+                        rt_key = (day, category, session, prompt)
+                        rt = rejection_totals.setdefault(rt_key, {})
+                        rt["no_tree_in_frame"] = (
+                            rt.get("no_tree_in_frame", 0) + n_raw
+                        )
 
                     # Per-(frame, prompt) rejection audit. Tracks which
                     # ORIGINAL SAM detection got rejected by which filter
