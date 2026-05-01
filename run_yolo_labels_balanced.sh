@@ -80,6 +80,7 @@ echo "[batch] Using python: $PY"
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
   --use-build-tree-mask --tree-mask-min-overlap 0.10 --tree-mask-dilate-px 30 \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 500 \
+  --flower-edge-margin-sides-px 0 \
   --flower-require-tree-in-frame --flower-foreground-canopy-max-depth-mm 2500 \
   --flower-max-behind-foreground-mm 1000 \
   --track-canopy --canopy-track-iou 0.3 --canopy-track-max-age 5 --canopy-track-min-cc-area 500 \

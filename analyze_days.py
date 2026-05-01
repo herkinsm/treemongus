@@ -2293,6 +2293,7 @@ def flower_quality_keep(masks_np: np.ndarray,
                          min_circ: float, min_sol: float,
                          edge_margin: int,
                          img_h: int, img_w: int,
+                         edge_margin_sides: int = -1,
                          rgb_arr: np.ndarray | None = None,
                          reject_yellow: bool = False,
                          yellow_h_lo: int = 15, yellow_h_hi: int = 45,
@@ -2373,10 +2374,17 @@ def flower_quality_keep(masks_np: np.ndarray,
             keep[i] = False; diag["top_row"] += 1; continue
         if cy > y_max:
             keep[i] = False; diag["ground_row"] += 1; continue
-        if edge_margin > 0:
-            if (bx < edge_margin or by < edge_margin
-                    or (bx + bw) > (img_w - 1 - edge_margin)
-                    or (by + bh) > (img_h - 1 - edge_margin)):
+        # Edge-margin filter. Top/bottom uses --flower-edge-margin-px
+        # (D455 stereo artefacts); left/right uses
+        # --flower-edge-margin-sides-px when >= 0, else the same.
+        # Setting sides to 0 lets blossom bboxes that crop at the
+        # L/R edge of the frame survive (half-trees at frame edges).
+        em_tb = edge_margin
+        em_lr = edge_margin_sides if edge_margin_sides >= 0 else edge_margin
+        if em_tb > 0 or em_lr > 0:
+            if (bx < em_lr or by < em_tb
+                    or (bx + bw) > (img_w - 1 - em_lr)
+                    or (by + bh) > (img_h - 1 - em_tb)):
                 keep[i] = False; diag["edge_margin"] += 1; continue
         if circ < min_circ:
             keep[i] = False; diag["circularity"] += 1; continue
@@ -3725,7 +3733,18 @@ def main():
                          "0.50, matches flower_detector.py).")
     ap.add_argument("--flower-edge-margin-px", type=int, default=15,
                     help="Reject flower bboxes that come within this many pixels of "
-                         "any frame edge (default 15; D455 stereo edge artefacts).")
+                         "the TOP or BOTTOM frame edge (default 15; D455 stereo "
+                         "edge artefacts). Use --flower-edge-margin-sides-px to "
+                         "configure the LEFT/RIGHT sides separately.")
+    ap.add_argument("--flower-edge-margin-sides-px", type=int, default=-1,
+                    help="Override --flower-edge-margin-px for the LEFT and "
+                         "RIGHT edges only. Default -1 = inherit from "
+                         "--flower-edge-margin-px. Set to 0 to allow flowers "
+                         "whose bbox touches the L/R edges through (useful "
+                         "for half-trees at frame edges where the partial "
+                         "canopy crops blossom bboxes; the original edge_margin "
+                         "was meant for D455 stereo artefacts that mostly "
+                         "affect top/bottom rows).")
     ap.add_argument("--flower-area-per-flower-px", type=int, default=200,
                     help="Average pixels per individual blossom; used to estimate "
                          "n_individual_flowers from cluster area as "
@@ -5764,6 +5783,7 @@ def main():
                             args.flower_min_circularity, args.flower_min_solidity,
                             args.flower_edge_margin_px,
                             img.height, img.width,
+                            edge_margin_sides=args.flower_edge_margin_sides_px,
                             rgb_arr=rgb_arr,
                             reject_yellow=args.flower_reject_yellow,
                             yellow_h_lo=args.flower_yellow_hue_min,
