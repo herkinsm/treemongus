@@ -3573,6 +3573,7 @@ def refine_canopy_mask(
     depth_min_mm: float = 600.0,
     depth_max_mm: float = 3000.0,
     exclude_sky: bool = True,
+    outward_dilate_px: int = 0,
 ) -> np.ndarray:
     """Post-process the canopy mask:
 
@@ -3672,6 +3673,41 @@ def refine_canopy_mask(
     if depth_mm is not None:
         bg_depth = depth_mm.astype(np.float32) > float(depth_max_mm)
         cm = cm & ~bg_depth
+
+    # 2c. OUTWARD DILATION INTO BRANCH PIXELS. Branches at the
+    # tree's outer edges often stick out PAST the SAM/heuristic
+    # mask -- they're thin so SAM doesn't fully segment them and
+    # the D455 returns no depth on them either. We catch them by
+    # dilating the canopy mask in ALL directions by N pixels and
+    # admitting pixels that are NOT sky AND have valid foreground
+    # depth OR no depth return (the typical thin-branch case).
+    # Sky pixels are still excluded so the dilation doesn't
+    # bleed into the actual sky.
+    if outward_dilate_px > 0:
+        kern_o = _cv2.getStructuringElement(
+            _cv2.MORPH_ELLIPSE,
+            (2 * int(outward_dilate_px) + 1,
+             2 * int(outward_dilate_px) + 1),
+        )
+        dilated = _cv2.dilate(
+            cm.astype(np.uint8), kern_o, iterations=1,
+        ) > 0
+        # Allowed = foreground depth OR no-return (sensor missed
+        # the thin branch). Sky still excluded by the HSV check
+        # we already computed.
+        if depth_mm is not None:
+            depth_f = depth_mm.astype(np.float32)
+            depth_ok = (
+                ((depth_f >= float(depth_min_mm))
+                 & (depth_f <= float(depth_max_mm)))
+                | (depth_f == 0)
+            )
+        else:
+            depth_ok = np.ones_like(cm)
+        admit = dilated & depth_ok
+        if sky_pix is not None:
+            admit = admit & ~sky_pix
+        cm = cm | admit
 
     # 3. CLOSING. Bridge small gaps between nearby CCs.
     if close_px > 0:
@@ -4564,6 +4600,30 @@ def main():
                     help="Stake maximum brightness V (default 120). "
                          "Stakes are dark (painted) -- leaves are "
                          "typically brighter.")
+    ap.add_argument("--canopy-stake-min-aspect-ratio", type=float,
+                    default=4.0,
+                    help="Per-CC aspect ratio (h/w) required for a "
+                         "stake-colored CC to actually be excluded. "
+                         "Real stakes are tall+narrow (aspect 5-30). "
+                         "Shaded-leaf blobs that happen to match the "
+                         "stake color HSV are roundish (aspect ~1) "
+                         "and stay in canopy. Default 4.0.")
+    ap.add_argument("--canopy-stake-min-area-px", type=int,
+                    default=50,
+                    help="Minimum CC area (in px) for stake-colored "
+                         "exclusion. Default 50 -- below this is just "
+                         "noise.")
+    ap.add_argument("--canopy-refine-outward-dilate-px", type=int,
+                    default=0,
+                    help="Dilate the canopy mask outward (any "
+                         "direction) by this many px and admit pixels "
+                         "that are NOT sky and have valid OR no-return "
+                         "depth. Catches branches at the edges that "
+                         "stick OUT of the SAM/heuristic mask -- thin "
+                         "branches often have no D455 depth return so "
+                         "they're not in the foreground depth band, "
+                         "but they're also not sky-coloured. Default "
+                         "0 = disabled. Try 8.")
     ap.add_argument("--canopy-fill-small-holes", action="store_true",
                     help="After all canopy exclusions (sky, "
                          "background depth, stakes), fill small "
@@ -6125,6 +6185,9 @@ def main():
                             depth_min_mm=args.depth_min_mm,
                             depth_max_mm=args.depth_max_mm,
                             exclude_sky=True,
+                            outward_dilate_px=(
+                                args.canopy_refine_outward_dilate_px
+                            ),
                         )
                     except Exception as _ref_err:
                         print(
@@ -6135,11 +6198,16 @@ def main():
 
                 # PAINTED-STAKE EXCLUSION. Remove pixels that look
                 # like a painted-green metal/wood stake (saturated
-                # green at low brightness) from the canopy mask.
-                # Stakes are visually distinct from leaf green
-                # (which has higher V and lower S in the same hue
-                # band). User can tune the HSV bounds via the
-                # --canopy-stake-* flags.
+                # green at low brightness AND forming a tall,
+                # narrow vertical shape) from the canopy mask.
+                #
+                # The shape check is critical: shaded leaves under
+                # dense foliage have similar HSV (saturated, dark,
+                # green) but form roundish blobs, not tall+narrow
+                # vertical lines. Color-only exclusion was carving
+                # holes out of leafy regions (user reported "holes
+                # appear to be on leaves, not in actual gaps").
+                # Adding a per-CC aspect-ratio gate fixes that.
                 if (args.canopy_exclude_painted_stakes
                         and canopy_mask_img is not None
                         and canopy_mask_img.any()):
@@ -6153,12 +6221,48 @@ def main():
                         _Hs = _hsv_st[:, :, 0]
                         _Ss = _hsv_st[:, :, 1]
                         _Vs = _hsv_st[:, :, 2]
-                        _stake_pix = (
+                        _stake_color = (
                             (_Hs >= int(args.canopy_stake_hue_min))
                             & (_Hs <= int(args.canopy_stake_hue_max))
                             & (_Ss >= int(args.canopy_stake_sat_min))
                             & (_Vs <= int(args.canopy_stake_val_max))
                         )
+                        # Shape-based pruning: keep only tall+narrow
+                        # CCs as stakes. Default aspect threshold 4.0
+                        # rejects round shadow-leaf blobs (aspect ~1)
+                        # while keeping real stakes (aspect 5-30).
+                        _stake_pix = np.zeros_like(_stake_color)
+                        if _stake_color.any():
+                            _sc_u8 = (
+                                _stake_color.astype(np.uint8) * 255
+                            )
+                            (_sc_n_cc, _sc_lbl, _sc_stats, _) = (
+                                _cv2_st.connectedComponentsWithStats(
+                                    _sc_u8, connectivity=8,
+                                )
+                            )
+                            _sc_min_area = int(
+                                args.canopy_stake_min_area_px
+                            )
+                            _sc_min_aspect = float(
+                                args.canopy_stake_min_aspect_ratio
+                            )
+                            for _sc_id in range(1, _sc_n_cc):
+                                _sc_w = int(
+                                    _sc_stats[_sc_id, _cv2_st.CC_STAT_WIDTH]
+                                )
+                                _sc_h = int(
+                                    _sc_stats[_sc_id, _cv2_st.CC_STAT_HEIGHT]
+                                )
+                                _sc_a = int(
+                                    _sc_stats[_sc_id, _cv2_st.CC_STAT_AREA]
+                                )
+                                if _sc_a < _sc_min_area:
+                                    continue
+                                if _sc_w > 0 and (
+                                    _sc_h / float(_sc_w)
+                                ) >= _sc_min_aspect:
+                                    _stake_pix |= (_sc_lbl == _sc_id)
                         canopy_mask_img = (
                             canopy_mask_img.astype(bool) & ~_stake_pix
                         )
@@ -6204,6 +6308,9 @@ def main():
 
                     # RE-APPLY stake exclusion (removes any stake
                     # that hole-fill brought back from a stake-hole).
+                    # Same shape-aware logic as the primary stake
+                    # exclusion above: only tall+narrow CCs are
+                    # treated as stakes.
                     if (args.canopy_exclude_painted_stakes
                             and canopy_mask_img is not None
                             and canopy_mask_img.any()):
@@ -6217,12 +6324,46 @@ def main():
                             _Hs2 = _hsv_st2[:, :, 0]
                             _Ss2 = _hsv_st2[:, :, 1]
                             _Vs2 = _hsv_st2[:, :, 2]
-                            _stake_pix2 = (
+                            _stake_color2 = (
                                 (_Hs2 >= int(args.canopy_stake_hue_min))
                                 & (_Hs2 <= int(args.canopy_stake_hue_max))
                                 & (_Ss2 >= int(args.canopy_stake_sat_min))
                                 & (_Vs2 <= int(args.canopy_stake_val_max))
                             )
+                            _stake_pix2 = np.zeros_like(_stake_color2)
+                            if _stake_color2.any():
+                                _sc2_u8 = (
+                                    _stake_color2.astype(np.uint8) * 255
+                                )
+                                (_sc2_n, _sc2_lbl, _sc2_stats, _) = (
+                                    _cv2_st2.connectedComponentsWithStats(
+                                        _sc2_u8, connectivity=8,
+                                    )
+                                )
+                                _ma = int(
+                                    args.canopy_stake_min_area_px
+                                )
+                                _mar = float(
+                                    args.canopy_stake_min_aspect_ratio
+                                )
+                                for _sc_id in range(1, _sc2_n):
+                                    _ww = int(
+                                        _sc2_stats[_sc_id, _cv2_st2.CC_STAT_WIDTH]
+                                    )
+                                    _hh = int(
+                                        _sc2_stats[_sc_id, _cv2_st2.CC_STAT_HEIGHT]
+                                    )
+                                    _aa = int(
+                                        _sc2_stats[_sc_id, _cv2_st2.CC_STAT_AREA]
+                                    )
+                                    if _aa < _ma:
+                                        continue
+                                    if _ww > 0 and (
+                                        _hh / float(_ww)
+                                    ) >= _mar:
+                                        _stake_pix2 |= (
+                                            _sc2_lbl == _sc_id
+                                        )
                             canopy_mask_img = (
                                 canopy_mask_img.astype(bool)
                                 & ~_stake_pix2

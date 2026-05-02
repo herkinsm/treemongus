@@ -98,6 +98,7 @@ echo "[batch] Using python: $PY"
   --canopy-sam-max-depth-row-corr 0.70 \
   --canopy-refine \
   --canopy-refine-upward-dilate-px 25 \
+  --canopy-refine-outward-dilate-px 8 \
   --canopy-refine-close-px 9 \
   --canopy-filter-by-tree-shape \
   --canopy-filter-min-aspect-ratio 0.5 \
@@ -110,6 +111,7 @@ echo "[batch] Using python: $PY"
   --canopy-exclude-painted-stakes \
   --canopy-stake-hue-min 30 --canopy-stake-hue-max 90 \
   --canopy-stake-sat-min 100 --canopy-stake-val-max 120 \
+  --canopy-stake-min-aspect-ratio 4.0 --canopy-stake-min-area-px 50 \
   --canopy-fill-small-holes --canopy-max-hole-area-px 1500 \
   --canopy-max-hole-aspect-ratio 3.0 \
   --canopy-max-bottom-row 420 \
