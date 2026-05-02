@@ -2320,6 +2320,8 @@ def flower_quality_keep(masks_np: np.ndarray,
                          peak_min_distance_px: int = 5,
                          peak_threshold_abs: int = 80,
                          peak_min_area_px: int = 60,
+                         peak_min_distance_px2: int = 0,
+                         peak_prominence_min: float = 5.0,
                          min_anther_holes_per_1000px: float = 0.0,
                          anther_petal_v_min: int = 100,
                          anther_hole_min_area_px: int = 2,
@@ -2384,22 +2386,82 @@ def flower_quality_keep(masks_np: np.ndarray,
     # discriminator. Each apple blossom is a bright petal with a
     # darker anther center, so a flower cluster has multiple V-
     # channel local maxima at small scale; a leaf is mostly
-    # uniform with at most a few specular highlights. We
-    # precompute the global peak map ONCE per frame (rather than
-    # per-mask) and just count peaks-inside-mask in the loop.
+    # uniform with at most a few specular highlights.
+    #
+    # Implementation has THREE refinements over a naive
+    # `V == max_in_window` check:
+    #   1. Prominence filter: V at the peak must be at least
+    #      peak_prominence_min above the local mean. Suppresses
+    #      uniform-bright plateaus (sky, smooth leaves) where
+    #      every pixel ties for the max.
+    #   2. Plateau collapse: each connected component of
+    #      candidate-peak pixels (a uniform-bright disc, e.g., a
+    #      single petal) becomes ONE peak (its anchor pixel),
+    #      not N peaks (one per pixel of the disc).
+    #   3. Multi-scale: an optional second scale (wider Gaussian
+    #      + wider max window) catches the cluster-centroid peak
+    #      of multi-blossom clusters whose individual blossoms
+    #      are smoothed away at the narrow scale. Each scale gets
+    #      its own plateau-collapse, then the two centroid masks
+    #      are OR'd. Real flowers register at one OR both scales;
+    #      leaves register at neither.
     peak_pixel_mask = None
     if min_peaks_per_1000px > 0 and rgb_arr is not None:
         try:
             import cv2
-            from scipy.ndimage import maximum_filter
+            from scipy.ndimage import (
+                maximum_filter, uniform_filter, label,
+            )
+
+            def _peaks_at_scale(V_blur_, mf_size_):
+                V_max_ = maximum_filter(
+                    V_blur_, size=mf_size_, mode="nearest",
+                )
+                V_mean_ = uniform_filter(
+                    V_blur_, size=mf_size_, mode="nearest",
+                )
+                cand = (
+                    (V_blur_ == V_max_)
+                    & (V_blur_ >= float(peak_threshold_abs))
+                    & ((V_blur_ - V_mean_)
+                       >= float(peak_prominence_min))
+                )
+                if not cand.any():
+                    return np.zeros_like(cand)
+                p_lbl, n_pl = label(cand)
+                if n_pl == 0:
+                    return np.zeros_like(cand)
+                # Collapse each plateau to its anchor (first
+                # row-major-order pixel) so a uniform-bright
+                # blossom contributes ONE peak, not N.
+                flat = p_lbl.ravel()
+                valid = flat > 0
+                if not valid.any():
+                    return np.zeros_like(cand)
+                vlbl = flat[valid]
+                vidx = np.where(valid)[0]
+                _, first_idx = np.unique(vlbl, return_index=True)
+                anchors = vidx[first_idx]
+                out = np.zeros(p_lbl.size, dtype=bool)
+                out[anchors] = True
+                return out.reshape(p_lbl.shape)
+
             hsv_p = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2HSV)
             V_p = hsv_p[..., 2].astype(np.float32)
+            # Scale 1 (narrow, blossom / anther-petal scale).
             V_blur = cv2.GaussianBlur(V_p, (3, 3), 0.8)
             mf_size = 2 * max(1, int(peak_min_distance_px)) + 1
-            V_max = maximum_filter(V_blur, size=mf_size, mode="nearest")
-            peak_pixel_mask = (
-                (V_blur == V_max) & (V_blur >= float(peak_threshold_abs))
-            )
+            peak_pixel_mask = _peaks_at_scale(V_blur, mf_size)
+            # Scale 2 (wider, cluster-centroid scale).
+            if peak_min_distance_px2 > 0:
+                sigma2 = max(1.5, peak_min_distance_px2 / 4.0)
+                k2 = max(5, 2 * (peak_min_distance_px2 // 3) + 1)
+                if k2 % 2 == 0:
+                    k2 += 1
+                V_blur2 = cv2.GaussianBlur(V_p, (k2, k2), sigma2)
+                mf_size2 = 2 * peak_min_distance_px2 + 1
+                peaks2 = _peaks_at_scale(V_blur2, mf_size2)
+                peak_pixel_mask = peak_pixel_mask | peaks2
         except Exception:
             peak_pixel_mask = None
 
@@ -4079,6 +4141,32 @@ def main():
                          "masks naturally have 0 or 1 peaks due to "
                          "size alone; the gate would be unfair. "
                          "Default 60 px.")
+    ap.add_argument("--flower-peak-min-distance-px2", type=int,
+                    default=0,
+                    help="Optional SECOND peak-detection scale, used "
+                         "in addition to --flower-peak-min-distance-px. "
+                         "Default 0 = single scale. Try 9 (= 19x19 "
+                         "window with sigma=2.25) to also catch the "
+                         "cluster-centroid peak of multi-blossom "
+                         "clusters whose individual blossoms are "
+                         "smoothed away at the narrow scale. Two "
+                         "scales help with viewpoint robustness: "
+                         "face-on blossoms peak strongly at the "
+                         "narrow scale, edge-on or backlit clusters "
+                         "often peak more clearly at the wider "
+                         "scale. The peak counts at each scale are "
+                         "OR'd, so a real flower can register at "
+                         "either scale; leaves register at neither.")
+    ap.add_argument("--flower-peak-prominence-min", type=float,
+                    default=5.0,
+                    help="Minimum prominence for a candidate peak: "
+                         "V at the peak must be at least this many "
+                         "units above the LOCAL MEAN of its window. "
+                         "Suppresses uniform-bright plateaus (sky, "
+                         "smooth leaves) where every pixel ties for "
+                         "the window max. Default 5.0; lower for "
+                         "dim conditions, higher to require sharper "
+                         "peaks.")
     # Anther-hole density: a POSITIVE flower discriminator. An
     # anther hole is a small dark pixel cluster fully enclosed by
     # bright petal pixels. Leaves and leaf-with-sky masks lack this
@@ -6162,6 +6250,12 @@ def main():
                             ),
                             peak_min_area_px=(
                                 args.flower_peak_min_area_px
+                            ),
+                            peak_min_distance_px2=(
+                                args.flower_peak_min_distance_px2
+                            ),
+                            peak_prominence_min=(
+                                args.flower_peak_prominence_min
                             ),
                             min_anther_holes_per_1000px=(
                                 args.flower_min_anther_holes_per_1000px
