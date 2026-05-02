@@ -3430,6 +3430,123 @@ def build_canopy_from_sam_trees(
     return canopy
 
 
+def refine_canopy_mask(
+    canopy_mask: np.ndarray,
+    depth_mm: np.ndarray | None,
+    rgb_arr: np.ndarray | None,
+    *,
+    upward_dilate_px: int = 20,
+    close_px: int = 9,
+    depth_min_mm: float = 600.0,
+    depth_max_mm: float = 3000.0,
+    exclude_sky: bool = True,
+) -> np.ndarray:
+    """Post-process the canopy mask:
+
+      1. UPWARD expansion into foreground depth -- catches tree
+         tops that SAM missed (sparse leaves with sky showing
+         through). Per column, the canopy mask is allowed to
+         extend up to upward_dilate_px rows ABOVE its current
+         topmost pixel, into pixels that are foreground depth
+         AND not sky. Downward expansion is NOT allowed (avoids
+         pulling in ground).
+
+      2. Sky exclusion -- pixels that are clearly sky (blue OR
+         bright + low saturation) get removed from the canopy
+         even if they were originally in it (SAM masks
+         sometimes include sky-coloured patches between
+         branches).
+
+      3. Morphological closing -- bridges small gaps between
+         nearby CCs (e.g., a tree split into two CCs because of
+         a thin gap of sky / branches in the middle). Uses a
+         small ELLIPSE kernel so it doesn't over-merge across
+         large distances.
+
+    Returns the refined canopy mask.
+    """
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return canopy_mask
+    if canopy_mask is None:
+        return canopy_mask
+    cm = canopy_mask.astype(bool).copy()
+    if not cm.any():
+        return cm
+    h, w = cm.shape
+
+    # Foreground-depth + non-sky pixel mask. Used both for the
+    # upward expansion (only add foreground-depth pixels) AND
+    # the sky exclusion (remove sky pixels from the canopy).
+    sky_pix = None
+    fg_clean: np.ndarray | None = None
+    if depth_mm is not None:
+        fg = (
+            (depth_mm.astype(np.float32) >= float(depth_min_mm))
+            & (depth_mm.astype(np.float32) <= float(depth_max_mm))
+        )
+        if (rgb_arr is not None and rgb_arr.shape[:2] == (h, w)
+                and exclude_sky):
+            try:
+                hsv = _cv2.cvtColor(
+                    rgb_arr.astype(np.uint8), _cv2.COLOR_RGB2HSV,
+                )
+                H_c = hsv[:, :, 0]
+                S_c = hsv[:, :, 1]
+                V_c = hsv[:, :, 2]
+                sky_blue = (H_c >= 85) & (H_c <= 145) & (S_c > 8)
+                sky_bright = (V_c > 185) & (S_c < 15)
+                sky_pix = sky_blue | sky_bright
+                fg_clean = fg & ~sky_pix
+            except Exception:
+                fg_clean = fg
+        else:
+            fg_clean = fg
+
+    # 1. UPWARD EXPANSION. For each column, find the topmost row
+    # that has a True in cm. Then allow pixels in that column to
+    # be added down to topmost-1, topmost-2, ..., topmost-N (i.e.,
+    # ABOVE the existing canopy by up to upward_dilate_px rows),
+    # provided those pixels are foreground depth + not sky.
+    if upward_dilate_px > 0 and fg_clean is not None:
+        any_in_col = cm.any(axis=0)
+        # First True row per column. argmax returns 0 when no True.
+        first_true = np.argmax(cm, axis=0).astype(np.int32)
+        # If column has no True, set to h so zone is empty.
+        first_true = np.where(any_in_col, first_true, h)
+        # Build the upward-expansion zone: rows < first_true[col]
+        # AND rows >= max(first_true[col] - upward_dilate_px, 0).
+        row_idx = np.arange(h, dtype=np.int32)[:, None]
+        upper_bound = first_true[None, :]
+        lower_bound = np.maximum(
+            first_true[None, :] - int(upward_dilate_px), 0,
+        )
+        zone = (row_idx >= lower_bound) & (row_idx < upper_bound)
+        cm = cm | (zone & fg_clean)
+
+    # 2. SKY EXCLUSION. Drop any pixels that look unambiguously
+    # like sky (blue or bright + desaturated).
+    if sky_pix is not None:
+        cm = cm & ~sky_pix
+
+    # 3. CLOSING. Bridge small gaps between nearby CCs.
+    if close_px > 0:
+        kern = _cv2.getStructuringElement(
+            _cv2.MORPH_ELLIPSE,
+            (2 * int(close_px) + 1, 2 * int(close_px) + 1),
+        )
+        cm_u8 = cm.astype(np.uint8) * 255
+        cm_u8 = _cv2.morphologyEx(cm_u8, _cv2.MORPH_CLOSE, kern)
+        cm = cm_u8 > 0
+        # Re-apply sky exclusion after closing (closing can fill
+        # small sky holes between branches).
+        if sky_pix is not None:
+            cm = cm & ~sky_pix
+
+    return cm
+
+
 def filter_canopy_by_tree_shape(
     canopy_mask: np.ndarray,
     depth_mm: np.ndarray,
@@ -3996,6 +4113,32 @@ def main():
                          "FULL fallback when SAM is empty. Prevents "
                          "the heuristic from adding grass/ground "
                          "noise when SAM has a clean tree mask.")
+    # Post-process canopy refinement: upward expansion + sky
+    # exclusion + morphological closing. Runs on the FINAL
+    # canopy mask after SAM and heuristic are unioned.
+    ap.add_argument("--canopy-refine", action="store_true",
+                    help="Apply post-processing refinement to the "
+                         "final canopy mask: (1) expand upward into "
+                         "foreground-depth pixels per column to "
+                         "catch tree tops SAM missed, (2) remove "
+                         "pixels that are sky (HSV check), (3) "
+                         "morphological closing to bridge nearby "
+                         "tree CC fragments. Recommended.")
+    ap.add_argument("--canopy-refine-upward-dilate-px", type=int,
+                    default=20,
+                    help="Maximum rows ABOVE the canopy mask's "
+                         "current topmost pixel that the refinement "
+                         "can extend into (filling in tree tops "
+                         "where SAM cut off). Foreground-depth + "
+                         "non-sky pixels in this band are added. "
+                         "Downward expansion is NOT allowed (avoids "
+                         "pulling in ground). Default 20.")
+    ap.add_argument("--canopy-refine-close-px", type=int, default=9,
+                    help="Morphological closing kernel radius for "
+                         "bridging nearby canopy CC fragments. "
+                         "Default 9 (= 19x19 ellipse) -- bridges "
+                         "gaps up to ~18 px without over-merging. "
+                         "Set 0 to disable closing.")
     ap.add_argument("--canopy-sam-max-top-row", type=int, default=280,
                     help="A SAM tree mask must extend UPWARD into the "
                          "upper canopy band (bbox top row <= this). "
@@ -5576,6 +5719,33 @@ def main():
                         canopy_mask_img = (
                             canopy_mask_img.astype(bool)
                             | _sct_canopy.astype(bool)
+                        )
+
+                # Post-process canopy refinement (upward expansion
+                # for tree tops + sky exclusion + morphological
+                # closing for adjacent CC merging).
+                if (args.canopy_refine
+                        and canopy_mask_img is not None
+                        and canopy_mask_img.any()):
+                    try:
+                        _rgb_ref = np.asarray(img)
+                        canopy_mask_img = refine_canopy_mask(
+                            canopy_mask_img,
+                            depth_mm,
+                            _rgb_ref,
+                            upward_dilate_px=(
+                                args.canopy_refine_upward_dilate_px
+                            ),
+                            close_px=args.canopy_refine_close_px,
+                            depth_min_mm=args.depth_min_mm,
+                            depth_max_mm=args.depth_max_mm,
+                            exclude_sky=True,
+                        )
+                    except Exception as _ref_err:
+                        print(
+                            f"[warn] canopy refinement failed "
+                            f"({_ref_err!r}); using unrefined mask",
+                            file=sys.stderr,
                         )
 
                 # Per-frame canopy tracking. Either:
