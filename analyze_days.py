@@ -3863,6 +3863,111 @@ def extract_canopy_components(
     return out
 
 
+class TrunkMemory:
+    """Per-session memory of recently-seen trunk bboxes.
+
+    SAM 3's trunk detection misses a frame here and there
+    (occlusion by leaves, motion blur, low confidence). When
+    that happens, the trunk-Voronoi partition loses the tree's
+    anchor for that frame and the canopy fragments. This
+    helper carries trunks forward by IoU-matching successive
+    frames' detections; if a trunk wasn't seen in the current
+    frame but was seen within the last max_age frames, it's
+    re-emitted as a "ghost" trunk so the partition stays
+    consistent.
+
+    The bookkeeping mirrors CanopyTracker: each stored trunk
+    has a bbox, age (frames since last seen), score, and
+    optional segmentation mask. Greedy IoU matching of current
+    detections to stored entries; unmatched current detections
+    become new entries; entries older than max_age get evicted.
+    """
+
+    def __init__(self, max_age: int = 5,
+                 iou_match_threshold: float = 0.3):
+        self.max_age = max_age
+        self.iou_match_threshold = iou_match_threshold
+        self.trunks: list[dict] = []
+
+    @staticmethod
+    def _iou(a, b) -> float:
+        x1 = max(float(a[0]), float(b[0]))
+        y1 = max(float(a[1]), float(b[1]))
+        x2 = min(float(a[2]), float(b[2]))
+        y2 = min(float(a[3]), float(b[3]))
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        inter = (x2 - x1) * (y2 - y1)
+        area_a = (float(a[2]) - float(a[0])) * (float(a[3]) - float(a[1]))
+        area_b = (float(b[2]) - float(b[0])) * (float(b[3]) - float(b[1]))
+        union = area_a + area_b - inter
+        return float(inter) / float(union) if union > 0 else 0.0
+
+    def step(self, cur_boxes, cur_scores, cur_masks=None):
+        """Update memory with the current frame's trunks.
+        Returns the FULL active trunk set: current detections +
+        ghost trunks for entries seen recently but not this
+        frame. Each returned tuple is (bbox, score, mask).
+        """
+        # Age all stored trunks (will be reset to 0 for those
+        # matched this frame).
+        for t in self.trunks:
+            t["age"] = int(t.get("age", 0)) + 1
+
+        n_cur = len(cur_boxes) if cur_boxes is not None else 0
+        used = [False] * n_cur
+        # Greedy IoU match: for each stored entry, find the
+        # best-IoU unused current detection.
+        if n_cur > 0:
+            for t in self.trunks:
+                best_iou = self.iou_match_threshold
+                best_idx = -1
+                for i in range(n_cur):
+                    if used[i]:
+                        continue
+                    iou = self._iou(t["bbox"], cur_boxes[i])
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_idx = i
+                if best_idx >= 0:
+                    used[best_idx] = True
+                    t["bbox"] = [
+                        float(x) for x in cur_boxes[best_idx]
+                    ]
+                    t["age"] = 0
+                    if cur_scores is not None and best_idx < len(cur_scores):
+                        t["score"] = float(cur_scores[best_idx])
+                    if cur_masks is not None and best_idx < len(cur_masks):
+                        t["mask"] = cur_masks[best_idx]
+            # New entries for unmatched current detections.
+            for i in range(n_cur):
+                if used[i]:
+                    continue
+                self.trunks.append({
+                    "bbox": [float(x) for x in cur_boxes[i]],
+                    "score": (
+                        float(cur_scores[i])
+                        if cur_scores is not None and i < len(cur_scores)
+                        else 1.0
+                    ),
+                    "mask": (
+                        cur_masks[i]
+                        if cur_masks is not None and i < len(cur_masks)
+                        else None
+                    ),
+                    "age": 0,
+                })
+        # Evict expired entries.
+        self.trunks = [
+            t for t in self.trunks if t["age"] <= self.max_age
+        ]
+        # Return the full active set (current + carry-forward).
+        return [
+            (t["bbox"], t.get("score", 1.0), t.get("mask"))
+            for t in self.trunks
+        ]
+
+
 class CanopyTracker:
     """IoU tracker for per-frame canopy connected components.
     Assigns a tree_id to each canopy CC and follows it across
@@ -4484,6 +4589,31 @@ def main():
                          "(bg band) and stays empty. Sky-gaps "
                          "between branches are roughly square "
                          "(aspect ~0.5-2). Default 3.0.")
+    ap.add_argument("--canopy-max-bottom-row", type=int, default=0,
+                    help="Hard crop the canopy mask at this row -- "
+                         "any canopy pixels below this row get "
+                         "removed. Catches the case where the SAM "
+                         "or heuristic mask extends down into the "
+                         "ground/grass at the bottom of the frame. "
+                         "Default 0 = disabled. Try 420 (= last "
+                         "12.5%% of a 480-row frame).")
+    ap.add_argument("--canopy-trunk-memory-frames", type=int,
+                    default=0,
+                    help="Carry trunks forward across frames. When "
+                         "SAM detects a trunk in frame N but not in "
+                         "frame N+1 (occlusion, motion blur, low "
+                         "confidence), the partition would lose the "
+                         "tree's anchor. With this set to N > 0, "
+                         "trunks seen within the last N frames are "
+                         "re-emitted as 'ghost' trunks for the "
+                         "current frame's partition. Try 5. "
+                         "Default 0 = disabled.")
+    ap.add_argument("--canopy-trunk-memory-iou", type=float,
+                    default=0.3,
+                    help="IoU threshold for matching the current "
+                         "frame's trunk detections to memory entries. "
+                         "Higher = stricter match (less drift across "
+                         "frames). Default 0.3.")
     ap.add_argument("--canopy-crop-below-trunk", action="store_true",
                     help="For each canopy CC that overlaps a SAM "
                          "trunk bbox, crop the CC at row "
@@ -5531,6 +5661,7 @@ def main():
     # Per-session canopy tracker. Reinstantiated per session so
     # tree IDs are scoped to one orchard-pass.
     current_canopy_tracker: CanopyTracker | None = None
+    current_trunk_memory: TrunkMemory | None = None
     # Per-(session, tree_id) summary for the new trees CSV.
     tree_summaries: list[dict] = []
     # Per-frame, per-tree row for trees_per_frame CSV.
@@ -5591,6 +5722,16 @@ def main():
                         iou_threshold=args.canopy_track_iou,
                         max_age=args.canopy_track_max_age,
                     ) if args.track_canopy else None
+                )
+                current_trunk_memory = (
+                    TrunkMemory(
+                        max_age=args.canopy_trunk_memory_frames,
+                        iou_match_threshold=(
+                            args.canopy_trunk_memory_iou
+                        ),
+                    )
+                    if args.canopy_trunk_memory_frames > 0
+                    else None
                 )
                 current_session_key = session_key
 
@@ -6089,21 +6230,30 @@ def main():
                         except Exception:
                             pass
 
-                    # RE-APPLY bg-depth exclusion (removes bg-grass-
-                    # through-leaves that hole-fill brought back).
-                    if (canopy_mask_img is not None
-                            and depth_mm is not None
-                            and canopy_mask_img.any()):
-                        try:
-                            _bg_d2 = (
-                                depth_mm.astype(np.float32)
-                                > float(args.depth_max_mm)
-                            )
-                            canopy_mask_img = (
-                                canopy_mask_img.astype(bool) & ~_bg_d2
-                            )
-                        except Exception:
-                            pass
+                    # NOTE: bg-depth re-exclusion intentionally
+                    # SKIPPED here. The D455 returns invalid or
+                    # far-bg depth on thin foliage (laser passes
+                    # through the leaf to the background), so a
+                    # real leaf pixel may have depth > 3000 mm in
+                    # the depth map. Re-excluding by bg-depth
+                    # would remove those legitimate leaf pixels
+                    # that the hole-fill correctly brought back.
+                    # Stake re-exclusion above is fine because
+                    # stakes have a unique HSV signature (sat dark
+                    # green) that doesn't conflict with leaves.
+
+                # HARD BOTTOM-ROW CROP. Any canopy pixels below
+                # this row are clipped. Catches the case where
+                # the SAM or heuristic mask extends down into the
+                # ground at the bottom of the frame even though
+                # there's no trunk detection for that mask (so
+                # crop-below-trunk didn't fire).
+                if (args.canopy_max_bottom_row > 0
+                        and canopy_mask_img is not None):
+                    _crow = int(args.canopy_max_bottom_row)
+                    if _crow < canopy_mask_img.shape[0]:
+                        canopy_mask_img = canopy_mask_img.astype(bool).copy()
+                        canopy_mask_img[_crow + 1:, :] = False
 
                 # FINAL tree-shape filter: catches CCs that became
                 # wide+short AFTER closing bridged smaller CCs. The
@@ -6274,6 +6424,40 @@ def main():
                                         min_valid_pixels=args.canopy_trunk_depth_min_pixels,
                                     )
                                 )
+                        # Carry-forward trunks across frames. If
+                        # SAM missed a trunk this frame but saw it
+                        # in the last memory_frames frames, the
+                        # ghost trunk gets re-emitted so the
+                        # partition stays consistent.
+                        if (current_trunk_memory is not None
+                                and args.canopy_trunk_memory_frames > 0):
+                            _active = current_trunk_memory.step(
+                                _kept_trunk_boxes,
+                                _kept_trunk_scores,
+                                _kept_trunk_masks
+                                if _kept_trunk_masks else None,
+                            )
+                            # Replace current trunks with the full
+                            # active set (current + ghost).
+                            _kept_trunk_boxes = [
+                                list(b) for b, _s, _m in _active
+                            ]
+                            _kept_trunk_scores = [
+                                float(s) for _b, s, _m in _active
+                            ]
+                            _kept_trunk_masks = [
+                                m for _b, _s, m in _active
+                                if m is not None
+                            ]
+                            # Drop masks if count mismatches boxes
+                            # (some ghost entries might lack masks
+                            # because the original detection didn't
+                            # include them).
+                            if (_kept_trunk_masks
+                                    and len(_kept_trunk_masks)
+                                        != len(_kept_trunk_boxes)):
+                                _kept_trunk_masks = []
+
                         if _kept_trunk_boxes:
                             # Trunk-based canopy refinements. Run
                             # BEFORE partition so the partition

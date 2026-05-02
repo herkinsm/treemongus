@@ -110,8 +110,10 @@ echo "[batch] Using python: $PY"
   --canopy-exclude-painted-stakes \
   --canopy-stake-hue-min 30 --canopy-stake-hue-max 90 \
   --canopy-stake-sat-min 100 --canopy-stake-val-max 120 \
-  --canopy-fill-small-holes --canopy-max-hole-area-px 20000 \
-  --canopy-max-hole-aspect-ratio 10.0 \
+  --canopy-fill-small-holes --canopy-max-hole-area-px 1500 \
+  --canopy-max-hole-aspect-ratio 3.0 \
+  --canopy-max-bottom-row 420 \
+  --canopy-trunk-memory-frames 5 --canopy-trunk-memory-iou 0.3 \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \
   --canopy-edge-tree-min-aspect-ratio 0.8 \
@@ -122,7 +124,7 @@ echo "[batch] Using python: $PY"
   --flower-require-tree-in-frame --flower-foreground-canopy-max-depth-mm 2500 \
   --flower-max-behind-foreground-mm 1000 \
   --track-canopy --canopy-track-iou 0.3 --canopy-track-max-age 5 --canopy-track-min-cc-area 500 \
-  --canopy-track-method trunk --canopy-trunk-min-score 0.20 --canopy-trunk-prompt "apple tree trunk" \
+  --canopy-track-method trunk --canopy-trunk-min-score 0.10 --canopy-trunk-prompt "apple tree trunk" \
   --canopy-trunk-reject-green-stakes --canopy-trunk-max-green-pct 0.35 \
   --canopy-trunk-green-threshold 15 --canopy-trunk-min-brown-pct 0.20 \
   --canopy-trunk-max-depth-mm 3000 --canopy-trunk-depth-min-pixels 5 \
