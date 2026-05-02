@@ -84,6 +84,8 @@ echo "[batch] Using python: $PY"
   --use-build-tree-mask --tree-mask-min-overlap 0.10 --tree-mask-dilate-px 8 \
   --canopy-sam-prompt "apple tree" --canopy-sam-min-score 0.15 \
   --canopy-sam-min-pixels 500 --canopy-sam-min-lower-frac 0.20 \
+  --canopy-sam-min-valid-depth-frac 0.30 \
+  --canopy-sam-supplement-with-edge-aug \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 100 --canopy-edge-tree-max-top-row 250 \
   --canopy-edge-tree-min-aspect-ratio 1.2 \

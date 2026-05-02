@@ -3134,6 +3134,7 @@ def build_canopy_from_sam_trees(
     min_pixels: int = 500,
     position_min_lower_frac: float = 0.20,
     require_depth_check: bool = True,
+    min_valid_depth_frac: float = 0.30,
 ) -> np.ndarray:
     """Build a canopy mask from SAM 3 tree segmentations.
 
@@ -3182,14 +3183,33 @@ def build_canopy_from_sam_trees(
         ys = np.where(ys_any)[0]
         if ys.size == 0 or int(ys.max()) < pos_threshold_y:
             continue
-        # Depth check: median depth must be in foreground band.
+        # Depth check: median depth must be in foreground band,
+        # AND a minimum fraction of the mask must have valid
+        # depth at all. The fraction check is critical: a far-
+        # background SAM detection gets *zero* valid depth
+        # returns from the D455 (sensor max range exceeded), so
+        # without this check the far-background mask would
+        # silently pass under "not enough info, benefit of
+        # doubt". Forcing min_valid_depth_frac means: if we
+        # cannot verify the mask is foreground, REJECT.
         if (require_depth_check and depth_mm is not None
                 and valid_depth is not None):
+            mask_area = float(m.sum())
             md = depth_mm[m & valid_depth]
-            if md.size >= 50:
-                med = float(np.median(md))
-                if med < depth_min_mm or med > depth_max_mm:
-                    continue
+            valid_frac = (
+                float(md.size) / mask_area if mask_area > 0 else 0.0
+            )
+            if valid_frac < min_valid_depth_frac:
+                # Not enough valid-depth pixels to verify
+                # foreground -- almost certainly a far-
+                # background or sky-mixed mask.
+                continue
+            if md.size < 50:
+                # Edge case: tiny mask + low depth coverage.
+                continue
+            med = float(np.median(md))
+            if med < depth_min_mm or med > depth_max_mm:
+                continue
         canopy |= m
     return canopy
 
@@ -3743,6 +3763,33 @@ def main():
                     action="store_false",
                     help="Disable the depth check on SAM tree masks. "
                          "Useful when depth is unreliable.")
+    ap.add_argument("--canopy-sam-min-valid-depth-frac", type=float,
+                    default=0.30,
+                    help="Require at least this fraction of a SAM "
+                         "tree mask's pixels to have VALID DEPTH "
+                         "(non-zero, < 60000 mm). Default 0.30. "
+                         "Critical for rejecting far-background "
+                         "detections: D455 sensor max range gives "
+                         "zero valid returns past ~5 m, so a far-"
+                         "background SAM mask has almost no valid "
+                         "depth. Without this floor, the median-"
+                         "depth check silently passes ('not enough "
+                         "info, benefit of doubt') and the bogus "
+                         "far-background detection becomes canopy.")
+    ap.add_argument("--canopy-sam-supplement-with-edge-aug",
+                    action="store_true", default=True,
+                    help="When SAM canopy is in use, ALSO run the "
+                         "edge-tree augmentation on top (union of "
+                         "SAM masks + edge augmentation). Recovers "
+                         "trees SAM partially or completely missed: "
+                         "tops cut off, adjacent trees not detected, "
+                         "half-trees at frame edges. Default ON.")
+    ap.add_argument("--no-canopy-sam-supplement-with-edge-aug",
+                    dest="canopy_sam_supplement_with_edge_aug",
+                    action="store_false",
+                    help="Use SAM canopy alone, without supplementing "
+                         "with edge augmentation. Tighter mask but "
+                         "may miss trees SAM didn't segment fully.")
 
     # Post-processing tree-shape filter. Runs on the FINAL canopy
     # mask (after build_tree_mask + edge augmentation + dilation)
@@ -5022,10 +5069,63 @@ def main():
                         require_depth_check=(
                             args.canopy_sam_depth_check
                         ),
+                        min_valid_depth_frac=(
+                            args.canopy_sam_min_valid_depth_frac
+                        ),
                     )
                     if _sct_canopy.any():
                         canopy_mask_img = _sct_canopy
                         _sam_canopy_used = True
+
+                # SAM canopy SUPPLEMENT pass: run edge-tree
+                # augmentation on top of SAM canopy when SAM was
+                # used, so trees SAM only partially segmented (tops
+                # cut off, adjacent half-trees missed) get filled
+                # in by the depth-based shape detector. Edge
+                # augmentation has its own shape filters tuned to
+                # accept tree-shaped CCs at the L/R edges, so the
+                # union doesn't readmit grass.
+                if (_sam_canopy_used
+                        and args.canopy_sam_supplement_with_edge_aug
+                        and args.canopy_include_edge_trees
+                        and depth_mm is not None
+                        and canopy_mask_img is not None):
+                    try:
+                        _rgb_supp = np.asarray(img)
+                        canopy_mask_img = augment_canopy_with_edge_trees(
+                            canopy_mask_img,
+                            depth_mm,
+                            _rgb_supp,
+                            depth_min_mm=args.depth_min_mm,
+                            depth_max_mm=(
+                                args.canopy_edge_tree_max_depth_mm
+                            ),
+                            min_area_px=(
+                                args.canopy_edge_tree_min_area_px
+                            ),
+                            min_height_px=(
+                                args.canopy_edge_tree_min_height_px
+                            ),
+                            max_top_row=(
+                                args.canopy_edge_tree_max_top_row
+                            ),
+                            min_aspect_ratio=(
+                                args.canopy_edge_tree_min_aspect_ratio
+                            ),
+                            max_depth_std_mm=(
+                                args.canopy_edge_tree_max_depth_std_mm
+                            ),
+                            min_green_frac=(
+                                args.canopy_edge_tree_min_green_frac
+                            ),
+                        )
+                    except Exception as _supp_err:
+                        print(
+                            f"[warn] SAM-canopy edge supplement "
+                            f"failed ({_supp_err!r}); using SAM "
+                            f"canopy as-is",
+                            file=sys.stderr,
+                        )
 
                 if (args.tree_mask and depth_mm is not None
                         and not _sam_canopy_used):
