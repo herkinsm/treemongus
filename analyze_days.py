@@ -2320,6 +2320,11 @@ def flower_quality_keep(masks_np: np.ndarray,
                          peak_min_distance_px: int = 5,
                          peak_threshold_abs: int = 80,
                          peak_min_area_px: int = 60,
+                         min_anther_holes_per_1000px: float = 0.0,
+                         anther_petal_v_min: int = 100,
+                         anther_hole_min_area_px: int = 2,
+                         anther_hole_max_area_px: int = 60,
+                         anther_min_area_px: int = 100,
                          ) -> tuple[np.ndarray, dict, list[int]]:
     """Boolean keep-array + per-rejection diagnostics + per-mask area, mirroring
     the gates in sprayer_pipeline/flower_detector.py:
@@ -2338,7 +2343,8 @@ def flower_quality_keep(masks_np: np.ndarray,
             "edge_margin": 0, "circularity": 0, "solidity": 0,
             "yellow_color": 0, "non_blossom_color": 0,
             "max_bbox_area": 0, "low_density": 0,
-            "leaf_green": 0, "low_peak_density": 0}
+            "leaf_green": 0, "low_peak_density": 0,
+            "low_anther_density": 0}
     areas: list[int] = []
 
     # Pre-compute the "could be apple blossom" pixel mask once per frame
@@ -2396,6 +2402,52 @@ def flower_quality_keep(masks_np: np.ndarray,
             )
         except Exception:
             peak_pixel_mask = None
+
+    # Anther-hole pixel map for the flower-vs-leaf POSITIVE
+    # discriminator. Each apple blossom has a yellow / dark
+    # anther cluster in the center: SMALL DARK pixels surrounded
+    # by BRIGHT petal pixels. A leaf-with-sky-behind has dark
+    # leaf pixels, but they are NOT surrounded by bright pixels
+    # (they are adjacent to bright sky on one side). So a global
+    # flood-fill of the bright-pixel mask from a frame corner
+    # marks every reachable dark pixel as 'exterior'. The dark
+    # pixels that remain unreached are 'interior dark' --
+    # surrounded by bright on all sides -- which is exactly the
+    # anther-hole signature. We label them once per frame and
+    # count per mask in the loop.
+    anther_label_img = None
+    anther_cc_areas: np.ndarray | None = None
+    if min_anther_holes_per_1000px > 0 and rgb_arr is not None:
+        try:
+            import cv2
+            hsv_a = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2HSV)
+            V_a = hsv_a[..., 2]
+            bright_u8 = (
+                (V_a >= int(anther_petal_v_min)).astype(np.uint8) * 255
+            )
+            if bright_u8.any():
+                h_a, w_a = bright_u8.shape
+                padded = np.zeros((h_a + 2, w_a + 2), dtype=np.uint8)
+                padded[1:-1, 1:-1] = bright_u8
+                flood_aux = np.zeros(
+                    (h_a + 4, w_a + 4), dtype=np.uint8,
+                )
+                cv2.floodFill(padded, flood_aux, (0, 0), 255)
+                interior = cv2.bitwise_not(padded)[1:-1, 1:-1]
+                if interior.any():
+                    n_cc_a, labels_a, stats_a, _ = (
+                        cv2.connectedComponentsWithStats(
+                            interior, connectivity=8,
+                        )
+                    )
+                    if n_cc_a > 1:
+                        anther_label_img = labels_a
+                        anther_cc_areas = stats_a[
+                            :, cv2.CC_STAT_AREA,
+                        ].astype(np.int64)
+        except Exception:
+            anther_label_img = None
+            anther_cc_areas = None
 
     for i, m in enumerate(masks_np):
         circ, sol, area, bx, by, bw, bh, cy = _mask_shape_stats(m)
@@ -2517,6 +2569,43 @@ def flower_quality_keep(masks_np: np.ndarray,
                     keep[i] = False
                     diag["low_peak_density"] += 1
                     continue
+        # Anther-hole density gate (POSITIVE flower signal).
+        # An anther hole is a small dark spot surrounded entirely
+        # by bright petal pixels. Leaves and leaf-with-sky masks
+        # don't have this pattern: their dark pixels are adjacent
+        # to other dark pixels or to bright sky, never fully
+        # enclosed by bright petals. We count anther-hole CCs
+        # whose pixels fall inside the mask, filtering by size
+        # so noise (1-pixel specks) and large branch gaps are
+        # excluded. Skipped below anther_min_area_px.
+        if (min_anther_holes_per_1000px > 0
+                and anther_label_img is not None
+                and anther_cc_areas is not None):
+            mb = np.asarray(m).astype(bool)
+            if mb.ndim == 3:
+                mb = mb.any(axis=0)
+            mb_area = int(mb.sum())
+            if mb_area >= anther_min_area_px:
+                # Find which anther-hole CCs intersect this mask.
+                # Take the labels image at mask pixels and unique
+                # them. Each unique non-zero label is an anther
+                # CC at least partially inside the mask. Filter
+                # by precomputed CC area for size validity.
+                lbls_in = anther_label_img[mb]
+                if lbls_in.size > 0:
+                    uniq = np.unique(lbls_in)
+                    uniq = uniq[uniq > 0]
+                    n_anther = 0
+                    for cc_id in uniq:
+                        a = int(anther_cc_areas[int(cc_id)])
+                        if (anther_hole_min_area_px <= a
+                                <= anther_hole_max_area_px):
+                            n_anther += 1
+                    density = (n_anther * 1000.0) / float(mb_area)
+                    if density < min_anther_holes_per_1000px:
+                        keep[i] = False
+                        diag["low_anther_density"] += 1
+                        continue
     return keep, diag, areas
 
 
@@ -3990,6 +4079,50 @@ def main():
                          "masks naturally have 0 or 1 peaks due to "
                          "size alone; the gate would be unfair. "
                          "Default 60 px.")
+    # Anther-hole density: a POSITIVE flower discriminator. An
+    # anther hole is a small dark pixel cluster fully enclosed by
+    # bright petal pixels. Leaves and leaf-with-sky masks lack this
+    # pattern -- their dark pixels are adjacent to dark or to bright
+    # sky, never enclosed. Implementation: global flood-fill the
+    # bright (V >= petal_v_min) mask from a frame corner; pixels
+    # that remain unreached and dark are anther candidates. Their
+    # CCs (filtered by size) are the holes we count per mask.
+    ap.add_argument("--flower-min-anther-holes-per-1000px", type=float,
+                    default=0.0,
+                    help="Reject any flower mask with fewer than this "
+                         "many anther-hole CCs per 1000 px of mask "
+                         "area. Apple blossoms have small dark anther "
+                         "dots fully enclosed by bright petals; leaves "
+                         "and sky-with-leaf don't. Default 0.0 = "
+                         "disabled. Try 2.0 (= ~2 anthers per typical "
+                         "1000 px cluster). Skipped on small masks "
+                         "below --flower-anther-min-area-px.")
+    ap.add_argument("--flower-anther-petal-v-min", type=int,
+                    default=100,
+                    help="Pixels with V (HSV brightness) at or above "
+                         "this threshold are 'petal-bright' for the "
+                         "anther-hole detector. Default 100 admits "
+                         "dim petals while rejecting most foliage.")
+    ap.add_argument("--flower-anther-hole-min-area-px", type=int,
+                    default=2,
+                    help="Minimum size (in px) for an interior dark "
+                         "CC to count as an anther hole. Filters out "
+                         "single-pixel speckle. Default 2.")
+    ap.add_argument("--flower-anther-hole-max-area-px", type=int,
+                    default=60,
+                    help="Maximum size (in px) for an interior dark "
+                         "CC to count as an anther hole. Filters out "
+                         "branch gaps and large dark structures that "
+                         "happen to be fully petal-enclosed. Default "
+                         "60.")
+    ap.add_argument("--flower-anther-min-area-px", type=int,
+                    default=100,
+                    help="Skip the --flower-min-anther-holes-per-1000px "
+                         "gate for masks smaller than this (in px). "
+                         "Anther dots need a few hundred bright petal "
+                         "pixels around them to be detected at all; "
+                         "small masks shouldn't be judged. Default 100 "
+                         "px.")
     # Multi-prompt union for flowers — run multiple flower-related prompts
     # and NMS-merge their detections under a single canonical 'flower' label.
     # Trades cost for recall: each prompt catches blossoms the others miss.
@@ -6029,6 +6162,21 @@ def main():
                             ),
                             peak_min_area_px=(
                                 args.flower_peak_min_area_px
+                            ),
+                            min_anther_holes_per_1000px=(
+                                args.flower_min_anther_holes_per_1000px
+                            ),
+                            anther_petal_v_min=(
+                                args.flower_anther_petal_v_min
+                            ),
+                            anther_hole_min_area_px=(
+                                args.flower_anther_hole_min_area_px
+                            ),
+                            anther_hole_max_area_px=(
+                                args.flower_anther_hole_max_area_px
+                            ),
+                            anther_min_area_px=(
+                                args.flower_anther_min_area_px
                             ),
                         )
                         # Roll up rejections per (session, prompt).

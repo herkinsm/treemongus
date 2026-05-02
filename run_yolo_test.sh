@@ -73,6 +73,10 @@ echo "[batch] Using python: $PY"
   --flower-min-peaks-per-1000px 3.0 \
   --flower-peak-min-distance-px 5 --flower-peak-threshold-abs 80 \
   --flower-peak-min-area-px 60 \
+  --flower-min-anther-holes-per-1000px 1.5 \
+  --flower-anther-petal-v-min 100 \
+  --flower-anther-hole-min-area-px 2 --flower-anther-hole-max-area-px 60 \
+  --flower-anther-min-area-px 100 \
   --depth-min-mm 600 --depth-max-mm 3000 --depth-near-frac 0.40 \
   --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
