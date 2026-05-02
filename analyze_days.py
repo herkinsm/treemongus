@@ -4364,6 +4364,38 @@ def main():
                          "bridged through the trunk pixels into one "
                          "CC. The trunk mask itself is narrow so it "
                          "doesn't add ground.")
+    ap.add_argument("--canopy-trunk-vertical-extension-px", type=int,
+                    default=100,
+                    help="When --canopy-add-trunk-masks is on, also "
+                         "draw a thin vertical line from each trunk's "
+                         "TOP going UP by this many pixels (5 px "
+                         "wide centered on the trunk's column "
+                         "centroid). Bridges upper canopy regions "
+                         "that sit ABOVE the visible trunk to the "
+                         "trunk-bearing main canopy. The trunk's "
+                         "visible top isn't always its actual top -- "
+                         "leaves often occlude the upper trunk "
+                         "section. Default 100. Set 0 to disable.")
+    ap.add_argument("--canopy-exclude-painted-stakes", action="store_true",
+                    help="Remove painted-green-stake pixels from the "
+                         "canopy mask. Stakes are saturated green at "
+                         "low brightness (HSV H in green range, S "
+                         "high, V low) and are visually distinct from "
+                         "leaf green (higher V). Tunable via the "
+                         "--canopy-stake-* flags below.")
+    ap.add_argument("--canopy-stake-hue-min", type=int, default=30,
+                    help="Stake hue lower bound (default 30, in "
+                         "OpenCV 0-179).")
+    ap.add_argument("--canopy-stake-hue-max", type=int, default=90,
+                    help="Stake hue upper bound (default 90).")
+    ap.add_argument("--canopy-stake-sat-min", type=int, default=100,
+                    help="Stake minimum saturation (default 100). "
+                         "Real stakes are saturated; leaves under "
+                         "overcast lighting are less saturated.")
+    ap.add_argument("--canopy-stake-val-max", type=int, default=120,
+                    help="Stake maximum brightness V (default 120). "
+                         "Stakes are dark (painted) -- leaves are "
+                         "typically brighter.")
     ap.add_argument("--canopy-crop-below-trunk", action="store_true",
                     help="For each canopy CC that overlaps a SAM "
                          "trunk bbox, crop the CC at row "
@@ -5872,6 +5904,42 @@ def main():
                             file=sys.stderr,
                         )
 
+                # PAINTED-STAKE EXCLUSION. Remove pixels that look
+                # like a painted-green metal/wood stake (saturated
+                # green at low brightness) from the canopy mask.
+                # Stakes are visually distinct from leaf green
+                # (which has higher V and lower S in the same hue
+                # band). User can tune the HSV bounds via the
+                # --canopy-stake-* flags.
+                if (args.canopy_exclude_painted_stakes
+                        and canopy_mask_img is not None
+                        and canopy_mask_img.any()):
+                    try:
+                        import cv2 as _cv2_st
+                        _rgb_st = np.asarray(img)
+                        _hsv_st = _cv2_st.cvtColor(
+                            _rgb_st.astype(np.uint8),
+                            _cv2_st.COLOR_RGB2HSV,
+                        )
+                        _Hs = _hsv_st[:, :, 0]
+                        _Ss = _hsv_st[:, :, 1]
+                        _Vs = _hsv_st[:, :, 2]
+                        _stake_pix = (
+                            (_Hs >= int(args.canopy_stake_hue_min))
+                            & (_Hs <= int(args.canopy_stake_hue_max))
+                            & (_Ss >= int(args.canopy_stake_sat_min))
+                            & (_Vs <= int(args.canopy_stake_val_max))
+                        )
+                        canopy_mask_img = (
+                            canopy_mask_img.astype(bool) & ~_stake_pix
+                        )
+                    except Exception as _stake_err:
+                        print(
+                            f"[warn] painted-stake exclusion "
+                            f"failed ({_stake_err!r})",
+                            file=sys.stderr,
+                        )
+
                 # FINAL tree-shape filter: catches CCs that became
                 # wide+short AFTER closing bridged smaller CCs. The
                 # earlier filter (inside the heuristic block) only
@@ -6056,12 +6124,36 @@ def main():
                                     and _kept_trunk_masks
                                     and canopy_mask_img is not None):
                                 _cm_b = canopy_mask_img.astype(bool)
-                                for _tm in _kept_trunk_masks:
+                                _h_cm, _w_cm = _cm_b.shape
+                                _v_ext = int(
+                                    args.canopy_trunk_vertical_extension_px
+                                )
+                                for _tm, _tb in zip(
+                                    _kept_trunk_masks, _kept_trunk_boxes,
+                                ):
                                     _tmb = np.asarray(_tm).astype(bool)
                                     if _tmb.ndim == 3:
                                         _tmb = _tmb.any(axis=0)
                                     if _tmb.shape == _cm_b.shape:
                                         _cm_b = _cm_b | _tmb
+                                    # Vertical extension: draw a 5px-
+                                    # wide line from trunk top going
+                                    # up by _v_ext rows. Bridges
+                                    # upper canopy regions above the
+                                    # visible trunk's segmented top.
+                                    if _v_ext > 0:
+                                        _x1 = float(_tb[0])
+                                        _y1 = float(_tb[1])
+                                        _x2 = float(_tb[2])
+                                        _cx = int(round((_x1 + _x2) / 2))
+                                        _y_top = int(round(_y1))
+                                        _line_top = max(0, _y_top - _v_ext)
+                                        _col_lo = max(0, _cx - 2)
+                                        _col_hi = min(_w_cm, _cx + 3)
+                                        if (_line_top < _y_top
+                                                and _col_lo < _col_hi):
+                                            _cm_b[_line_top:_y_top,
+                                                  _col_lo:_col_hi] = True
                                 canopy_mask_img = _cm_b
                             #   2. Crop canopy CCs below trunk
                             #      bottom: removes GROUND that the
