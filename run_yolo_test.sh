@@ -92,12 +92,13 @@ echo "[batch] Using python: $PY"
   --canopy-sam-max-depth-row-corr 0.70 \
   --canopy-refine \
   --canopy-refine-upward-dilate-px 25 \
-  --canopy-refine-close-px 5 \
+  --canopy-refine-close-px 9 \
   --canopy-filter-by-tree-shape \
   --canopy-filter-min-aspect-ratio 0.5 \
   --canopy-filter-max-depth-std-mm 2000 \
   --canopy-filter-min-green-frac 0.0 \
   --canopy-filter-min-area-px 400 \
+  --canopy-filter-max-top-row 300 \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \
   --canopy-edge-tree-min-aspect-ratio 0.8 \

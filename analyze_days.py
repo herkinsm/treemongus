@@ -3530,6 +3530,16 @@ def refine_canopy_mask(
     if sky_pix is not None:
         cm = cm & ~sky_pix
 
+    # 2b. BACKGROUND-DEPTH EXCLUSION. Drop pixels with VALID
+    # background depth (> max). This removes background grass /
+    # building / fence visible THROUGH leaf gaps in the SAM mask
+    # while keeping pixels where depth is invalid (== 0; e.g.,
+    # thin foliage where D455 didn't return a measurement). Sky
+    # is handled separately by the HSV check above.
+    if depth_mm is not None:
+        bg_depth = depth_mm.astype(np.float32) > float(depth_max_mm)
+        cm = cm & ~bg_depth
+
     # 3. CLOSING. Bridge small gaps between nearby CCs.
     if close_px > 0:
         kern = _cv2.getStructuringElement(
@@ -3556,6 +3566,7 @@ def filter_canopy_by_tree_shape(
     max_depth_std_mm: float = 1500.0,
     min_green_frac: float = 0.15,
     min_area_px: int = 400,
+    max_top_row: int = 0,
 ) -> np.ndarray:
     """Post-process the canopy mask: remove connected components
     that don't look like a tree.
@@ -3620,10 +3631,18 @@ def filter_canopy_by_tree_shape(
     n_drop_depth = 0
     n_drop_green = 0
     n_drop_area = 0
+    n_drop_top_row = 0
     for cc_id in range(1, n_cc):
         x, y, ww, hh, area = stats[cc_id]
         if area < min_area_px:
             n_drop_area += 1
+            continue
+        # max_top_row check: a tree extends UP into the upper
+        # canopy band (bbox top row <= max_top_row). Small ground
+        # patches / wildflower blobs in the lower frame have
+        # bbox top well below this. 0 disables.
+        if max_top_row > 0 and int(y) > int(max_top_row):
+            n_drop_top_row += 1
             continue
         if ww > 0 and (hh / float(ww)) < min_aspect_ratio:
             n_drop_aspect += 1
@@ -4255,6 +4274,14 @@ def main():
                     help="Minimum area for a canopy CC to survive "
                          "the post-processing filter. Default 400. "
                          "Small specks have unreliable shape stats.")
+    ap.add_argument("--canopy-filter-max-top-row", type=int,
+                    default=0,
+                    help="If > 0, reject canopy CCs whose bbox top "
+                         "row is BELOW this. A tree extends UP into "
+                         "the upper canopy band (top row <= this). "
+                         "Small ground / grass blobs in the lower "
+                         "frame have top row >> this and get "
+                         "rejected. Default 0 = disabled. Try 300.")
     ap.add_argument("--flower-max-behind-foreground-mm",
                     type=float, default=0.0,
                     help="After flowers are assigned to canopy "
@@ -5774,6 +5801,9 @@ def main():
                             ),
                             min_area_px=(
                                 args.canopy_filter_min_area_px
+                            ),
+                            max_top_row=(
+                                args.canopy_filter_max_top_row
                             ),
                         )
                     except Exception as _filt2_err:
