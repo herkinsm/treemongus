@@ -120,6 +120,13 @@ echo "[batch] Using python: $PY"
   --canopy-crop-ground-gradient \
   --canopy-ground-gradient-bottom-frac 0.30 \
   --canopy-ground-gradient-max-corr 0.70 \
+  --canopy-remove-ground-by-gradient \
+  --canopy-grad-window-px 25 --canopy-grad-min-jump-mm 300 \
+  --canopy-grad-min-y 200 --canopy-grad-cc-bottom-frac 0.5 \
+  --canopy-remove-grass-by-hsv \
+  --canopy-grass-hue-min 35 --canopy-grass-hue-max 65 \
+  --canopy-grass-sat-min 60 --canopy-grass-val-min 80 \
+  --canopy-grass-min-y 300 \
   --canopy-trunk-memory-frames 5 --canopy-trunk-memory-iou 0.3 \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \

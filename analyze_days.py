@@ -3493,6 +3493,159 @@ def fill_small_canopy_holes(
     return out
 
 
+def remove_ground_by_local_gradient(
+    canopy_mask: np.ndarray,
+    depth_mm: np.ndarray | None,
+    *,
+    window_px: int = 25,
+    min_depth_jump_mm: float = 300.0,
+    min_y: int = 200,
+    require_in_cc_bottom_frac: float = 0.5,
+) -> np.ndarray:
+    """Per-pixel ground removal by local vertical depth gradient.
+
+    For each canopy pixel that satisfies ALL of:
+      - row index >= min_y                           (lower frame only)
+      - inside the BOTTOM `require_in_cc_bottom_frac`
+        of its CC's height                           (bottom-of-CC only)
+      - valid depth at the pixel itself              (>0, <60000)
+      - valid depth `window_px` rows above and below
+      - depth_above < depth_self < depth_below       (strict monotonic
+                                                      increase)
+      - depth_below - depth_above >= min_depth_jump_mm
+    ... the pixel is identified as a GROUND-gradient pixel and
+    removed from the canopy.
+
+    Multiple LEAF-PROTECTION safeguards:
+      1. Tree LEAVES are mostly in the upper half of a CC, so
+         only the bottom 50% by default is even examined.
+      2. Top-of-frame leaves (rows 0-199) are never touched.
+      3. Strict monotonic increase rules out random branch-to-
+         branch depth fluctuations (which are roughly random,
+         not consistently increasing).
+      4. 300 mm jump threshold is well above typical leaf-to-
+         leaf depth variation (~50-150 mm); only ground (which
+         increases hundreds of mm per row band) triggers it.
+      5. Both above-and-below sample points must have VALID
+         depth -- so leaves at the literal top-of-tree (sky
+         above) or bottom-of-tree (no ground depth available)
+         won't trigger.
+    """
+    if canopy_mask is None or depth_mm is None:
+        return canopy_mask
+    cm = canopy_mask.astype(bool)
+    if not cm.any():
+        return cm
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return cm
+    H, W = cm.shape
+    N = max(1, int(window_px))
+    if N >= H // 2:
+        return cm
+
+    # Compute the "in CC bottom" mask once: for each pixel in
+    # canopy, is it in the bottom `frac` of its containing CC?
+    # We CC-label the canopy and then build a per-pixel "row
+    # within CC" position.
+    cm_u8 = cm.astype(np.uint8) * 255
+    n_cc, labels, stats, _ = _cv2.connectedComponentsWithStats(
+        cm_u8, connectivity=8,
+    )
+    in_cc_bottom = np.zeros_like(cm, dtype=bool)
+    if n_cc > 1 and require_in_cc_bottom_frac > 0:
+        for cc_id in range(1, n_cc):
+            y0 = int(stats[cc_id, _cv2.CC_STAT_TOP])
+            h_cc = int(stats[cc_id, _cv2.CC_STAT_HEIGHT])
+            cut_y = y0 + int(round(h_cc * (1.0 - require_in_cc_bottom_frac)))
+            cc_pix = (labels == cc_id)
+            in_cc_bottom |= cc_pix & (np.arange(H)[:, None] >= cut_y)
+    elif require_in_cc_bottom_frac <= 0:
+        in_cc_bottom = cm.copy()
+
+    # Vertical depth shift arrays. Pad with 0 (invalid) outside
+    # the frame so border-row pixels can't trigger a false jump.
+    d = depth_mm.astype(np.int32)
+    d_above = np.zeros_like(d)
+    d_above[N:, :] = d[: H - N, :]
+    d_below = np.zeros_like(d)
+    d_below[: H - N, :] = d[N:, :]
+
+    valid = (d > 0) & (d_above > 0) & (d_below > 0)
+    monotonic = (d_above < d) & (d < d_below)
+    big_jump = (d_below - d_above) >= int(min_depth_jump_mm)
+    rows = np.arange(H)[:, None]
+    in_lower = rows >= int(min_y)
+
+    is_ground = (
+        cm
+        & in_cc_bottom
+        & in_lower
+        & valid
+        & monotonic
+        & big_jump
+    )
+
+    if is_ground.any():
+        return cm & ~is_ground
+    return cm
+
+
+def remove_grass_by_hsv(
+    canopy_mask: np.ndarray,
+    rgb_arr: np.ndarray | None,
+    *,
+    hue_min: int = 35,
+    hue_max: int = 65,
+    sat_min: int = 60,
+    val_min: int = 80,
+    min_y: int = 300,
+) -> np.ndarray:
+    """Remove pixels in canopy matching bright sunlit grass HSV.
+
+    Grass in the user's imagery is bright yellow-green:
+      H in [35, 65]  (yellow-green; pure leaf green is >= 60)
+      S >= 60        (saturated; tree leaves under canopy are <50)
+      V >= 80        (bright; shaded leaves are <70)
+
+    Restricted to rows >= min_y so legitimate sunlit upper
+    canopy isn't touched.
+
+    Leaf-protection safeguards:
+      1. min_y default 300 puts the cutoff at the BOTTOM 38% of
+         the frame -- well below typical tree foliage.
+      2. Sat >= 60 + V >= 80 is a SUNLIT bright-green signature;
+         shaded leaves under apple-tree canopy don't reach this.
+      3. The hue band [35, 65] biases yellow-green; pure deeper
+         green leaves (H 60-85) are partly excluded.
+    """
+    if canopy_mask is None or rgb_arr is None:
+        return canopy_mask
+    cm = canopy_mask.astype(bool)
+    if not cm.any():
+        return cm
+    h, w = cm.shape
+    if rgb_arr.shape[:2] != (h, w):
+        return cm
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return cm
+    hsv = _cv2.cvtColor(rgb_arr.astype(np.uint8), _cv2.COLOR_RGB2HSV)
+    H_c = hsv[:, :, 0]
+    S_c = hsv[:, :, 1]
+    V_c = hsv[:, :, 2]
+    grass_color = (
+        (H_c >= int(hue_min)) & (H_c <= int(hue_max))
+        & (S_c >= int(sat_min))
+        & (V_c >= int(val_min))
+    )
+    rows = np.arange(h)[:, None]
+    in_lower = rows >= int(min_y)
+    return cm & ~(grass_color & in_lower)
+
+
 def crop_canopy_ground_gradient(
     canopy_mask: np.ndarray,
     depth_mm: np.ndarray | None,
@@ -4793,6 +4946,59 @@ def main():
                          "depth-row correlation| > this. Ground has "
                          "near-1 correlation; trees near 0. Default "
                          "0.70.")
+    # Plan C Strategy 1: Per-pixel local vertical depth gradient.
+    ap.add_argument("--canopy-remove-ground-by-gradient",
+                    action="store_true",
+                    help="Per-pixel ground removal via local "
+                         "vertical depth gradient. For each canopy "
+                         "pixel, sample depth `window_px` rows above "
+                         "and below; if a strict monotonic increase "
+                         "with total jump exceeding "
+                         "--canopy-grad-min-jump-mm is found, the "
+                         "pixel is on a ground gradient and is "
+                         "removed. Several leaf-protection "
+                         "safeguards: only checks pixels in lower "
+                         "half of frame AND in bottom half of their "
+                         "CC, requires valid depth at all 3 sample "
+                         "points, requires strict monotonic increase, "
+                         "and uses a 300 mm jump threshold (well "
+                         "above leaf-to-leaf variance).")
+    ap.add_argument("--canopy-grad-window-px", type=int, default=25,
+                    help="Vertical window (rows above + below) for "
+                         "the gradient check. Default 25.")
+    ap.add_argument("--canopy-grad-min-jump-mm", type=float,
+                    default=300.0,
+                    help="Minimum depth_below - depth_above for a "
+                         "pixel to be ground. Default 300 mm. "
+                         "Higher = stricter (fewer false positives "
+                         "on tree branches at varying depth).")
+    ap.add_argument("--canopy-grad-min-y", type=int, default=200,
+                    help="Only check pixels at row >= this. Tree "
+                         "foliage is mostly above row 200; ground "
+                         "is below. Default 200.")
+    ap.add_argument("--canopy-grad-cc-bottom-frac", type=float,
+                    default=0.5,
+                    help="Only check pixels in the BOTTOM this "
+                         "fraction of their CC's height. Tree leaves "
+                         "are mostly in the upper half of a CC. "
+                         "Default 0.5 (bottom half only).")
+    # Plan C Strategy 2: HSV-based grass removal.
+    ap.add_argument("--canopy-remove-grass-by-hsv",
+                    action="store_true",
+                    help="Remove canopy pixels matching bright "
+                         "sunlit grass HSV in the lower frame. "
+                         "Default thresholds target bright yellow-"
+                         "green (H 35-65, S >= 60, V >= 80) below "
+                         "row 300, which doesn't catch shaded "
+                         "tree leaves (those have lower S and V).")
+    ap.add_argument("--canopy-grass-hue-min", type=int, default=35)
+    ap.add_argument("--canopy-grass-hue-max", type=int, default=65)
+    ap.add_argument("--canopy-grass-sat-min", type=int, default=60)
+    ap.add_argument("--canopy-grass-val-min", type=int, default=80)
+    ap.add_argument("--canopy-grass-min-y", type=int, default=300,
+                    help="Only consider grass-color pixels at row "
+                         ">= this. Default 300 protects upper-canopy "
+                         "sunlit leaves from being removed as grass.")
     ap.add_argument("--canopy-trunk-memory-frames", type=int,
                     default=0,
                     help="Carry trunks forward across frames. When "
@@ -6562,6 +6768,69 @@ def main():
                             print(
                                 f"[warn] ground-gradient crop "
                                 f"failed ({_gg_err!r})",
+                                file=sys.stderr,
+                            )
+
+                    # PLAN C STRATEGY 1: per-pixel local vertical
+                    # depth gradient. Most aggressive ground-removal
+                    # we have -- runs at pixel level on canopy
+                    # pixels in the bottom half of the frame AND
+                    # bottom half of their CC, requires valid depth
+                    # at sample points above and below, and requires
+                    # a strict monotonic depth increase exceeding
+                    # 300 mm. Multiple safeguards against removing
+                    # real leaves.
+                    if (args.canopy_remove_ground_by_gradient
+                            and canopy_mask_img is not None
+                            and depth_mm is not None
+                            and canopy_mask_img.any()):
+                        try:
+                            canopy_mask_img = (
+                                remove_ground_by_local_gradient(
+                                    canopy_mask_img,
+                                    depth_mm,
+                                    window_px=(
+                                        args.canopy_grad_window_px
+                                    ),
+                                    min_depth_jump_mm=(
+                                        args.canopy_grad_min_jump_mm
+                                    ),
+                                    min_y=args.canopy_grad_min_y,
+                                    require_in_cc_bottom_frac=(
+                                        args.canopy_grad_cc_bottom_frac
+                                    ),
+                                )
+                            )
+                        except Exception as _gr_err:
+                            print(
+                                f"[warn] local-gradient ground "
+                                f"removal failed ({_gr_err!r})",
+                                file=sys.stderr,
+                            )
+
+                    # PLAN C STRATEGY 2: HSV-based grass color
+                    # removal. Bright yellow-green pixels in the
+                    # lower half of the frame are very likely to
+                    # be sunlit grass; tree leaves there are
+                    # darker / less saturated.
+                    if (args.canopy_remove_grass_by_hsv
+                            and canopy_mask_img is not None
+                            and canopy_mask_img.any()):
+                        try:
+                            _rgb_grass = np.asarray(img)
+                            canopy_mask_img = remove_grass_by_hsv(
+                                canopy_mask_img,
+                                _rgb_grass,
+                                hue_min=args.canopy_grass_hue_min,
+                                hue_max=args.canopy_grass_hue_max,
+                                sat_min=args.canopy_grass_sat_min,
+                                val_min=args.canopy_grass_val_min,
+                                min_y=args.canopy_grass_min_y,
+                            )
+                        except Exception as _gh_err:
+                            print(
+                                f"[warn] HSV grass removal failed "
+                                f"({_gh_err!r})",
                                 file=sys.stderr,
                             )
 
