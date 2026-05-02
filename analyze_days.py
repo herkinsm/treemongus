@@ -3274,6 +3274,7 @@ def build_canopy_from_sam_trees(
     max_top_row: int = 280,
     min_aspect_ratio: float = 0.5,
     max_depth_row_corr: float = 0.70,
+    high_sam_trust_threshold: float = 0.0,
 ) -> np.ndarray:
     """Build a canopy mask from SAM 3 tree segmentations.
 
@@ -3338,6 +3339,15 @@ def build_canopy_from_sam_trees(
     for mask, score in zip(tree_masks, tree_scores):
         if float(score) < min_score:
             continue
+        # High-SAM-trust override: confident SAM detections bypass
+        # the depth-median check below. Trees close to the camera
+        # (depth <600 mm) and trees with poor depth coverage
+        # otherwise fail the median check despite SAM segmenting
+        # them confidently.
+        is_high_sam_trust = (
+            high_sam_trust_threshold > 0
+            and float(score) >= float(high_sam_trust_threshold)
+        )
         m = np.asarray(mask).astype(bool)
         if m.ndim == 3:
             m = m.any(axis=0)
@@ -3402,8 +3412,15 @@ def build_canopy_from_sam_trees(
         #      foliage, edge-of-FOV) while still rejecting far-
         #      background detections (which have neither valid
         #      depth NOR vegetation color).
+        #
+        # High-SAM-trust override: when SAM is confident (score
+        # >= threshold), the entire depth check is bypassed.
+        # Trees close to camera (depth <600 mm) or with weird
+        # depth distribution still get admitted because SAM
+        # said this is a tree.
         if (require_depth_check and depth_mm is not None
-                and valid_depth is not None):
+                and valid_depth is not None
+                and not is_high_sam_trust):
             mask_area = float(m.sum())
             md = depth_mm[m & valid_depth]
             valid_frac = (
@@ -6426,6 +6443,9 @@ def main():
                             ),
                             max_depth_row_corr=(
                                 args.canopy_sam_max_depth_row_corr
+                            ),
+                            high_sam_trust_threshold=(
+                                args.high_sam_trust_threshold
                             ),
                         )
                         if _u_p.any():

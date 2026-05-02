@@ -115,7 +115,7 @@ echo "[batch] Using python: $PY"
   --canopy-stake-min-aspect-ratio 4.0 --canopy-stake-min-area-px 50 \
   --canopy-fill-small-holes --canopy-max-hole-area-px 1500 \
   --canopy-max-hole-aspect-ratio 3.0 \
-  --canopy-max-bottom-row 400 \
+  --canopy-max-bottom-row 460 \
   --canopy-post-fill-bg-depth-mm 3500 \
   --canopy-crop-ground-gradient \
   --canopy-ground-gradient-bottom-frac 0.30 \
