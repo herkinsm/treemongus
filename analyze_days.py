@@ -3135,6 +3135,8 @@ def build_canopy_from_sam_trees(
     position_min_lower_frac: float = 0.20,
     require_depth_check: bool = True,
     min_valid_depth_frac: float = 0.30,
+    rgb_arr: np.ndarray | None = None,
+    rgb_fallback_min_vegetation_frac: float = 0.20,
 ) -> np.ndarray:
     """Build a canopy mask from SAM 3 tree segmentations.
 
@@ -3166,6 +3168,36 @@ def build_canopy_from_sam_trees(
     valid_depth = None
     if depth_mm is not None and require_depth_check:
         valid_depth = (depth_mm > 0) & (depth_mm < 60000)
+    # Optional RGB-based vegetation pixel mask. Used as a fallback
+    # when a SAM tree mask has too little valid depth to verify it
+    # via the depth check. Real apple trees (even blossom-dominant
+    # ones) have substantial vegetation pixel content (green leaves
+    # AND/OR white/pink blossoms); far-background detections do not.
+    veg_pixel = None
+    if (rgb_fallback_min_vegetation_frac > 0
+            and rgb_arr is not None
+            and rgb_arr.shape[:2] == (h, w)):
+        try:
+            import cv2 as _cv2_v
+            hsv_v = _cv2_v.cvtColor(
+                rgb_arr.astype(np.uint8), _cv2_v.COLOR_RGB2HSV,
+            )
+            H_v = hsv_v[:, :, 0]
+            S_v = hsv_v[:, :, 1]
+            V_v = hsv_v[:, :, 2]
+            green_v = (
+                (H_v >= 35) & (H_v <= 85)
+                & (S_v >= 40) & (V_v >= 35)
+            )
+            white_v = (S_v <= 50) & (V_v >= 120)
+            pink_v = (
+                (((H_v >= 0) & (H_v <= 20))
+                 | ((H_v >= 150) & (H_v <= 179)))
+                & (S_v >= 20) & (V_v >= 100)
+            )
+            veg_pixel = green_v | white_v | pink_v
+        except Exception:
+            veg_pixel = None
     for mask, score in zip(tree_masks, tree_scores):
         if float(score) < min_score:
             continue
@@ -3183,15 +3215,17 @@ def build_canopy_from_sam_trees(
         ys = np.where(ys_any)[0]
         if ys.size == 0 or int(ys.max()) < pos_threshold_y:
             continue
-        # Depth check: median depth must be in foreground band,
-        # AND a minimum fraction of the mask must have valid
-        # depth at all. The fraction check is critical: a far-
-        # background SAM detection gets *zero* valid depth
-        # returns from the D455 (sensor max range exceeded), so
-        # without this check the far-background mask would
-        # silently pass under "not enough info, benefit of
-        # doubt". Forcing min_valid_depth_frac means: if we
-        # cannot verify the mask is foreground, REJECT.
+        # Depth check with RGB fallback. Two-tier:
+        #   1. If valid_depth_frac >= threshold, use median-depth
+        #      check (the trustworthy path).
+        #   2. If valid_depth_frac is too low to median-check,
+        #      fall back to RGB: require the mask to have at
+        #      least rgb_fallback_min_vegetation_frac of pixels
+        #      that look like leaves OR blossoms. This admits
+        #      apple trees with poor D455 depth returns (thin
+        #      foliage, edge-of-FOV) while still rejecting far-
+        #      background detections (which have neither valid
+        #      depth NOR vegetation color).
         if (require_depth_check and depth_mm is not None
                 and valid_depth is not None):
             mask_area = float(m.sum())
@@ -3199,17 +3233,23 @@ def build_canopy_from_sam_trees(
             valid_frac = (
                 float(md.size) / mask_area if mask_area > 0 else 0.0
             )
-            if valid_frac < min_valid_depth_frac:
-                # Not enough valid-depth pixels to verify
-                # foreground -- almost certainly a far-
-                # background or sky-mixed mask.
-                continue
-            if md.size < 50:
-                # Edge case: tiny mask + low depth coverage.
-                continue
-            med = float(np.median(md))
-            if med < depth_min_mm or med > depth_max_mm:
-                continue
+            if valid_frac >= min_valid_depth_frac and md.size >= 50:
+                # Tier 1: depth median check
+                med = float(np.median(md))
+                if med < depth_min_mm or med > depth_max_mm:
+                    continue
+            else:
+                # Tier 2: RGB vegetation-fraction fallback
+                if (veg_pixel is None
+                        or rgb_fallback_min_vegetation_frac <= 0):
+                    # No RGB fallback available -- reject
+                    continue
+                veg_frac = (
+                    float((m & veg_pixel).sum())
+                    / float(mask_area)
+                ) if mask_area > 0 else 0.0
+                if veg_frac < rgb_fallback_min_vegetation_frac:
+                    continue
         canopy |= m
     return canopy
 
@@ -3737,6 +3777,35 @@ def main():
                          "augmentation + tree-shape filter. Falls "
                          "back to build_tree_mask if SAM finds "
                          "nothing in a frame. Default '' = disabled.")
+    ap.add_argument("--canopy-sam-multi-prompts", nargs="+",
+                    default=None,
+                    help="Additional SAM prompts to try for the "
+                         "canopy. All masks across these prompts "
+                         "are unioned (after individual filtering) "
+                         "to form the SAM canopy. Useful when the "
+                         "primary --canopy-sam-prompt misses some "
+                         "trees -- different phrasings catch "
+                         "different cases. Try: 'apple tree' 'tree "
+                         "branches' 'tree canopy' 'fruit tree'. The "
+                         "primary prompt is automatically included.")
+    ap.add_argument("--canopy-sam-rgb-fallback-min-veg-frac",
+                    type=float, default=0.20,
+                    help="When a SAM tree mask has too little valid "
+                         "depth to verify (<= --canopy-sam-min-valid"
+                         "-depth-frac), fall back to checking RGB "
+                         "vegetation content. The mask must have at "
+                         "least this fraction of pixels that look "
+                         "like green leaves OR white/pink blossoms. "
+                         "Default 0.20 (20%%). Admits trees with "
+                         "poor D455 depth returns while still "
+                         "rejecting far-background detections.")
+    ap.add_argument("--canopy-sam-only", action="store_true",
+                    help="When SAM canopy finds anything, use ONLY "
+                         "the SAM canopy. The heuristic build_tree"
+                         "_mask + edge augmentation only runs as a "
+                         "FULL fallback when SAM is empty. Prevents "
+                         "the heuristic from adding grass/ground "
+                         "noise when SAM has a clean tree mask.")
     ap.add_argument("--canopy-sam-min-score", type=float, default=0.15,
                     help="Minimum SAM 3 detection score for a tree "
                          "mask to be included in the canopy. Default "
@@ -4681,17 +4750,23 @@ def main():
             f"prompt {args.canopy_trunk_prompt!r}",
             file=sys.stderr,
         )
-    # Auto-add the SAM canopy prompt when --canopy-sam-prompt is set.
-    # SAM 3 will be queried with this prompt every frame and the
-    # resulting masks become the canopy.
-    if (args.canopy_sam_prompt
-            and args.canopy_sam_prompt not in prompts):
-        prompts.append(args.canopy_sam_prompt)
-        print(
-            f"[init] --canopy-sam-prompt set: auto-added prompt "
-            f"{args.canopy_sam_prompt!r} as canopy source",
-            file=sys.stderr,
-        )
+    # Auto-add the SAM canopy prompt(s). SAM 3 will be queried with
+    # the primary prompt + any --canopy-sam-multi-prompts each frame,
+    # and the union of their (filtered) masks becomes the canopy.
+    _canopy_sam_prompt_set: list[str] = []
+    if args.canopy_sam_prompt:
+        _canopy_sam_prompt_set.append(args.canopy_sam_prompt)
+    if args.canopy_sam_multi_prompts:
+        for p in args.canopy_sam_multi_prompts:
+            if p and p not in _canopy_sam_prompt_set:
+                _canopy_sam_prompt_set.append(p)
+    for p in _canopy_sam_prompt_set:
+        if p not in prompts:
+            prompts.append(p)
+            print(
+                f"[init] auto-added canopy SAM prompt {p!r}",
+                file=sys.stderr,
+            )
     prompt_slugs = {p: slugify(p) for p in prompts}
 
     # Resolve which prompts the IoU tracker should run on. Default: any prompt
@@ -5042,43 +5117,68 @@ def main():
                 if args.depth or args.tree_mask:
                     depth_mm = load_depth_mm(depth_path_for(img_path), (img.height, img.width))
 
-                # SAM 3-based canopy: ADDITIVE source. We always
-                # run BOTH the SAM 3 query (when --canopy-sam-prompt
-                # is set) AND the heuristic build_tree_mask + edge
-                # augmentation, then union them. This way SAM gives
-                # pixel-accurate masks where it works, and the
-                # heuristic covers the cases SAM misses (half-trees
-                # at edges, partial segmentations, blossom-dominant
-                # trees that don't look like SAM's pretrained 'apple
-                # tree' prototype). Neither has to be perfect alone.
+                # SAM 3-based canopy. Iterate over the configured
+                # canopy prompts (primary + multi-prompts), build a
+                # filtered canopy from each, and union them. Each
+                # prompt has different strengths: 'apple tree'
+                # captures the prototypical case; 'tree branches'
+                # catches sparse / dim trees; 'fruit tree' helps
+                # with blossom-dominant trees; 'tree canopy' helps
+                # with full-canopy trees. The union recovers cases
+                # where any single prompt misses.
                 _sct_canopy: np.ndarray | None = None
-                if (args.tree_mask and args.canopy_sam_prompt
+                if (args.tree_mask
                         and isinstance(infer, dict)
-                        and args.canopy_sam_prompt in infer):
-                    _sct_infer = infer[args.canopy_sam_prompt]
-                    _sct_masks = _sct_infer.get("masks")
-                    _sct_scores = _sct_infer.get("scores")
-                    _sct_canopy = build_canopy_from_sam_trees(
-                        _sct_masks, _sct_scores, depth_mm,
-                        (img.height, img.width),
-                        min_score=args.canopy_sam_min_score,
-                        depth_min_mm=args.depth_min_mm,
-                        depth_max_mm=args.depth_max_mm,
-                        min_pixels=args.canopy_sam_min_pixels,
-                        position_min_lower_frac=(
-                            args.canopy_sam_min_lower_frac
-                        ),
-                        require_depth_check=(
-                            args.canopy_sam_depth_check
-                        ),
-                        min_valid_depth_frac=(
-                            args.canopy_sam_min_valid_depth_frac
-                        ),
+                        and _canopy_sam_prompt_set):
+                    _rgb_for_sct = np.asarray(img)
+                    _u = np.zeros(
+                        (img.height, img.width), dtype=bool,
                     )
-                    if not _sct_canopy.any():
-                        _sct_canopy = None
+                    for _p in _canopy_sam_prompt_set:
+                        if _p not in infer:
+                            continue
+                        _pi = infer[_p]
+                        _u_p = build_canopy_from_sam_trees(
+                            _pi.get("masks"),
+                            _pi.get("scores"),
+                            depth_mm,
+                            (img.height, img.width),
+                            min_score=args.canopy_sam_min_score,
+                            depth_min_mm=args.depth_min_mm,
+                            depth_max_mm=args.depth_max_mm,
+                            min_pixels=args.canopy_sam_min_pixels,
+                            position_min_lower_frac=(
+                                args.canopy_sam_min_lower_frac
+                            ),
+                            require_depth_check=(
+                                args.canopy_sam_depth_check
+                            ),
+                            min_valid_depth_frac=(
+                                args.canopy_sam_min_valid_depth_frac
+                            ),
+                            rgb_arr=_rgb_for_sct,
+                            rgb_fallback_min_vegetation_frac=(
+                                args.canopy_sam_rgb_fallback_min_veg_frac
+                            ),
+                        )
+                        if _u_p.any():
+                            _u |= _u_p
+                    if _u.any():
+                        _sct_canopy = _u
 
-                if (args.tree_mask and depth_mm is not None):
+                # Decide whether to skip the heuristic. When
+                # --canopy-sam-only is on AND SAM found anything,
+                # we trust SAM and skip the heuristic entirely
+                # (avoids over-inclusion: heuristic adds grass /
+                # ground noise where SAM has a clean tree mask).
+                # Otherwise the heuristic runs and is unioned in.
+                _skip_heuristic = (
+                    bool(args.canopy_sam_only)
+                    and _sct_canopy is not None
+                )
+
+                if (args.tree_mask and depth_mm is not None
+                        and not _skip_heuristic):
                     if args.use_build_tree_mask:
                         # Robust canopy detection from tree_mask.py:
                         # depth band + HSV sky exclusion + ROI-anchored

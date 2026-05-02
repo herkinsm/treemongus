@@ -82,10 +82,12 @@ echo "[batch] Using python: $PY"
   --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
   --use-build-tree-mask --tree-mask-min-overlap 0.10 --tree-mask-dilate-px 8 \
-  --canopy-sam-prompt "apple tree" --canopy-sam-min-score 0.15 \
+  --canopy-sam-prompt "apple tree" --canopy-sam-min-score 0.10 \
+  --canopy-sam-multi-prompts "apple tree" "tree branches" "tree canopy" "fruit tree" \
   --canopy-sam-min-pixels 500 --canopy-sam-min-lower-frac 0.20 \
   --canopy-sam-min-valid-depth-frac 0.30 \
-  --canopy-sam-supplement-with-edge-aug \
+  --canopy-sam-rgb-fallback-min-veg-frac 0.20 \
+  --canopy-sam-only \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \
   --canopy-edge-tree-min-aspect-ratio 0.8 \
