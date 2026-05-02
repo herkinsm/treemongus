@@ -66,7 +66,7 @@ echo "[batch] Using python: $PY"
   --root "/fs/scratch/PAS0228" \
   --out "$HOME/sam3_yolo_labels" \
   --save-overlays --save-empty-overlays --save-masks \
-  --save-canopy-masks \
+  --save-canopy-masks --save-canopy-overlay \
   --depth --tree-mask \
   --require-all-modalities --require-info-modality \
   --sample-per-session 0 --sample-mode stride --sample-stride 20 \

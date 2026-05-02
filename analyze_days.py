@@ -3339,6 +3339,19 @@ def main():
                          "a single 'canopy' boolean array and "
                          "optionally per-tree partition labels and "
                          "trunk bboxes when --track-canopy is on.")
+    ap.add_argument("--save-canopy-overlay", action="store_true",
+                    help="Save a HUMAN-VIEWABLE per-frame JPG of the "
+                         "RGB image with the canopy mask drawn on top "
+                         "(red translucent fill + bright outline), at "
+                         "<out>/canopy_overlays/<rel_path>.jpg. Use "
+                         "this to debug 'why is my canopy mask "
+                         "wrong' visually -- e.g., when an edge tree "
+                         "is missing from the mask, or when grass is "
+                         "being added as canopy by --canopy-include-"
+                         "edge-trees. When --track-canopy is on, also "
+                         "draws the per-tree partition labels in "
+                         "different colors and the detected trunk "
+                         "bboxes.")
     ap.add_argument("--save-overlays", action="store_true")
     ap.add_argument("--save-empty-overlays", action="store_true",
                     help="Also save overlay JPGs for frames where the "
@@ -4315,12 +4328,15 @@ def main():
     masks_dir = out_dir / "masks"
     overlays_dir = out_dir / "overlays"
     canopy_masks_dir = out_dir / "canopy_masks"
+    canopy_overlays_dir = out_dir / "canopy_overlays"
     if args.save_masks:
         masks_dir.mkdir(exist_ok=True)
     if args.save_overlays:
         overlays_dir.mkdir(exist_ok=True)
     if args.save_canopy_masks:
         canopy_masks_dir.mkdir(exist_ok=True)
+    if args.save_canopy_overlay:
+        canopy_overlays_dir.mkdir(exist_ok=True)
 
     print(f"[init] device={args.device} threshold={args.threshold} sample/session={sample}")
     print(f"[init] prompts: {prompts}")
@@ -4969,6 +4985,131 @@ def main():
                         print(
                             f"[warn] could not save canopy mask for "
                             f"{img_path.name}: {_cp_err!r}",
+                            file=sys.stderr,
+                        )
+
+                # Save a HUMAN-VIEWABLE canopy overlay JPG. RGB +
+                # red translucent fill on canopy pixels + per-tree
+                # partition tints (when --track-canopy is on) + a
+                # bright outline + trunk bboxes. Lets you visually
+                # diagnose why a frame failed (e.g., edge tree
+                # missing from the mask, grass added as canopy,
+                # depth band exclusion, etc.) without having to
+                # load and decode the .npz.
+                if (args.save_canopy_overlay
+                        and canopy_mask_img is not None):
+                    try:
+                        import cv2 as _cv2_co
+                        rel_co = (
+                            img_path.relative_to(args.root)
+                            .with_suffix(".jpg")
+                        )
+                        co_path = canopy_overlays_dir / rel_co
+                        co_path.parent.mkdir(parents=True, exist_ok=True)
+                        rgb_co = np.asarray(img).copy()
+                        if rgb_co.ndim == 2:
+                            rgb_co = _cv2_co.cvtColor(
+                                rgb_co, _cv2_co.COLOR_GRAY2RGB,
+                            )
+                        cm_bool = canopy_mask_img.astype(bool)
+                        # Base layer: red tint inside canopy.
+                        tint = np.zeros_like(rgb_co)
+                        tint[cm_bool] = (255, 60, 60)
+                        rgb_co = _cv2_co.addWeighted(
+                            rgb_co, 0.7, tint, 0.3, 0,
+                        )
+                        # Per-tree partition tints (different hue
+                        # per tree id) when canopy tracking is on.
+                        if frame_canopy_components and frame_tree_ids:
+                            _labels_img = (
+                                frame_canopy_components[0].get("labels")
+                            )
+                            if _labels_img is not None:
+                                # Color cycle for trees.
+                                _tree_colors = [
+                                    (60, 220, 60), (60, 60, 220),
+                                    (220, 220, 60), (220, 60, 220),
+                                    (60, 220, 220), (220, 140, 60),
+                                    (140, 220, 60), (60, 140, 220),
+                                ]
+                                for cc, tid in zip(
+                                    frame_canopy_components,
+                                    frame_tree_ids,
+                                ):
+                                    lid = int(cc.get("label_id", 0))
+                                    if lid <= 0:
+                                        continue
+                                    color = _tree_colors[
+                                        int(tid) % len(_tree_colors)
+                                    ]
+                                    pix = (_labels_img == lid)
+                                    if not pix.any():
+                                        continue
+                                    tt = np.zeros_like(rgb_co)
+                                    tt[pix] = color
+                                    rgb_co = _cv2_co.addWeighted(
+                                        rgb_co, 0.85, tt, 0.15, 0,
+                                    )
+                                    # Tree id label at centroid.
+                                    ys, xs = np.where(pix)
+                                    if ys.size:
+                                        cy_t = int(ys.mean())
+                                        cx_t = int(xs.mean())
+                                        _cv2_co.putText(
+                                            rgb_co,
+                                            f"T{int(tid)}",
+                                            (cx_t, cy_t),
+                                            _cv2_co.FONT_HERSHEY_SIMPLEX,
+                                            0.6, (255, 255, 255), 2,
+                                            _cv2_co.LINE_AA,
+                                        )
+                        # Bright outline on canopy boundary.
+                        cm_u8 = cm_bool.astype(np.uint8) * 255
+                        contours, _ = _cv2_co.findContours(
+                            cm_u8, _cv2_co.RETR_EXTERNAL,
+                            _cv2_co.CHAIN_APPROX_SIMPLE,
+                        )
+                        _cv2_co.drawContours(
+                            rgb_co, contours, -1, (255, 255, 0), 2,
+                        )
+                        # Trunk bboxes in cyan.
+                        if frame_canopy_components:
+                            for cc in frame_canopy_components:
+                                tb = cc.get("trunk_box")
+                                if tb is not None:
+                                    x1, y1, x2, y2 = (
+                                        int(v) for v in tb
+                                    )
+                                    _cv2_co.rectangle(
+                                        rgb_co, (x1, y1), (x2, y2),
+                                        (0, 255, 255), 2,
+                                    )
+                        # Header text: # of canopy components,
+                        # canopy fraction, # of trunks.
+                        _cf = float(cm_bool.sum()) / float(cm_bool.size)
+                        hdr = (
+                            f"canopy_frac={_cf*100:.1f}%  "
+                            f"trees={len(frame_canopy_components)}"
+                        )
+                        _cv2_co.putText(
+                            rgb_co, hdr, (8, 22),
+                            _cv2_co.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0, 0, 0), 4, _cv2_co.LINE_AA,
+                        )
+                        _cv2_co.putText(
+                            rgb_co, hdr, (8, 22),
+                            _cv2_co.FONT_HERSHEY_SIMPLEX,
+                            0.6, (255, 255, 255), 1, _cv2_co.LINE_AA,
+                        )
+                        _cv2_co.imwrite(
+                            str(co_path),
+                            _cv2_co.cvtColor(rgb_co, _cv2_co.COLOR_RGB2BGR),
+                            [int(_cv2_co.IMWRITE_JPEG_QUALITY), 88],
+                        )
+                    except Exception as _co_err:
+                        print(
+                            f"[warn] could not save canopy overlay "
+                            f"for {img_path.name}: {_co_err!r}",
                             file=sys.stderr,
                         )
 
