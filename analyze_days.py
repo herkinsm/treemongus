@@ -5748,6 +5748,42 @@ def main():
                             file=sys.stderr,
                         )
 
+                # FINAL tree-shape filter: catches CCs that became
+                # wide+short AFTER closing bridged smaller CCs. The
+                # earlier filter (inside the heuristic block) only
+                # sees pre-union, pre-closing CCs. Closing can
+                # bridge multiple foreground patches into a single
+                # wide grass band; this final pass removes those.
+                if (args.canopy_filter_by_tree_shape
+                        and canopy_mask_img is not None
+                        and canopy_mask_img.any()):
+                    try:
+                        _rgb_filt2 = np.asarray(img)
+                        canopy_mask_img = filter_canopy_by_tree_shape(
+                            canopy_mask_img,
+                            depth_mm,
+                            _rgb_filt2,
+                            min_aspect_ratio=(
+                                args.canopy_filter_min_aspect_ratio
+                            ),
+                            max_depth_std_mm=(
+                                args.canopy_filter_max_depth_std_mm
+                            ),
+                            min_green_frac=(
+                                args.canopy_filter_min_green_frac
+                            ),
+                            min_area_px=(
+                                args.canopy_filter_min_area_px
+                            ),
+                        )
+                    except Exception as _filt2_err:
+                        print(
+                            f"[warn] post-refine tree-shape filter "
+                            f"failed ({_filt2_err!r}); using "
+                            f"unfiltered mask",
+                            file=sys.stderr,
+                        )
+
                 # Per-frame canopy tracking. Either:
                 #   cc method:    extract connected components from
                 #                 the canopy mask (cheap; fails on
