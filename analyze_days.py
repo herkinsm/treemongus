@@ -4248,6 +4248,23 @@ def main():
     ap.add_argument("--depth-near-frac", type=float, default=0.5,
                     help="Count a detection as near-field if >= this fraction of its "
                          "mask pixels lie inside the depth band (default 0.5).")
+    ap.add_argument("--high-sam-trust-threshold", type=float,
+                    default=0.0,
+                    help="If a SAM detection's score is >= this "
+                         "threshold, several depth-based gates are "
+                         "BYPASSED for that detection. Currently "
+                         "applies to: near_field (depth-near-frac) "
+                         "and on_smooth_plane (local-depth-std). "
+                         "Real flowers often have poor D455 depth "
+                         "coverage on thin petals (laser passes "
+                         "through to background) so they fail "
+                         "depth gates despite being clearly visible "
+                         "to SAM. Default 0 = disabled. Recommended "
+                         "0.20 -- per rejection-log analysis, ~70%% "
+                         "of low-score (<0.1) near_field rejections "
+                         "are noise, but high-score (>=0.2) rejections "
+                         "are mostly real flowers SAM detected "
+                         "confidently.")
     # Tree-mask canopy filter (port of sprayer_pipeline/tree_mask.py).
     ap.add_argument("--tree-mask", action="store_true",
                     help="Apply a row-banded canopy mask derived from depth and reject "
@@ -7055,6 +7072,15 @@ def main():
                     # Depth-based near-field filter. When --depth is on, we
                     # actively drop detections whose mask doesn't sit inside
                     # the canopy band (background trees, far ground, etc.).
+                    #
+                    # HIGH-SAM-SCORE OVERRIDE: real flowers often have
+                    # thin petals where the D455 returns no depth (laser
+                    # passes through to background), giving them poor
+                    # foreground-depth coverage even though the SAM
+                    # detection itself is confident. Detections with SAM
+                    # score >= --high-sam-trust-threshold bypass this
+                    # depth gate. Low-SAM detections (typically noise)
+                    # still need to pass the depth check.
                     near_mean: float | str = ""
                     near_max: float | str = ""
                     if (args.depth and depth_mm is not None and n_raw > 0
@@ -7064,6 +7090,15 @@ def main():
                         )
                         fracs_arr = np.asarray(fracs, dtype=float)
                         keep = ~np.isnan(fracs_arr) & (fracs_arr >= args.depth_near_frac)
+                        # Apply high-SAM trust override for flowers.
+                        if (args.high_sam_trust_threshold > 0
+                                and scores_np is not None
+                                and len(scores_np) == len(keep)):
+                            high_trust = (
+                                np.asarray(scores_np, dtype=float)
+                                >= float(args.high_sam_trust_threshold)
+                            )
+                            keep = keep | high_trust
                         audit.apply(keep, "near_field")
                         if not keep.all():
                             masks_np = masks_np[keep]
@@ -7113,14 +7148,32 @@ def main():
                                 diag_g["depth_row_corr"] += 1
                                 continue
                             if apply_local_depth:
-                                lstd = local_depth_std(
-                                    m, depth_mm,
-                                    window_size=args.flower_local_depth_window_px,
+                                # High-SAM-trust override: skip the
+                                # smooth-plane gate for confident SAM
+                                # detections. Real flowers on a small
+                                # tree at a single depth give a near-
+                                # uniform local depth std (looks like a
+                                # smooth plane) but the SAM segmenter
+                                # confidently identified them, so we
+                                # trust SAM over the depth heuristic.
+                                _high_trust_i = (
+                                    args.high_sam_trust_threshold > 0
+                                    and scores_np is not None
+                                    and i < len(scores_np)
+                                    and float(scores_np[i])
+                                    >= float(args.high_sam_trust_threshold)
                                 )
-                                if lstd > 0 and lstd < args.flower_min_local_depth_std_mm:
-                                    keep[i] = False
-                                    diag_g["on_smooth_plane"] += 1
-                                    continue
+                                if _high_trust_i:
+                                    pass  # skip the smooth-plane reject
+                                else:
+                                    lstd = local_depth_std(
+                                        m, depth_mm,
+                                        window_size=args.flower_local_depth_window_px,
+                                    )
+                                    if lstd > 0 and lstd < args.flower_min_local_depth_std_mm:
+                                        keep[i] = False
+                                        diag_g["on_smooth_plane"] += 1
+                                        continue
                         rt_key = (day, category, session, prompt)
                         rt = rejection_totals.setdefault(rt_key, {})
                         for k, v in diag_g.items():
