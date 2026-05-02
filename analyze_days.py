@@ -1047,10 +1047,22 @@ def infer_per_prompt(processor, img: Image.Image, prompts: list[str],
 # ---------------------------------------------------------------------------
 def depth_path_for(img_path: Path) -> Path:
     """Given .../<session>/RGB/<stem>-RGB[-BP].<ext>, return the matching
-    .../<session>/depth/<stem>-Depth.<txt|bmp>. The user's VB capture code
-    saves BOTH a .txt (raw mm, what bridge_server.py:1474 reads) and a .bmp
-    (3-channel uint8 colormap, for human inspection only). We must prefer
-    the .txt — the .bmp doesn't carry mm values."""
+    .../<session>/depth/<stem>-Depth.<txt|bmp>.
+
+    The user's VB capture code saves BOTH a .txt (raw mm) and a
+    .bmp. Some sessions have the .txt saved at a smaller width
+    than the RGB/BMP (e.g., 480x74 vs the full 480x640) -- when
+    that happens load_depth_mm falls back to the greyscale .bmp.
+
+    Path priority:
+      1. depth/<base>-Depth.txt              (if present & full-res)
+      2. depth/Image/<base>-Depth.bmp        (the user's capture
+                                              writes BMPs to a
+                                              `depth/Image/`
+                                              subfolder)
+      3. depth/<base>-Depth.bmp              (sibling of the .txt,
+                                              fallback)
+    """
     session_dir = img_path.parent.parent  # drop RGB/
     stem = img_path.stem
     base = stem
@@ -1061,6 +1073,12 @@ def depth_path_for(img_path: Path) -> Path:
     txt = session_dir / "depth" / f"{base}-Depth.txt"
     if txt.is_file():
         return txt
+    # Try the Image subfolder where the capture code writes BMPs.
+    bmp_in_subdir = (
+        session_dir / "depth" / "Image" / f"{base}-Depth.bmp"
+    )
+    if bmp_in_subdir.is_file():
+        return bmp_in_subdir
     return session_dir / "depth" / f"{base}-Depth.bmp"
 
 
@@ -1919,45 +1937,161 @@ def _build_legend_panel(
     return panel
 
 
+def _decode_greyscale_depth_bmp(
+    bmp_path: Path, target_hw: tuple[int, int],
+    *, mm_min: float = 600.0, mm_max: float = 5000.0,
+) -> np.ndarray | None:
+    """Decode a greyscale-stored depth-visualization BMP to uint16 mm.
+
+    Many capture pipelines write depth as an 8-bit GREYSCALE BMP
+    (a 3-channel uint8 BMP where all three channels are equal --
+    this is what cv2 returns for a single-channel BMP saved
+    without a palette). The brightness encodes depth: 0 = invalid
+    (no return), 255 = saturated / past max range, 1-254 linearly
+    span [mm_min, mm_max].
+
+    Returns None if the BMP is a true 3-channel COLOR BMP (e.g.,
+    a JET/TURBO colormap) -- those need a separate color decoder.
+    """
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return None
+    b = _cv2.imread(str(bmp_path), _cv2.IMREAD_UNCHANGED)
+    if b is None:
+        return None
+    if b.ndim == 3:
+        # Check if it's actually greyscale (all channels equal).
+        if not ((b[..., 0] == b[..., 1]).all()
+                and (b[..., 1] == b[..., 2]).all()):
+            # True colour -- can't decode as greyscale depth.
+            return None
+        g = b[..., 0]
+    else:
+        g = b
+    if g.dtype != np.uint8:
+        return None
+    # Map greyscale -> mm. 0 = invalid (kept as 0); 255 = past
+    # sensor max (kept as 0 -- treated as invalid by downstream
+    # depth gates that check (depth > 0) & (depth < 60000)).
+    valid = (g > 0) & (g < 255)
+    d = np.zeros(g.shape, dtype=np.float32)
+    if valid.any():
+        d[valid] = (
+            mm_min + (g[valid].astype(np.float32) - 1.0)
+            / 253.0 * (mm_max - mm_min)
+        )
+    H, W = target_hw
+    if d.shape != (H, W):
+        pim = Image.fromarray(d, mode="F").resize(
+            (W, H), Image.BILINEAR,
+        )
+        d = np.asarray(pim)
+    return np.clip(d, 0, 65535).astype(np.uint16)
+
+
 def load_depth_mm(depth_path: Path, target_hw: tuple[int, int]) -> np.ndarray | None:
     """Load a depth file and return uint16 mm upsampled to target (H, W).
-    Supported:
-      - .txt : ASCII (what the user's bridge_server.py reads)
-      - .bmp / .png : 16-bit single-channel raw mm
-    Rejects 3-channel uint8 BMPs — those are the colormap *visualization* the
-    VB capture code writes for human inspection, not raw mm depth. A warning
-    is printed once per session-folder so the user notices."""
+
+    Source-priority chain:
+      1. .txt  (ASCII raw mm) -- used UNLESS it's truncated to a
+                                 width drastically smaller than
+                                 the target frame width (some
+                                 capture pipelines save .txt at
+                                 lower resolution than the BMP /
+                                 RGB; bilinear upsampling 8x
+                                 destroys depth boundaries).
+      2. .bmp/.png greyscale (depth viz, 0=invalid, 1-254 linear mm)
+      3. .bmp/.png 16-bit single-channel raw mm
+
+    Falls through to the .bmp (greyscale) when:
+      - .txt is missing
+      - .txt's column count < 50% of target width (truncated)
+    """
+    H, W = target_hw
     if not depth_path.is_file():
         return None
     suffix = depth_path.suffix.lower()
-    try:
-        if suffix == ".txt":
-            d = np.loadtxt(depth_path, dtype=np.float32)
-        else:
-            import cv2
-            d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-            if d is None:
-                return None
-            if d.ndim == 3 or d.dtype == np.uint8:
+    txt_was_truncated = False
+    txt_d: np.ndarray | None = None
+    if suffix == ".txt":
+        try:
+            txt_d = np.loadtxt(depth_path, dtype=np.float32)
+        except Exception:
+            txt_d = None
+        if txt_d is not None and txt_d.ndim == 2:
+            if txt_d.shape[1] < W * 0.5:
+                # The .txt was saved truncated. Fall back to the
+                # matching BMP if present (it's full-resolution).
+                txt_was_truncated = True
                 key = str(depth_path.parent)
                 if key not in _warned_bad_depth_bmps:
                     _warned_bad_depth_bmps.add(key)
-                    print(f"[warn] depth at {key} is {d.shape} {d.dtype} — looks "
-                          f"like the colormap visualization, not raw mm. Upload "
-                          f"the matching .txt files (raw mm) instead.",
-                          file=sys.stderr)
-                return None
-            d = d.astype(np.int32)
-    except Exception:
+                    print(
+                        f"[warn] depth .txt at {key} is "
+                        f"{txt_d.shape} (truncated horizontally; "
+                        f"target W={W}). Falling back to greyscale "
+                        f"BMP for full-resolution depth.",
+                        file=sys.stderr,
+                    )
+        else:
+            txt_d = None
+
+    if txt_was_truncated or suffix in (".bmp", ".png"):
+        # Look for the matching BMP. depth_path_for returns the
+        # .txt path; the BMP can live alongside it OR in an
+        # 'Image' subfolder (the user's capture pipeline writes
+        # to depth/Image/).
+        if suffix == ".txt":
+            stem = depth_path.stem  # e.g. "...-Depth"
+            cand_paths = [
+                depth_path.with_suffix(".bmp"),
+                depth_path.parent / "Image" / f"{stem}.bmp",
+                depth_path.parent / "Image" / f"{stem}.BMP",
+            ]
+        else:
+            cand_paths = [depth_path]
+        for cp in cand_paths:
+            if not cp.is_file():
+                continue
+            d = _decode_greyscale_depth_bmp(cp, target_hw)
+            if d is not None:
+                return d
+            # Greyscale decode failed -- maybe it's a 16-bit raw
+            # BMP. Try the legacy path.
+            try:
+                import cv2
+                d_raw = cv2.imread(str(cp), cv2.IMREAD_UNCHANGED)
+                if d_raw is None or d_raw.ndim == 3 or d_raw.dtype == np.uint8:
+                    continue
+                d_raw = d_raw.astype(np.int32)
+                if d_raw.shape != (H, W):
+                    pim = Image.fromarray(
+                        d_raw.astype(np.float32), mode="F",
+                    ).resize((W, H), Image.BILINEAR)
+                    d_raw = np.asarray(pim)
+                return np.clip(d_raw, 0, 65535).astype(np.uint16)
+            except Exception:
+                continue
+        if txt_was_truncated and txt_d is not None:
+            # No BMP available -- have to upsample the truncated
+            # .txt. Better than nothing.
+            pass
+
+    # .txt path (full-res or truncated-with-no-BMP fallback)
+    if txt_d is None and suffix == ".txt":
+        try:
+            txt_d = np.loadtxt(depth_path, dtype=np.float32)
+        except Exception:
+            return None
+    if txt_d is None or txt_d.ndim != 2 or txt_d.size == 0:
         return None
-    if d.ndim != 2 or d.size == 0:
-        return None
-    H, W = target_hw
-    if d.shape != (H, W):
-        pim = Image.fromarray(d.astype(np.float32), mode="F").resize((W, H), Image.BILINEAR)
-        d = np.asarray(pim)
-    d = np.clip(d, 0, 65535).astype(np.uint16)
-    return d
+    if txt_d.shape != (H, W):
+        pim = Image.fromarray(
+            txt_d.astype(np.float32), mode="F",
+        ).resize((W, H), Image.BILINEAR)
+        txt_d = np.asarray(pim)
+    return np.clip(txt_d, 0, 65535).astype(np.uint16)
 
 
 def near_frac_per_mask(masks_np: np.ndarray, depth_mm: np.ndarray,
@@ -3669,6 +3803,20 @@ def main():
                          "draws the per-tree partition labels in "
                          "different colors and the detected trunk "
                          "bboxes.")
+    ap.add_argument("--save-depth-fg-overlay", action="store_true",
+                    help="Save a per-frame DIAGNOSTIC JPG showing "
+                         "the RAW foreground-depth mask (every pixel "
+                         "with depth in [--depth-min-mm, --depth-max-"
+                         "mm] AND not sky-blue / not sky-bright), at "
+                         "<out>/depth_fg_overlays/<rel_path>.jpg. "
+                         "Compare to canopy_overlays to see whether "
+                         "the depth data captures a tree but the "
+                         "filter chain rejects it (filter issue) or "
+                         "the depth itself doesn't have the tree "
+                         "(data issue). Different colors mark each "
+                         "depth band: green=close (600-1500mm), "
+                         "yellow=mid (1500-2200mm), orange=far "
+                         "(2200-3000mm).")
     ap.add_argument("--save-overlays", action="store_true")
     ap.add_argument("--save-empty-overlays", action="store_true",
                     help="Also save overlay JPGs for frames where the "
@@ -4852,6 +5000,7 @@ def main():
     overlays_dir = out_dir / "overlays"
     canopy_masks_dir = out_dir / "canopy_masks"
     canopy_overlays_dir = out_dir / "canopy_overlays"
+    depth_overlays_dir = out_dir / "depth_fg_overlays"
     if args.save_masks:
         masks_dir.mkdir(exist_ok=True)
     if args.save_overlays:
@@ -4860,6 +5009,8 @@ def main():
         canopy_masks_dir.mkdir(exist_ok=True)
     if args.save_canopy_overlay:
         canopy_overlays_dir.mkdir(exist_ok=True)
+    if args.save_depth_fg_overlay:
+        depth_overlays_dir.mkdir(exist_ok=True)
 
     print(f"[init] device={args.device} threshold={args.threshold} sample/session={sample}")
     print(f"[init] prompts: {prompts}")
