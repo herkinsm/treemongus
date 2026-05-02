@@ -104,6 +104,7 @@ echo "[batch] Using python: $PY"
   --canopy-exclude-painted-stakes \
   --canopy-stake-hue-min 30 --canopy-stake-hue-max 90 \
   --canopy-stake-sat-min 100 --canopy-stake-val-max 120 \
+  --canopy-fill-small-holes --canopy-max-hole-area-px 300 \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \
   --canopy-edge-tree-min-aspect-ratio 0.8 \

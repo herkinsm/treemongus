@@ -3430,6 +3430,64 @@ def build_canopy_from_sam_trees(
     return canopy
 
 
+def fill_small_canopy_holes(
+    canopy_mask: np.ndarray,
+    *,
+    max_hole_area_px: int = 200,
+) -> np.ndarray:
+    """Fill SMALL interior holes in the canopy mask.
+
+    After sky / background-depth / stake exclusion, the tree
+    canopy mask often has many small holes (sky pixels between
+    branches that were correctly removed). Visually the tree
+    becomes a constellation of blobs instead of one silhouette.
+    Filling small holes restores the tree's outer shape so
+    branches connecting leafy regions don't appear as missing
+    seams.
+
+    Algorithm: flood-fill the canopy COMPLEMENT from a frame
+    corner; any non-canopy pixel NOT reached by the flood is an
+    "interior hole" surrounded by canopy. Connected-component
+    label the holes, fill only those whose area <=
+    max_hole_area_px (avoids re-adding large excluded regions
+    like stakes or wide background patches).
+    """
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return canopy_mask
+    if canopy_mask is None:
+        return canopy_mask
+    cm = canopy_mask.astype(bool)
+    if not cm.any():
+        return cm
+    h, w = cm.shape
+    cm_u8 = cm.astype(np.uint8) * 255
+    # Pad with 1-px zero border so the flood from (0, 0) always
+    # starts in the EXTERIOR (regardless of whether the canopy
+    # touches the original frame edge).
+    padded = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    padded[1:-1, 1:-1] = cm_u8
+    flood_aux = np.zeros((h + 4, w + 4), dtype=np.uint8)
+    _cv2.floodFill(padded, flood_aux, (0, 0), 255)
+    # interior_holes = pixels that are 0 in original AND NOT
+    # reached by flood. After flood, EXTERIOR is 255 and
+    # INTERIOR HOLES are still 0. Inverting gives holes.
+    interior_holes = _cv2.bitwise_not(padded)[1:-1, 1:-1]
+    if not interior_holes.any():
+        return cm
+    # CC-label the holes, keep only small ones to fill.
+    n_h, h_labels, h_stats, _ = _cv2.connectedComponentsWithStats(
+        interior_holes, connectivity=8,
+    )
+    out = cm.copy()
+    for hid in range(1, n_h):
+        area = int(h_stats[hid, _cv2.CC_STAT_AREA])
+        if area <= int(max_hole_area_px):
+            out = out | (h_labels == hid)
+    return out
+
+
 def crop_canopy_below_trunks(
     canopy_mask: np.ndarray,
     trunk_boxes: list,
@@ -4396,6 +4454,22 @@ def main():
                     help="Stake maximum brightness V (default 120). "
                          "Stakes are dark (painted) -- leaves are "
                          "typically brighter.")
+    ap.add_argument("--canopy-fill-small-holes", action="store_true",
+                    help="After all canopy exclusions (sky, "
+                         "background depth, stakes), fill small "
+                         "interior holes in the canopy mask via "
+                         "flood-fill + size-filtered re-add. Makes "
+                         "the tree appear as a continuous silhouette "
+                         "instead of a constellation of leafy blobs "
+                         "separated by sky-gap holes that the "
+                         "exclusions correctly removed but which "
+                         "should be VISUALLY part of the tree mask.")
+    ap.add_argument("--canopy-max-hole-area-px", type=int, default=300,
+                    help="Maximum size of an interior hole that "
+                         "--canopy-fill-small-holes will fill. "
+                         "Larger holes (e.g., a stake or a wide "
+                         "background patch) are left empty so we "
+                         "don't undo those exclusions. Default 300.")
     ap.add_argument("--canopy-crop-below-trunk", action="store_true",
                     help="For each canopy CC that overlaps a SAM "
                          "trunk bbox, crop the CC at row "
@@ -5937,6 +6011,32 @@ def main():
                         print(
                             f"[warn] painted-stake exclusion "
                             f"failed ({_stake_err!r})",
+                            file=sys.stderr,
+                        )
+
+                # FILL SMALL CANOPY HOLES. After sky / bg-depth /
+                # stake exclusion the canopy is often a
+                # constellation of leafy blobs separated by tiny
+                # sky-gaps that were correctly removed but which
+                # belong to the tree's silhouette visually.
+                # Filling small holes restores connectivity through
+                # branches without re-adding large excluded regions
+                # (which stay as holes because they exceed the size
+                # cap).
+                if (args.canopy_fill_small_holes
+                        and canopy_mask_img is not None
+                        and canopy_mask_img.any()):
+                    try:
+                        canopy_mask_img = fill_small_canopy_holes(
+                            canopy_mask_img,
+                            max_hole_area_px=(
+                                args.canopy_max_hole_area_px
+                            ),
+                        )
+                    except Exception as _fill_err:
+                        print(
+                            f"[warn] canopy hole-fill failed "
+                            f"({_fill_err!r})",
                             file=sys.stderr,
                         )
 
