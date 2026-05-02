@@ -3137,6 +3137,9 @@ def build_canopy_from_sam_trees(
     min_valid_depth_frac: float = 0.30,
     rgb_arr: np.ndarray | None = None,
     rgb_fallback_min_vegetation_frac: float = 0.20,
+    max_top_row: int = 280,
+    min_aspect_ratio: float = 0.5,
+    max_depth_row_corr: float = 0.70,
 ) -> np.ndarray:
     """Build a canopy mask from SAM 3 tree segmentations.
 
@@ -3215,6 +3218,45 @@ def build_canopy_from_sam_trees(
         ys = np.where(ys_any)[0]
         if ys.size == 0 or int(ys.max()) < pos_threshold_y:
             continue
+        # Extends-up check: a TREE extends into the upper
+        # canopy band (top row <= max_top_row). A GROUND BAND
+        # in the middle of the frame stays in the lower
+        # portion (top row >> max_top_row). This is the
+        # primary discriminator for SAM detecting grass /
+        # ground as 'tree'.
+        if int(ys.min()) > max_top_row:
+            continue
+        # Aspect ratio: trees are not extremely wide. A wide
+        # horizontal grass band gets aspect h/w << 0.5.
+        xs_any = m.any(axis=0)
+        xs = np.where(xs_any)[0]
+        if xs.size == 0:
+            continue
+        bb_w = int(xs.max() - xs.min() + 1)
+        bb_h = int(ys.max() - ys.min() + 1)
+        if bb_w > 0 and (bb_h / float(bb_w)) < min_aspect_ratio:
+            continue
+        # Depth-row correlation: ground has monotonic depth
+        # increase with row (correlation ~ 1); a tree has
+        # similar depth top-to-bottom (correlation near 0).
+        # Reject masks with strong row-depth correlation.
+        if (max_depth_row_corr < 1.0
+                and depth_mm is not None
+                and valid_depth is not None):
+            ys_in, xs_in = np.where(m & valid_depth)
+            if ys_in.size >= 100:
+                ds_in = depth_mm[ys_in, xs_in].astype(np.float64)
+                yf = ys_in.astype(np.float64)
+                yf -= yf.mean()
+                df = ds_in - ds_in.mean()
+                denom = float(
+                    np.sqrt((yf * yf).sum())
+                    * np.sqrt((df * df).sum())
+                )
+                if denom > 0:
+                    corr = float((yf * df).sum() / denom)
+                    if abs(corr) > max_depth_row_corr:
+                        continue
         # Depth check with RGB fallback. Two-tier:
         #   1. If valid_depth_frac >= threshold, use median-depth
         #      check (the trustworthy path).
@@ -3806,6 +3848,27 @@ def main():
                          "FULL fallback when SAM is empty. Prevents "
                          "the heuristic from adding grass/ground "
                          "noise when SAM has a clean tree mask.")
+    ap.add_argument("--canopy-sam-max-top-row", type=int, default=280,
+                    help="A SAM tree mask must extend UPWARD into the "
+                         "upper canopy band (bbox top row <= this). "
+                         "Trees extend high; grass / ground bands in "
+                         "the middle of the frame stay below. PRIMARY "
+                         "discriminator against SAM segmenting grass "
+                         "as 'tree'. Default 280.")
+    ap.add_argument("--canopy-sam-min-aspect-ratio", type=float,
+                    default=0.5,
+                    help="Minimum bbox h/w ratio for a SAM tree mask. "
+                         "Default 0.5 admits full-canopy trees "
+                         "(aspect ~1) while rejecting horizontal "
+                         "grass bands (aspect << 0.5). 0 disables.")
+    ap.add_argument("--canopy-sam-max-depth-row-corr", type=float,
+                    default=0.70,
+                    help="Reject SAM tree masks whose depth correlates "
+                         "with row (depth-row correlation > this). "
+                         "Ground has monotonic depth increase with "
+                         "row (corr ~ 1); a tree's depth is roughly "
+                         "constant top-to-bottom (corr near 0). "
+                         "Default 0.70. Set 1.0 to disable.")
     ap.add_argument("--canopy-sam-min-score", type=float, default=0.15,
                     help="Minimum SAM 3 detection score for a tree "
                          "mask to be included in the canopy. Default "
@@ -5159,6 +5222,13 @@ def main():
                             rgb_arr=_rgb_for_sct,
                             rgb_fallback_min_vegetation_frac=(
                                 args.canopy_sam_rgb_fallback_min_veg_frac
+                            ),
+                            max_top_row=args.canopy_sam_max_top_row,
+                            min_aspect_ratio=(
+                                args.canopy_sam_min_aspect_ratio
+                            ),
+                            max_depth_row_corr=(
+                                args.canopy_sam_max_depth_row_corr
                             ),
                         )
                         if _u_p.any():

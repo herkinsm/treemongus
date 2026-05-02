@@ -93,6 +93,9 @@ echo "[batch] Using python: $PY"
   --canopy-sam-min-pixels 500 --canopy-sam-min-lower-frac 0.20 \
   --canopy-sam-min-valid-depth-frac 0.30 \
   --canopy-sam-rgb-fallback-min-veg-frac 0.20 \
+  --canopy-sam-max-top-row 280 \
+  --canopy-sam-min-aspect-ratio 0.5 \
+  --canopy-sam-max-depth-row-corr 0.70 \
   --canopy-sam-only \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \
