@@ -3001,14 +3001,14 @@ def augment_canopy_with_edge_trees(
     rgb_arr: np.ndarray | None,
     *,
     depth_min_mm: float = 600.0,
-    depth_max_mm: float = 2500.0,
-    min_area_px: int = 800,
+    depth_max_mm: float = 3000.0,
+    min_area_px: int = 400,
     edge_band_px: int = 20,
-    min_height_px: int = 150,
-    max_top_row: int = 200,
-    min_aspect_ratio: float = 1.5,
-    max_depth_std_mm: float = 800.0,
-    min_green_frac: float = 0.30,
+    min_height_px: int = 100,
+    max_top_row: int = 250,
+    min_aspect_ratio: float = 1.2,
+    max_depth_std_mm: float = 1500.0,
+    min_green_frac: float = 0.15,
 ) -> np.ndarray:
     """Add tree-shaped foreground-depth CCs touching the L/R
     frame edges to the canopy mask.
@@ -3120,6 +3120,104 @@ def augment_canopy_with_edge_trees(
     if not added:
         return canopy_mask
     return augmented
+
+
+def filter_canopy_by_tree_shape(
+    canopy_mask: np.ndarray,
+    depth_mm: np.ndarray,
+    rgb_arr: np.ndarray | None,
+    *,
+    min_aspect_ratio: float = 1.2,
+    max_depth_std_mm: float = 1500.0,
+    min_green_frac: float = 0.15,
+    min_area_px: int = 400,
+) -> np.ndarray:
+    """Post-process the canopy mask: remove connected components
+    that don't look like a tree.
+
+    Runs AFTER build_tree_mask + edge-tree augmentation. Catches
+    cases where build_tree_mask's central anchor pulled grass
+    into the canopy because grass extends up into the central
+    columns (camera tilt, orchard slope), or where edge
+    augmentation accidentally added a wide foreground-depth CC.
+
+    Tree-shape filters per CC (any failure -> remove that CC):
+      1. height / width >= min_aspect_ratio       (TALL & NARROW;
+                                                   rejects grass
+                                                   bands which are
+                                                   wide + short)
+      2. depth std < max_depth_std_mm             (depth-coherent;
+                                                   rejects ground
+                                                   gradient)
+      3. green-leaf fraction >= min_green_frac    (foliage-like;
+                                                   rejects fences
+                                                   / soil)
+      4. area >= min_area_px                      (size floor)
+    """
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return canopy_mask
+    if canopy_mask is None:
+        return canopy_mask
+    cm_bool = canopy_mask.astype(bool)
+    if not cm_bool.any():
+        return canopy_mask
+    cm_u8 = cm_bool.astype(np.uint8) * 255
+    n_cc, labels, stats, _ = _cv2.connectedComponentsWithStats(
+        cm_u8, connectivity=8,
+    )
+    if n_cc <= 1:
+        return canopy_mask
+    h, w = cm_bool.shape
+    green_pixel = None
+    if (rgb_arr is not None and rgb_arr.shape[:2] == (h, w)
+            and min_green_frac > 0):
+        try:
+            hsv = _cv2.cvtColor(
+                rgb_arr.astype(np.uint8), _cv2.COLOR_RGB2HSV,
+            )
+            H_c = hsv[:, :, 0]
+            S_c = hsv[:, :, 1]
+            V_c = hsv[:, :, 2]
+            green_pixel = (
+                (H_c >= 35) & (H_c <= 85)
+                & (S_c >= 40) & (V_c >= 35)
+            )
+        except Exception:
+            green_pixel = None
+    out = np.zeros_like(cm_bool)
+    depth_f = (
+        depth_mm.astype(np.float32) if depth_mm is not None else None
+    )
+    n_kept = 0
+    n_drop_aspect = 0
+    n_drop_depth = 0
+    n_drop_green = 0
+    n_drop_area = 0
+    for cc_id in range(1, n_cc):
+        x, y, ww, hh, area = stats[cc_id]
+        if area < min_area_px:
+            n_drop_area += 1
+            continue
+        if ww > 0 and (hh / float(ww)) < min_aspect_ratio:
+            n_drop_aspect += 1
+            continue
+        cc_pix = (labels == cc_id)
+        if depth_f is not None and max_depth_std_mm > 0:
+            cc_d = depth_f[cc_pix]
+            cc_d = cc_d[(cc_d > 0) & (cc_d < 60000)]
+            if cc_d.size >= 50 and float(cc_d.std()) > max_depth_std_mm:
+                n_drop_depth += 1
+                continue
+        if green_pixel is not None:
+            frac_g = float((cc_pix & green_pixel).sum()) / float(area)
+            if frac_g < min_green_frac:
+                n_drop_green += 1
+                continue
+        out |= cc_pix
+        n_kept += 1
+    return out
 
 
 def canopy_component_depth_medians(
@@ -3523,11 +3621,52 @@ def main():
                          "vegetation; ground / fence / building edges "
                          "are not. Default 0.30. Set 0 to disable.")
     ap.add_argument("--canopy-edge-tree-max-depth-mm", type=float,
-                    default=2500.0,
+                    default=3000.0,
                     help="Maximum depth (mm) for the foreground-depth "
                          "band used by edge-tree augmentation. Tighter "
-                         "than the global --depth-max-mm; default 2500 "
+                         "than the global --depth-max-mm; default 3000 "
                          "mm so far-row trees aren't pulled in.")
+    # Post-processing tree-shape filter. Runs on the FINAL canopy
+    # mask (after build_tree_mask + edge augmentation + dilation)
+    # and removes any CC that doesn't look like a tree. This is
+    # the SECOND LINE OF DEFENSE: build_tree_mask's central anchor
+    # can pull grass into the canopy when the orchard floor
+    # extends up into cols 285-354, and the per-CC tree-shape
+    # filter rejects those wide+short bands.
+    ap.add_argument("--canopy-filter-by-tree-shape", action="store_true",
+                    help="After all canopy mask construction, run a "
+                         "per-CC filter that drops CCs not shaped "
+                         "like a tree (wide-and-short = ground; "
+                         "depth-incoherent = ground; not green = "
+                         "fence/soil). Critical safety net for cases "
+                         "where build_tree_mask's central anchor or "
+                         "edge augmentation accidentally pulled non-"
+                         "tree CCs into the canopy mask.")
+    ap.add_argument("--canopy-filter-min-aspect-ratio", type=float,
+                    default=1.2,
+                    help="Minimum bbox HEIGHT / WIDTH for a canopy CC "
+                         "to survive the post-processing filter. "
+                         "Default 1.2 (modestly tall). Trees easily "
+                         "pass this; horizontal grass bands fail.")
+    ap.add_argument("--canopy-filter-max-depth-std-mm", type=float,
+                    default=1500.0,
+                    help="Maximum depth std (mm) within a canopy CC "
+                         "for it to survive the post-processing "
+                         "filter. Default 1500 mm. Trees have depth "
+                         "consistent within +/- 750 mm; ground has a "
+                         "depth gradient often exceeding this.")
+    ap.add_argument("--canopy-filter-min-green-frac", type=float,
+                    default=0.15,
+                    help="Minimum leaf-green fraction within a canopy "
+                         "CC for it to survive the post-processing "
+                         "filter. Default 0.15 (lenient -- pink "
+                         "blossoms reduce green frac, but real trees "
+                         "still have substantial green leaves).")
+    ap.add_argument("--canopy-filter-min-area-px", type=int,
+                    default=400,
+                    help="Minimum area for a canopy CC to survive "
+                         "the post-processing filter. Default 400. "
+                         "Small specks have unreliable shape stats.")
     ap.add_argument("--flower-max-behind-foreground-mm",
                     type=float, default=0.0,
                     help="After flowers are assigned to canopy "
@@ -4848,6 +4987,45 @@ def main():
                                 f"[warn] edge-tree canopy augmentation "
                                 f"failed ({_edge_err!r}); using "
                                 f"unaugmented mask",
+                                file=sys.stderr,
+                            )
+
+                    # Post-processing tree-shape filter. Runs on the
+                    # FINAL canopy mask (after build_tree_mask, after
+                    # external dilation, after edge augmentation) to
+                    # remove non-tree-shaped CCs. Catches grass bands
+                    # that build_tree_mask pulled in via central
+                    # anchoring (because the orchard floor extended
+                    # up into cols 285-354) and any wide foreground-
+                    # depth CC that snuck through. The aspect-ratio
+                    # check is the workhorse here -- a tree is
+                    # tall+narrow, grass is wide+short.
+                    if (args.canopy_filter_by_tree_shape
+                            and canopy_mask_img is not None):
+                        try:
+                            _rgb_filt = np.asarray(img)
+                            canopy_mask_img = filter_canopy_by_tree_shape(
+                                canopy_mask_img,
+                                depth_mm,
+                                _rgb_filt,
+                                min_aspect_ratio=(
+                                    args.canopy_filter_min_aspect_ratio
+                                ),
+                                max_depth_std_mm=(
+                                    args.canopy_filter_max_depth_std_mm
+                                ),
+                                min_green_frac=(
+                                    args.canopy_filter_min_green_frac
+                                ),
+                                min_area_px=(
+                                    args.canopy_filter_min_area_px
+                                ),
+                            )
+                        except Exception as _filt_err:
+                            print(
+                                f"[warn] tree-shape canopy filter "
+                                f"failed ({_filt_err!r}); using "
+                                f"unfiltered mask",
                                 file=sys.stderr,
                             )
 
