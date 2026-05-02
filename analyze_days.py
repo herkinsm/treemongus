@@ -2316,6 +2316,10 @@ def flower_quality_keep(masks_np: np.ndarray,
                          green_h_lo: int = 35, green_h_hi: int = 85,
                          green_s_min: int = 40, green_v_min: int = 35,
                          green_blossom_override_frac: float = 0.20,
+                         min_peaks_per_1000px: float = 0.0,
+                         peak_min_distance_px: int = 5,
+                         peak_threshold_abs: int = 80,
+                         peak_min_area_px: int = 60,
                          ) -> tuple[np.ndarray, dict, list[int]]:
     """Boolean keep-array + per-rejection diagnostics + per-mask area, mirroring
     the gates in sprayer_pipeline/flower_detector.py:
@@ -2334,7 +2338,7 @@ def flower_quality_keep(masks_np: np.ndarray,
             "edge_margin": 0, "circularity": 0, "solidity": 0,
             "yellow_color": 0, "non_blossom_color": 0,
             "max_bbox_area": 0, "low_density": 0,
-            "leaf_green": 0}
+            "leaf_green": 0, "low_peak_density": 0}
     areas: list[int] = []
 
     # Pre-compute the "could be apple blossom" pixel mask once per frame
@@ -2369,6 +2373,30 @@ def flower_quality_keep(masks_np: np.ndarray,
                 (H_ch >= green_h_lo) & (H_ch <= green_h_hi)
                 & (S_ch >= green_s_min) & (V_ch >= green_v_min)
             )
+
+    # Bright local-peak map for the flower-vs-leaf texture
+    # discriminator. Each apple blossom is a bright petal with a
+    # darker anther center, so a flower cluster has multiple V-
+    # channel local maxima at small scale; a leaf is mostly
+    # uniform with at most a few specular highlights. We
+    # precompute the global peak map ONCE per frame (rather than
+    # per-mask) and just count peaks-inside-mask in the loop.
+    peak_pixel_mask = None
+    if min_peaks_per_1000px > 0 and rgb_arr is not None:
+        try:
+            import cv2
+            from scipy.ndimage import maximum_filter
+            hsv_p = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2HSV)
+            V_p = hsv_p[..., 2].astype(np.float32)
+            V_blur = cv2.GaussianBlur(V_p, (3, 3), 0.8)
+            mf_size = 2 * max(1, int(peak_min_distance_px)) + 1
+            V_max = maximum_filter(V_blur, size=mf_size, mode="nearest")
+            peak_pixel_mask = (
+                (V_blur == V_max) & (V_blur >= float(peak_threshold_abs))
+            )
+        except Exception:
+            peak_pixel_mask = None
+
     for i, m in enumerate(masks_np):
         circ, sol, area, bx, by, bw, bh, cy = _mask_shape_stats(m)
         areas.append(area)
@@ -2470,6 +2498,24 @@ def flower_quality_keep(masks_np: np.ndarray,
                         and frac_blossom < green_blossom_override_frac):
                     keep[i] = False
                     diag["leaf_green"] += 1
+                    continue
+        # Bright-peak density gate. Apple blossoms have local V
+        # maxima at petal scale; leaves don't (uniform brightness
+        # with at most a few specular highlights). Reject masks
+        # with too few peaks per 1000 px of mask area. Skipped
+        # below peak_min_area_px (small masks naturally have 0-1
+        # peaks just due to size and shouldn't be judged).
+        if min_peaks_per_1000px > 0 and peak_pixel_mask is not None:
+            mb = np.asarray(m).astype(bool)
+            if mb.ndim == 3:
+                mb = mb.any(axis=0)
+            mb_area = int(mb.sum())
+            if mb_area >= peak_min_area_px:
+                n_peaks = int((mb & peak_pixel_mask).sum())
+                density = (n_peaks * 1000.0) / float(mb_area)
+                if density < min_peaks_per_1000px:
+                    keep[i] = False
+                    diag["low_peak_density"] += 1
                     continue
     return keep, diag, areas
 
@@ -3907,6 +3953,43 @@ def main():
                          "a small white-from-sky fraction -- the "
                          "override doesn't fire and the cap rejects "
                          "it. Default 0.20 (20%%).")
+    # Bright-peak density texture discriminator. Apple blossoms have
+    # local V-channel maxima at petal scale (each blossom = a bright
+    # petal with a darker anther center => one peak); leaves are
+    # mostly uniform with at most 1-2 specular highlights. Counting
+    # peaks per 1000 px of mask discriminates flower clusters from
+    # leaf masks even when both have similar overall brightness.
+    ap.add_argument("--flower-min-peaks-per-1000px", type=float,
+                    default=0.0,
+                    help="Reject any flower mask with fewer than this "
+                         "many local brightness peaks per 1000 px of "
+                         "mask area. Apple blossoms register as bright "
+                         "V-channel local maxima at petal scale; "
+                         "leaves do not. Default 0.0 = disabled. Try "
+                         "3.0 (= ~3 peaks per 1000 px, or one per "
+                         "single ~330 px blossom). Skipped on small "
+                         "masks below --flower-peak-min-area-px.")
+    ap.add_argument("--flower-peak-min-distance-px", type=int,
+                    default=5,
+                    help="Minimum spacing (in px) between counted "
+                         "brightness peaks. Effective neighborhood = "
+                         "(2*N+1)x(2*N+1). Default 5 -> 11x11 window. "
+                         "Set to roughly half a typical blossom "
+                         "diameter so two peaks inside one blossom "
+                         "collapse to one.")
+    ap.add_argument("--flower-peak-threshold-abs", type=int,
+                    default=80,
+                    help="Minimum V (HSV brightness, 0-255) for a "
+                         "pixel to count as a candidate peak. Default "
+                         "80 admits dimly-lit blossoms while excluding "
+                         "shadow-noise local maxima.")
+    ap.add_argument("--flower-peak-min-area-px", type=int,
+                    default=60,
+                    help="Skip the --flower-min-peaks-per-1000px gate "
+                         "for masks smaller than this (in px). Tiny "
+                         "masks naturally have 0 or 1 peaks due to "
+                         "size alone; the gate would be unfair. "
+                         "Default 60 px.")
     # Multi-prompt union for flowers — run multiple flower-related prompts
     # and NMS-merge their detections under a single canonical 'flower' label.
     # Trades cost for recall: each prompt catches blossoms the others miss.
@@ -5934,6 +6017,18 @@ def main():
                             green_v_min=args.flower_green_val_min,
                             green_blossom_override_frac=(
                                 args.flower_green_blossom_override_frac
+                            ),
+                            min_peaks_per_1000px=(
+                                args.flower_min_peaks_per_1000px
+                            ),
+                            peak_min_distance_px=(
+                                args.flower_peak_min_distance_px
+                            ),
+                            peak_threshold_abs=(
+                                args.flower_peak_threshold_abs
+                            ),
+                            peak_min_area_px=(
+                                args.flower_peak_min_area_px
                             ),
                         )
                         # Roll up rejections per (session, prompt).
