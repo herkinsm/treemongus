@@ -3001,28 +3001,45 @@ def augment_canopy_with_edge_trees(
     rgb_arr: np.ndarray | None,
     *,
     depth_min_mm: float = 600.0,
-    depth_max_mm: float = 3000.0,
-    min_area_px: int = 500,
+    depth_max_mm: float = 2500.0,
+    min_area_px: int = 800,
     edge_band_px: int = 20,
-    min_height_px: int = 100,
+    min_height_px: int = 150,
     max_top_row: int = 200,
+    min_aspect_ratio: float = 1.5,
+    max_depth_std_mm: float = 800.0,
+    min_green_frac: float = 0.30,
 ) -> np.ndarray:
-    """Add foreground-depth components touching the left/right
+    """Add tree-shaped foreground-depth CCs touching the L/R
     frame edges to the canopy mask.
 
-    build_tree_mask uses a center-anchored algorithm that rejects
-    components outside ``center_depth +/- DEPTH_BAND_HALF_MM``.
-    With multiple trees at different depths in frame, the median
-    falls between them and BOTH get cut. Half-trees at the frame
-    edges then disappear from the canopy mask, which makes
-    --flower-require-tree-in-frame zero out every flower in the
-    frame even though there is clearly a foreground tree.
+    The sprayer pipeline's build_tree_mask anchors only on the
+    center column band (285-354), so half-trees at the L/R frame
+    edges are not in its result. This wrapper recovers them but
+    is RESTRICTIVE -- only CCs that look like trees (tall +
+    narrow + depth-coherent + green) get added. Without these
+    shape filters, large grass regions or tree-and-grass merged
+    CCs would also pass and contaminate the canopy mask with
+    ground pixels.
 
-    This wrapper bypasses that depth-band logic for components
-    that touch the frame edge, since those are by construction
-    half-trees with their canopy partly outside the field of view.
-    They get added back to the canopy mask if they are large
-    enough and have valid foreground depth.
+    Shape filter chain:
+      1. Touches L or R edge within edge_band_px         (geometry)
+      2. area >= min_area_px                              (size floor)
+      3. bbox height >= min_height_px                     (vertical extent)
+      4. bbox top <= max_top_row                          (extends up)
+      5. height/width >= min_aspect_ratio                 (TALL & NARROW
+                                                           -- rejects grass
+                                                           which is wide+short)
+      6. depth std < max_depth_std_mm                     (depth-coherent
+                                                           -- a tree has
+                                                           similar depth
+                                                           top to bottom;
+                                                           grass has a
+                                                           ground-depth
+                                                           gradient)
+      7. green-leaf pixel frac >= min_green_frac          (foliage-like
+                                                           -- rejects
+                                                           non-vegetation)
     """
     try:
         import cv2 as _cv2
@@ -3031,10 +3048,13 @@ def augment_canopy_with_edge_trees(
     if canopy_mask is None or depth_mm is None:
         return canopy_mask
     h, w = depth_mm.shape
+    depth_f = depth_mm.astype(np.float32)
     fg = (
-        (depth_mm.astype(np.float32) >= float(depth_min_mm))
-        & (depth_mm.astype(np.float32) <= float(depth_max_mm))
+        (depth_f >= float(depth_min_mm))
+        & (depth_f <= float(depth_max_mm))
     )
+    H_c = S_c = V_c = None
+    green_pixel = None
     if rgb_arr is not None and rgb_arr.shape[:2] == (h, w):
         try:
             hsv = _cv2.cvtColor(
@@ -3044,6 +3064,11 @@ def augment_canopy_with_edge_trees(
             sky_blue = (H_c >= 85) & (H_c <= 145) & (S_c > 8)
             sky_bright = (V_c > 185) & (S_c < 15)
             fg = fg & ~(sky_blue | sky_bright)
+            # Leaf-green pixel mask for the foliage check.
+            green_pixel = (
+                (H_c >= 35) & (H_c <= 85)
+                & (S_c >= 40) & (V_c >= 35)
+            )
         except Exception:
             pass
     fg_u8 = fg.astype(np.uint8) * 255
@@ -3056,22 +3081,42 @@ def augment_canopy_with_edge_trees(
     added = False
     for cc_id in range(1, n_cc):
         x, y, ww, hh, area = stats[cc_id]
+        # 2. size
         if area < min_area_px:
             continue
-        # Tree-shape filter: trees are TALL (height >= min_height_px)
-        # and extend into the upper rows of the frame (bbox top
-        # <= max_top_row). Grass that touches the frame edges is
-        # short and confined to the lower rows, so this filter
-        # rejects the grass CC even though it has foreground
-        # depth and touches the L/R edges.
+        # 3. height
         if hh < min_height_px:
             continue
+        # 4. top extends up
         if y > max_top_row:
             continue
+        # 5. aspect ratio (tall + narrow)
+        if ww > 0 and (hh / float(ww)) < min_aspect_ratio:
+            continue
+        # 1. edge contact
         x_max = x + ww - 1
-        if x <= edge_band_px or x_max >= w - 1 - edge_band_px:
-            augmented |= (labels == cc_id)
-            added = True
+        touches_edge = (
+            x <= edge_band_px or x_max >= w - 1 - edge_band_px
+        )
+        if not touches_edge:
+            continue
+        # CC mask for the remaining checks.
+        cc_pix = (labels == cc_id)
+        # 6. depth coherence
+        cc_d = depth_f[cc_pix]
+        cc_d = cc_d[(cc_d >= float(depth_min_mm))
+                    & (cc_d <= float(depth_max_mm))]
+        if cc_d.size >= 50:
+            if float(cc_d.std()) > float(max_depth_std_mm):
+                continue
+        # 7. green foliage frac
+        if min_green_frac > 0 and green_pixel is not None:
+            green_in_cc = float((cc_pix & green_pixel).sum())
+            frac_g = green_in_cc / float(area)
+            if frac_g < min_green_frac:
+                continue
+        augmented |= cc_pix
+        added = True
     if not added:
         return canopy_mask
     return augmented
@@ -3438,26 +3483,51 @@ def main():
                          "this gate exempts them from the global "
                          "depth-band check.")
     ap.add_argument("--canopy-edge-tree-min-area-px", type=int,
-                    default=500,
+                    default=800,
                     help="Minimum area for an edge-touching CC to be "
                          "added as canopy by --canopy-include-edge-"
-                         "trees. Default 500 px filters small noise.")
+                         "trees. Default 800 px filters small noise.")
     ap.add_argument("--canopy-edge-tree-min-height-px", type=int,
-                    default=100,
+                    default=150,
                     help="Minimum bbox HEIGHT for an edge-touching CC "
-                         "to be added as canopy by --canopy-include-"
-                         "edge-trees. Trees are tall; grass that "
-                         "touches the L/R edges is short and stays "
-                         "in the lower frame. Default 100 px filters "
-                         "out grass strips.")
+                         "to be added as canopy. Trees are tall. "
+                         "Default 150 px (~ 1/3 of a 480-row frame).")
     ap.add_argument("--canopy-edge-tree-max-top-row", type=int,
                     default=200,
                     help="Maximum bbox TOP ROW for an edge-touching CC "
-                         "to be added as canopy by --canopy-include-"
-                         "edge-trees. Tree CCs extend into the upper "
-                         "frame; grass CCs are confined to the lower "
-                         "rows so their bbox top is well below 200. "
-                         "Default 200 (= upper 42%% of a 480-row frame).")
+                         "to be added as canopy. Tree CCs extend into "
+                         "the upper frame. Default 200.")
+    ap.add_argument("--canopy-edge-tree-min-aspect-ratio", type=float,
+                    default=1.5,
+                    help="Minimum bbox HEIGHT / WIDTH ratio for an "
+                         "edge-touching CC to be added as canopy. "
+                         "Trees are tall + narrow; grass is wide + "
+                         "short. Default 1.5 = height must be at least "
+                         "1.5x width. THIS IS THE KEY FILTER for "
+                         "rejecting grass CCs that touch the frame "
+                         "edges -- without it, a 600x250 grass region "
+                         "passes the height + top-row checks.")
+    ap.add_argument("--canopy-edge-tree-max-depth-std-mm", type=float,
+                    default=800.0,
+                    help="Maximum depth standard deviation (mm) within "
+                         "an edge-touching CC for it to be added as "
+                         "canopy. A tree silhouette has similar depth "
+                         "from top to bottom (low std); grass has a "
+                         "ground-plane depth gradient (high std). "
+                         "Default 800 mm.")
+    ap.add_argument("--canopy-edge-tree-min-green-frac", type=float,
+                    default=0.30,
+                    help="Minimum fraction of CC pixels that must be "
+                         "leaf-green (HSV H 35-85, S>=40, V>=35) for "
+                         "the CC to be added as canopy. Trees are "
+                         "vegetation; ground / fence / building edges "
+                         "are not. Default 0.30. Set 0 to disable.")
+    ap.add_argument("--canopy-edge-tree-max-depth-mm", type=float,
+                    default=2500.0,
+                    help="Maximum depth (mm) for the foreground-depth "
+                         "band used by edge-tree augmentation. Tighter "
+                         "than the global --depth-max-mm; default 2500 "
+                         "mm so far-row trees aren't pulled in.")
     ap.add_argument("--flower-max-behind-foreground-mm",
                     type=float, default=0.0,
                     help="After flowers are assigned to canopy "
@@ -4666,15 +4736,26 @@ def main():
                         try:
                             from tree_mask import build_tree_mask as _btm
                             _rgb_for_canopy = np.asarray(img)
-                            # Pass full-frame columns as roi_cols so
-                            # the function detects ANY tree, not just
-                            # one anchored at the sprayer pipeline's
-                            # default ROI columns.
+                            # Use the sprayer pipeline's DEFAULT center-
+                            # column ROI (cols 285-354) for primary
+                            # anchoring. This is critical: the algorithm
+                            # computes center_depth from anchored-region
+                            # pixels, then enforces a +/-500 mm band
+                            # around that depth. Anchoring on the full
+                            # frame width pulled in grass + sky pixels,
+                            # which then biased center_depth and let
+                            # the band include grass and dilation-leak
+                            # into sky. With the tight default anchor
+                            # the sprayer pipeline's logic locks onto
+                            # the actual target tree's depth.
+                            #
+                            # Trees at the L/R frame edges that aren't
+                            # in the center ROI are recovered by the
+                            # SEPARATE tree-shape augmentation below.
                             _h, _w = depth_mm.shape
                             _btm_u8 = _btm(
                                 depth_mm.astype(np.uint16),
                                 rgb=_rgb_for_canopy,
-                                roi_cols=(0, _w - 1),
                             )
                             canopy_mask_img = _btm_u8.astype(bool)
                         except Exception as _btm_err:
@@ -4742,10 +4823,25 @@ def main():
                                 depth_mm,
                                 _rgb_aug,
                                 depth_min_mm=args.depth_min_mm,
-                                depth_max_mm=args.depth_max_mm,
+                                depth_max_mm=(
+                                    args.canopy_edge_tree_max_depth_mm
+                                ),
                                 min_area_px=args.canopy_edge_tree_min_area_px,
-                                min_height_px=args.canopy_edge_tree_min_height_px,
-                                max_top_row=args.canopy_edge_tree_max_top_row,
+                                min_height_px=(
+                                    args.canopy_edge_tree_min_height_px
+                                ),
+                                max_top_row=(
+                                    args.canopy_edge_tree_max_top_row
+                                ),
+                                min_aspect_ratio=(
+                                    args.canopy_edge_tree_min_aspect_ratio
+                                ),
+                                max_depth_std_mm=(
+                                    args.canopy_edge_tree_max_depth_std_mm
+                                ),
+                                min_green_frac=(
+                                    args.canopy_edge_tree_min_green_frac
+                                ),
                             )
                         except Exception as _edge_err:
                             print(
