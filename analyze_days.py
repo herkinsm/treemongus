@@ -3493,6 +3493,85 @@ def fill_small_canopy_holes(
     return out
 
 
+def crop_canopy_ground_gradient(
+    canopy_mask: np.ndarray,
+    depth_mm: np.ndarray | None,
+    *,
+    bottom_frac: float = 0.30,
+    max_corr: float = 0.70,
+    min_pixels: int = 100,
+) -> np.ndarray:
+    """Crop the bottom of any canopy CC whose lower portion has
+    a ground-like depth-row correlation.
+
+    Ground depth increases monotonically with row (camera angled
+    down at field) -> Pearson correlation ~ 1. A tree's depth is
+    roughly constant top-to-bottom -> correlation near 0. We
+    examine each CC's BOTTOM bottom_frac fraction of its rows
+    independently; if THAT subregion shows a strong row-depth
+    correlation, those rows are ground that the SAM/heuristic
+    mask incorrectly extended into and we crop them out.
+
+    The whole-CC depth-row correlation already runs on SAM
+    masks at detection time, but it can't catch the case where
+    a real tree mask extends DOWN into ground -- the upper
+    tree dominates the whole-CC correlation. This per-CC
+    bottom-only check is targeted at exactly that case.
+    """
+    if canopy_mask is None or depth_mm is None:
+        return canopy_mask
+    cm = canopy_mask.astype(bool)
+    if not cm.any():
+        return cm
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return cm
+    h, w = cm.shape
+    cm_u8 = cm.astype(np.uint8) * 255
+    n_cc, labels, stats, _ = _cv2.connectedComponentsWithStats(
+        cm_u8, connectivity=8,
+    )
+    if n_cc <= 1:
+        return cm
+    valid = (depth_mm > 0) & (depth_mm < 60000)
+    out = cm.copy()
+    for cc_id in range(1, n_cc):
+        x = int(stats[cc_id, _cv2.CC_STAT_LEFT])
+        y = int(stats[cc_id, _cv2.CC_STAT_TOP])
+        h_cc = int(stats[cc_id, _cv2.CC_STAT_HEIGHT])
+        area = int(stats[cc_id, _cv2.CC_STAT_AREA])
+        if area < min_pixels or h_cc < 5:
+            continue
+        bottom_h = max(1, int(round(h_cc * bottom_frac)))
+        bottom_y_start = y + h_cc - bottom_h
+        bottom_y_end = y + h_cc
+        cc_pix = (labels == cc_id)
+        bottom_region = np.zeros_like(cc_pix)
+        bottom_region[bottom_y_start:bottom_y_end, :] = True
+        bottom_pix = cc_pix & bottom_region & valid
+        ys, xs = np.where(bottom_pix)
+        if ys.size < min_pixels:
+            continue
+        ds = depth_mm[ys, xs].astype(np.float64)
+        yf = ys.astype(np.float64)
+        yf -= yf.mean()
+        df = ds - ds.mean()
+        denom = float(
+            np.sqrt((yf * yf).sum())
+            * np.sqrt((df * df).sum())
+        )
+        if denom < 1e-6:
+            continue
+        corr = float((yf * df).sum() / denom)
+        if abs(corr) > max_corr:
+            # Crop the bottom rows of this CC.
+            crop_zone = np.zeros_like(cc_pix)
+            crop_zone[bottom_y_start:bottom_y_end, :] = True
+            out[cc_pix & crop_zone] = False
+    return out
+
+
 def crop_canopy_below_trunks(
     canopy_mask: np.ndarray,
     trunk_boxes: list,
@@ -3678,17 +3757,27 @@ def refine_canopy_mask(
     # tree's outer edges often stick out PAST the SAM/heuristic
     # mask -- they're thin so SAM doesn't fully segment them and
     # the D455 returns no depth on them either. We catch them by
-    # dilating the canopy mask in ALL directions by N pixels and
-    # admitting pixels that are NOT sky AND have valid foreground
-    # depth OR no depth return (the typical thin-branch case).
-    # Sky pixels are still excluded so the dilation doesn't
-    # bleed into the actual sky.
+    # dilating the canopy mask UPWARD and SIDEWAYS (NOT downward,
+    # which would pull in ground) and admitting pixels that are
+    # NOT sky AND have valid foreground depth OR no depth return
+    # (the typical thin-branch case). Sky pixels are still
+    # excluded so the dilation doesn't bleed into actual sky.
+    #
+    # Directional kernel: an ellipse with the UPPER half zeroed
+    # out (kernel rows < center). In cv2.dilate semantics, kernel
+    # elements BELOW center (rows > kc) are what cause the canopy
+    # to grow UPWARD (each input pixel contributes to outputs at
+    # smaller row indices). Center row + lower half = grow up
+    # and sideways. Upper half zeroed = no downward growth.
     if outward_dilate_px > 0:
+        _ksize = 2 * int(outward_dilate_px) + 1
         kern_o = _cv2.getStructuringElement(
-            _cv2.MORPH_ELLIPSE,
-            (2 * int(outward_dilate_px) + 1,
-             2 * int(outward_dilate_px) + 1),
+            _cv2.MORPH_ELLIPSE, (_ksize, _ksize),
         )
+        kc = int(outward_dilate_px)
+        # Zero the rows ABOVE kernel center -> output canopy will
+        # NOT grow downward.
+        kern_o[:kc, :] = 0
         dilated = _cv2.dilate(
             cm.astype(np.uint8), kern_o, iterations=1,
         ) > 0
@@ -4672,8 +4761,38 @@ def main():
                          "removed. Catches the case where the SAM "
                          "or heuristic mask extends down into the "
                          "ground/grass at the bottom of the frame. "
-                         "Default 0 = disabled. Try 420 (= last "
-                         "12.5%% of a 480-row frame).")
+                         "Default 0 = disabled. Try 400 (= last "
+                         "17%% of a 480-row frame).")
+    # Step 1: Selective bg-depth re-exclusion AFTER hole-fill.
+    ap.add_argument("--canopy-post-fill-bg-depth-mm",
+                    type=float, default=0.0,
+                    help="After hole-fill, drop canopy pixels whose "
+                         "VALID depth exceeds this threshold "
+                         "(distant background). Higher than --depth-"
+                         "max-mm to give a cushion for near-foreground "
+                         "leaves with jittery depth. depth=0 (no-"
+                         "return) pixels are kept (thin foliage). "
+                         "Default 0 = disabled. Try 3500.")
+    # Step 3: Per-CC ground-gradient detector.
+    ap.add_argument("--canopy-crop-ground-gradient", action="store_true",
+                    help="For each canopy CC, examine the bottom "
+                         "fraction of its rows for a ground-like "
+                         "depth-row correlation. Crop those rows if "
+                         "correlation exceeds the threshold. Catches "
+                         "the case where a real tree's CC extends "
+                         "DOWN into ground -- the upper tree dominates "
+                         "any whole-CC correlation, but the bottom-only "
+                         "check sees the ground gradient.")
+    ap.add_argument("--canopy-ground-gradient-bottom-frac",
+                    type=float, default=0.30,
+                    help="Examine this fraction of each CC's rows "
+                         "(measured from the bottom up). Default 0.30.")
+    ap.add_argument("--canopy-ground-gradient-max-corr",
+                    type=float, default=0.70,
+                    help="Crop the bottom rows when |Pearson "
+                         "depth-row correlation| > this. Ground has "
+                         "near-1 correlation; trees near 0. Default "
+                         "0.70.")
     ap.add_argument("--canopy-trunk-memory-frames", type=int,
                     default=0,
                     help="Carry trunks forward across frames. When "
@@ -6388,17 +6507,63 @@ def main():
                         except Exception:
                             pass
 
-                    # NOTE: bg-depth re-exclusion intentionally
-                    # SKIPPED here. The D455 returns invalid or
-                    # far-bg depth on thin foliage (laser passes
-                    # through the leaf to the background), so a
-                    # real leaf pixel may have depth > 3000 mm in
-                    # the depth map. Re-excluding by bg-depth
-                    # would remove those legitimate leaf pixels
-                    # that the hole-fill correctly brought back.
-                    # Stake re-exclusion above is fine because
-                    # stakes have a unique HSV signature (sat dark
-                    # green) that doesn't conflict with leaves.
+                    # SELECTIVE BG-DEPTH RE-EXCLUSION. Pixels with
+                    # VALID DEPTH > post_fill_bg_depth_mm are
+                    # background (distant grass / fence / building
+                    # / distant trees) -- there's no way a SAM-
+                    # segmented "tree" pixel should genuinely have
+                    # valid depth at 4+ meters. Pixels with depth=0
+                    # (no return; thin foliage / sky) are KEPT --
+                    # the laser-through-leaf case where depth is
+                    # invalid is exactly what we want to preserve.
+                    # The threshold is HIGHER than --depth-max-mm
+                    # (default 3000) to give a 500 mm cushion for
+                    # near-foreground leaves with jittery depth at
+                    # the boundary; pure background is well past
+                    # this threshold so they still get cut.
+                    if (args.canopy_post_fill_bg_depth_mm > 0
+                            and canopy_mask_img is not None
+                            and depth_mm is not None
+                            and canopy_mask_img.any()):
+                        try:
+                            _bg2 = (
+                                depth_mm.astype(np.float32)
+                                > float(args.canopy_post_fill_bg_depth_mm)
+                            )
+                            canopy_mask_img = (
+                                canopy_mask_img.astype(bool) & ~_bg2
+                            )
+                        except Exception:
+                            pass
+
+                    # PER-CC GROUND-GRADIENT CROP. For each CC,
+                    # examine the bottom fraction of rows. If
+                    # depth correlates strongly with row in that
+                    # subregion, crop those rows -- it's ground
+                    # the canopy mask incorrectly extended into.
+                    if (args.canopy_crop_ground_gradient
+                            and canopy_mask_img is not None
+                            and depth_mm is not None
+                            and canopy_mask_img.any()):
+                        try:
+                            canopy_mask_img = (
+                                crop_canopy_ground_gradient(
+                                    canopy_mask_img,
+                                    depth_mm,
+                                    bottom_frac=(
+                                        args.canopy_ground_gradient_bottom_frac
+                                    ),
+                                    max_corr=(
+                                        args.canopy_ground_gradient_max_corr
+                                    ),
+                                )
+                            )
+                        except Exception as _gg_err:
+                            print(
+                                f"[warn] ground-gradient crop "
+                                f"failed ({_gg_err!r})",
+                                file=sys.stderr,
+                            )
 
                 # HARD BOTTOM-ROW CROP. Any canopy pixels below
                 # this row are clipped. Catches the case where
