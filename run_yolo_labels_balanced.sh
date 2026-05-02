@@ -105,6 +105,8 @@ echo "[batch] Using python: $PY"
   --canopy-filter-min-green-frac 0.0 \
   --canopy-filter-min-area-px 400 \
   --canopy-filter-max-top-row 300 \
+  --canopy-add-trunk-masks \
+  --canopy-crop-below-trunk --canopy-crop-below-trunk-buffer-px 30 \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \
   --canopy-edge-tree-min-aspect-ratio 0.8 \

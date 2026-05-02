@@ -3430,6 +3430,76 @@ def build_canopy_from_sam_trees(
     return canopy
 
 
+def crop_canopy_below_trunks(
+    canopy_mask: np.ndarray,
+    trunk_boxes: list,
+    *,
+    buffer_below_px: int = 30,
+) -> np.ndarray:
+    """Crop each canopy CC at the bottom of its trunk(s).
+
+    A SAM tree mask often extends below the actual tree into
+    the GROUND, especially when foreground depth at the grass
+    is similar to the tree's depth. The trunk's bbox bottom
+    marks where the trunk meets the ground, so anything in
+    the same canopy CC below trunk_y2 + buffer is ground and
+    should be removed.
+
+    Implementation:
+      1. CC-label the canopy mask.
+      2. For each CC, find every trunk bbox whose interior
+         contains at least one canopy-mask pixel of that CC.
+      3. Cut the CC at row max(trunk_y2 for those trunks) +
+         buffer_below_px. Pixels of this CC below that row
+         are removed.
+
+    CCs that don't overlap any trunk bbox are left alone.
+    Buffer accounts for low-hanging branches just below the
+    trunk bbox bottom.
+    """
+    if not trunk_boxes:
+        return canopy_mask
+    if canopy_mask is None:
+        return canopy_mask
+    cm = canopy_mask.astype(bool).copy()
+    if not cm.any():
+        return cm
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return cm
+    h, w = cm.shape
+    cm_u8 = cm.astype(np.uint8) * 255
+    n_cc, labels, _stats, _ = _cv2.connectedComponentsWithStats(
+        cm_u8, connectivity=8,
+    )
+    if n_cc <= 1:
+        return cm
+    out = cm.copy()
+    for cc_id in range(1, n_cc):
+        cc_pix = (labels == cc_id)
+        if not cc_pix.any():
+            continue
+        cc_trunk_y2: list[int] = []
+        for tb in trunk_boxes:
+            x1 = max(0, int(round(float(tb[0]))))
+            y1 = max(0, int(round(float(tb[1]))))
+            x2 = min(w - 1, int(round(float(tb[2]))))
+            y2 = min(h - 1, int(round(float(tb[3]))))
+            if x2 < x1 or y2 < y1:
+                continue
+            if cc_pix[y1:y2 + 1, x1:x2 + 1].any():
+                cc_trunk_y2.append(y2)
+        if not cc_trunk_y2:
+            continue
+        cut_row = max(cc_trunk_y2) + int(buffer_below_px)
+        if cut_row < h - 1:
+            below = np.zeros_like(out)
+            below[cut_row + 1:, :] = True
+            out[cc_pix & below] = False
+    return out
+
+
 def refine_canopy_mask(
     canopy_mask: np.ndarray,
     depth_mm: np.ndarray | None,
@@ -4282,6 +4352,33 @@ def main():
                          "Small ground / grass blobs in the lower "
                          "frame have top row >> this and get "
                          "rejected. Default 0 = disabled. Try 300.")
+    # Trunk-based canopy refinements. Both use the SAM 3 trunk
+    # detections that --track-canopy --canopy-track-method=trunk
+    # already produces. Run AFTER the canopy mask is built and
+    # filtered, BEFORE the trunk-Voronoi partition.
+    ap.add_argument("--canopy-add-trunk-masks", action="store_true",
+                    help="Union the SAM-detected trunk masks into "
+                         "the canopy mask. A tree's two leafy regions "
+                         "that were separate CCs (because the visible "
+                         "trunk between them was filtered out) get "
+                         "bridged through the trunk pixels into one "
+                         "CC. The trunk mask itself is narrow so it "
+                         "doesn't add ground.")
+    ap.add_argument("--canopy-crop-below-trunk", action="store_true",
+                    help="For each canopy CC that overlaps a SAM "
+                         "trunk bbox, crop the CC at row "
+                         "(trunk_y2 + buffer). Removes the GROUND "
+                         "that the canopy mask incorrectly extended "
+                         "into below the tree. The trunk's bbox "
+                         "bottom marks where the trunk meets the "
+                         "ground, so anything below that in the same "
+                         "CC is ground.")
+    ap.add_argument("--canopy-crop-below-trunk-buffer-px", type=int,
+                    default=30,
+                    help="Buffer (rows) added below trunk_y2 before "
+                         "cropping the canopy CC. Accounts for low-"
+                         "hanging branches that extend a bit below "
+                         "the trunk bbox. Default 30.")
     ap.add_argument("--flower-max-behind-foreground-mm",
                     type=float, default=0.0,
                     help="After flowers are assigned to canopy "
@@ -5945,6 +6042,51 @@ def main():
                                     )
                                 )
                         if _kept_trunk_boxes:
+                            # Trunk-based canopy refinements. Run
+                            # BEFORE partition so the partition
+                            # operates on the corrected mask.
+                            #   1. Union trunk masks into canopy:
+                            #      bridges two CCs that share a
+                            #      trunk (one tree shown as two
+                            #      leafy blobs because the visible
+                            #      trunk between them was filtered
+                            #      out). The trunk mask is narrow
+                            #      so it doesn't add ground.
+                            if (args.canopy_add_trunk_masks
+                                    and _kept_trunk_masks
+                                    and canopy_mask_img is not None):
+                                _cm_b = canopy_mask_img.astype(bool)
+                                for _tm in _kept_trunk_masks:
+                                    _tmb = np.asarray(_tm).astype(bool)
+                                    if _tmb.ndim == 3:
+                                        _tmb = _tmb.any(axis=0)
+                                    if _tmb.shape == _cm_b.shape:
+                                        _cm_b = _cm_b | _tmb
+                                canopy_mask_img = _cm_b
+                            #   2. Crop canopy CCs below trunk
+                            #      bottom: removes GROUND that the
+                            #      SAM mask extended into below the
+                            #      tree. Buffer accounts for low-
+                            #      hanging branches.
+                            if (args.canopy_crop_below_trunk
+                                    and canopy_mask_img is not None):
+                                try:
+                                    canopy_mask_img = (
+                                        crop_canopy_below_trunks(
+                                            canopy_mask_img,
+                                            _kept_trunk_boxes,
+                                            buffer_below_px=(
+                                                args.canopy_crop_below_trunk_buffer_px
+                                            ),
+                                        )
+                                    )
+                                except Exception as _crop_err:
+                                    print(
+                                        f"[warn] crop-below-trunk "
+                                        f"failed ({_crop_err!r}); "
+                                        f"using uncropped mask",
+                                        file=sys.stderr,
+                                    )
                             frame_canopy_components, _part_labels = (
                                 partition_canopy_by_trunks(
                                     canopy_mask_img, _kept_trunk_boxes,
