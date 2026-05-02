@@ -82,17 +82,14 @@ echo "[batch] Using python: $PY"
   --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
   --use-build-tree-mask --tree-mask-min-overlap 0.10 --tree-mask-dilate-px 8 \
+  --canopy-sam-prompt "apple tree" --canopy-sam-min-score 0.15 \
+  --canopy-sam-min-pixels 500 --canopy-sam-min-lower-frac 0.20 \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 100 --canopy-edge-tree-max-top-row 250 \
   --canopy-edge-tree-min-aspect-ratio 1.2 \
   --canopy-edge-tree-max-depth-std-mm 1500 \
   --canopy-edge-tree-min-green-frac 0.15 \
   --canopy-edge-tree-max-depth-mm 3000 \
-  --canopy-filter-by-tree-shape \
-  --canopy-filter-min-aspect-ratio 1.2 \
-  --canopy-filter-max-depth-std-mm 1500 \
-  --canopy-filter-min-green-frac 0.15 \
-  --canopy-filter-min-area-px 400 \
   --flower-edge-margin-sides-px 0 \
   --flower-require-tree-in-frame --flower-foreground-canopy-max-depth-mm 2500 \
   --flower-max-behind-foreground-mm 1000 \

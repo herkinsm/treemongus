@@ -3122,6 +3122,78 @@ def augment_canopy_with_edge_trees(
     return augmented
 
 
+def build_canopy_from_sam_trees(
+    tree_masks,
+    tree_scores,
+    depth_mm: np.ndarray | None,
+    frame_shape: tuple[int, int],
+    *,
+    min_score: float = 0.15,
+    depth_min_mm: float = 600.0,
+    depth_max_mm: float = 3000.0,
+    min_pixels: int = 500,
+    position_min_lower_frac: float = 0.20,
+    require_depth_check: bool = True,
+) -> np.ndarray:
+    """Build a canopy mask from SAM 3 tree segmentations.
+
+    SAM 3 prompted with 'apple tree' (or similar) returns one
+    mask per detected tree with a confidence score. This helper
+    unions them into a single canopy mask after a few sanity
+    filters:
+
+      1. Confidence score >= min_score                 (skip low-conf)
+      2. Mask area >= min_pixels                       (size floor)
+      3. Mask extends into the lower portion of the
+         frame: max(y) >= H * (1 - position_min_lower_frac)
+                                                       (rejects sky-only
+                                                        detections)
+      4. Median depth of valid-depth pixels in mask
+         is within [depth_min_mm, depth_max_mm]        (rejects far
+                                                        background trees)
+
+    Returns a (H, W) bool canopy mask. Empty if no SAM trees
+    pass the filters.
+    """
+    h, w = frame_shape
+    canopy = np.zeros((h, w), dtype=bool)
+    if tree_masks is None or len(tree_masks) == 0:
+        return canopy
+    if tree_scores is None:
+        tree_scores = [1.0] * len(tree_masks)
+    pos_threshold_y = int(h * (1.0 - position_min_lower_frac))
+    valid_depth = None
+    if depth_mm is not None and require_depth_check:
+        valid_depth = (depth_mm > 0) & (depth_mm < 60000)
+    for mask, score in zip(tree_masks, tree_scores):
+        if float(score) < min_score:
+            continue
+        m = np.asarray(mask).astype(bool)
+        if m.ndim == 3:
+            m = m.any(axis=0)
+        if m.shape != (h, w):
+            continue
+        if int(m.sum()) < min_pixels:
+            continue
+        # Position check: must extend into the lower portion
+        # of the frame so sky-only / distant-line detections
+        # are rejected.
+        ys_any = m.any(axis=1)
+        ys = np.where(ys_any)[0]
+        if ys.size == 0 or int(ys.max()) < pos_threshold_y:
+            continue
+        # Depth check: median depth must be in foreground band.
+        if (require_depth_check and depth_mm is not None
+                and valid_depth is not None):
+            md = depth_mm[m & valid_depth]
+            if md.size >= 50:
+                med = float(np.median(md))
+                if med < depth_min_mm or med > depth_max_mm:
+                    continue
+        canopy |= m
+    return canopy
+
+
 def filter_canopy_by_tree_shape(
     canopy_mask: np.ndarray,
     depth_mm: np.ndarray,
@@ -3626,6 +3698,52 @@ def main():
                          "band used by edge-tree augmentation. Tighter "
                          "than the global --depth-max-mm; default 3000 "
                          "mm so far-row trees aren't pulled in.")
+    # SAM 3-based canopy detection. PRIMARY canopy source when
+    # enabled. SAM 3 prompted with 'apple tree' (or similar)
+    # returns pixel-accurate tree segmentations directly; we
+    # union them into the canopy mask after filtering by score,
+    # size, position, and median depth. When non-empty, this
+    # REPLACES the build_tree_mask + edge augmentation + tree-
+    # shape filter chain. When empty (or disabled), we fall
+    # back to that chain so existing setups keep working.
+    ap.add_argument("--canopy-sam-prompt", default="",
+                    help="If set, run SAM 3 with this prompt and "
+                         "use its segmentations as the canopy mask. "
+                         "Recommended: 'apple tree' or 'tree canopy'. "
+                         "When SAM 3 returns one or more masks "
+                         "passing the filters (--canopy-sam-min-*), "
+                         "they become the canopy_mask_img directly, "
+                         "skipping build_tree_mask + edge "
+                         "augmentation + tree-shape filter. Falls "
+                         "back to build_tree_mask if SAM finds "
+                         "nothing in a frame. Default '' = disabled.")
+    ap.add_argument("--canopy-sam-min-score", type=float, default=0.15,
+                    help="Minimum SAM 3 detection score for a tree "
+                         "mask to be included in the canopy. Default "
+                         "0.15.")
+    ap.add_argument("--canopy-sam-min-pixels", type=int, default=500,
+                    help="Minimum mask area (in px) for a SAM 3 tree "
+                         "detection to be included in the canopy. "
+                         "Default 500.")
+    ap.add_argument("--canopy-sam-min-lower-frac", type=float,
+                    default=0.20,
+                    help="The mask must extend into the lower "
+                         "fraction of the frame: max(y) >= H * (1 - "
+                         "this). Rejects sky-only / horizon-only "
+                         "detections. Default 0.20 (mask must reach "
+                         "into the lower 20%% of the frame).")
+    ap.add_argument("--canopy-sam-depth-check", action="store_true",
+                    default=True,
+                    help="Require SAM tree masks to have median depth "
+                         "in [--depth-min-mm, --depth-max-mm]. Default "
+                         "on; rejects distant background trees that "
+                         "SAM might still segment.")
+    ap.add_argument("--no-canopy-sam-depth-check",
+                    dest="canopy_sam_depth_check",
+                    action="store_false",
+                    help="Disable the depth check on SAM tree masks. "
+                         "Useful when depth is unreliable.")
+
     # Post-processing tree-shape filter. Runs on the FINAL canopy
     # mask (after build_tree_mask + edge augmentation + dilation)
     # and removes any CC that doesn't look like a tree. This is
@@ -4516,6 +4634,17 @@ def main():
             f"prompt {args.canopy_trunk_prompt!r}",
             file=sys.stderr,
         )
+    # Auto-add the SAM canopy prompt when --canopy-sam-prompt is set.
+    # SAM 3 will be queried with this prompt every frame and the
+    # resulting masks become the canopy.
+    if (args.canopy_sam_prompt
+            and args.canopy_sam_prompt not in prompts):
+        prompts.append(args.canopy_sam_prompt)
+        print(
+            f"[init] --canopy-sam-prompt set: auto-added prompt "
+            f"{args.canopy_sam_prompt!r} as canopy source",
+            file=sys.stderr,
+        )
     prompt_slugs = {p: slugify(p) for p in prompts}
 
     # Resolve which prompts the IoU tracker should run on. Default: any prompt
@@ -4865,7 +4994,41 @@ def main():
                 canopy_mask_img = None
                 if args.depth or args.tree_mask:
                     depth_mm = load_depth_mm(depth_path_for(img_path), (img.height, img.width))
-                if args.tree_mask and depth_mm is not None:
+
+                # SAM 3-based canopy: the PRIMARY source when the
+                # --canopy-sam-prompt is set. SAM 3 returns pixel-
+                # accurate apple-tree masks; we union them after
+                # filtering by score, size, frame-position, and
+                # median depth. This replaces build_tree_mask + edge
+                # augmentation + tree-shape filter for the cases
+                # where SAM finds at least one tree.
+                _sam_canopy_used = False
+                if (args.tree_mask and args.canopy_sam_prompt
+                        and isinstance(infer, dict)
+                        and args.canopy_sam_prompt in infer):
+                    _sct_infer = infer[args.canopy_sam_prompt]
+                    _sct_masks = _sct_infer.get("masks")
+                    _sct_scores = _sct_infer.get("scores")
+                    _sct_canopy = build_canopy_from_sam_trees(
+                        _sct_masks, _sct_scores, depth_mm,
+                        (img.height, img.width),
+                        min_score=args.canopy_sam_min_score,
+                        depth_min_mm=args.depth_min_mm,
+                        depth_max_mm=args.depth_max_mm,
+                        min_pixels=args.canopy_sam_min_pixels,
+                        position_min_lower_frac=(
+                            args.canopy_sam_min_lower_frac
+                        ),
+                        require_depth_check=(
+                            args.canopy_sam_depth_check
+                        ),
+                    )
+                    if _sct_canopy.any():
+                        canopy_mask_img = _sct_canopy
+                        _sam_canopy_used = True
+
+                if (args.tree_mask and depth_mm is not None
+                        and not _sam_canopy_used):
                     if args.use_build_tree_mask:
                         # Robust canopy detection from tree_mask.py:
                         # depth band + HSV sky exclusion + ROI-anchored
