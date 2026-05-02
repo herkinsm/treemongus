@@ -3493,6 +3493,93 @@ def fill_small_canopy_holes(
     return out
 
 
+def crop_canopy_at_top_vs_row_depth_jump(
+    canopy_mask: np.ndarray,
+    depth_mm: np.ndarray | None,
+    *,
+    min_jump_mm: float = 500.0,
+    top_frac: float = 0.25,
+    min_pixels_per_row: int = 10,
+) -> np.ndarray:
+    """For each CC, compare per-row median depth to the CC's
+    TOP-rows median. Find the first row going down where the
+    median jumps higher (deeper) by > min_jump_mm and crop
+    everything below.
+
+    This catches the "balloon" failure case where SAM segments a
+    tree+ground as one CC and the mask extends into ground at
+    the bottom. The TOP of the CC has tree-depth (e.g., 1.5 m);
+    below the actual tree base the median jumps to ground-depth
+    (e.g., 2.5 m). The first row exhibiting this jump is the
+    tree-ground transition.
+
+    Leaf-protection safeguards:
+      1. Threshold (default 500 mm) is large -- tree branches at
+         varying depths typically vary <300 mm; only ground gives
+         500+ mm jumps.
+      2. Compares to TOP rows (top 25%) which we trust to be tree
+         (the top of a tree is virtually always tree, never
+         ground). So drift from tree-depth is the discriminator.
+      3. Crop only AT and BELOW the jump row, never above. The
+         entire upper portion of the CC is preserved.
+      4. Requires at least 10 pixels per row for a reliable
+         median; sparse / boundary rows are skipped.
+    """
+    if canopy_mask is None or depth_mm is None:
+        return canopy_mask
+    cm = canopy_mask.astype(bool)
+    if not cm.any():
+        return cm
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return cm
+    H, W = cm.shape
+    cm_u8 = cm.astype(np.uint8) * 255
+    n_cc, labels, stats, _ = _cv2.connectedComponentsWithStats(
+        cm_u8, connectivity=8,
+    )
+    if n_cc <= 1:
+        return cm
+    out = cm.copy()
+    rows_idx = np.arange(H)[:, None]
+    for cc_id in range(1, n_cc):
+        y0 = int(stats[cc_id, _cv2.CC_STAT_TOP])
+        h_cc = int(stats[cc_id, _cv2.CC_STAT_HEIGHT])
+        if h_cc < 20:
+            continue
+        cc_pix = (labels == cc_id)
+        # Compute per-row median depth WITHIN this CC.
+        medians = np.full(h_cc, np.nan, dtype=np.float64)
+        for dy in range(h_cc):
+            y = y0 + dy
+            in_row = cc_pix[y, :] & (depth_mm[y, :] > 0) & (depth_mm[y, :] < 60000)
+            if int(in_row.sum()) >= min_pixels_per_row:
+                medians[dy] = float(np.median(depth_mm[y, in_row]))
+        # TOP-rows median (top top_frac of CC). This is our tree
+        # baseline -- the top of the CC is virtually always tree.
+        top_n = max(3, int(h_cc * top_frac))
+        top_vals = medians[:top_n]
+        top_vals = top_vals[~np.isnan(top_vals)]
+        if top_vals.size < 3:
+            continue
+        top_median = float(np.median(top_vals))
+        # Walk down from the end of the top region looking for
+        # first row whose median exceeds the top_median by
+        # > min_jump_mm. That row is the tree-ground transition;
+        # crop everything from that row down.
+        for dy in range(top_n, h_cc):
+            if np.isnan(medians[dy]):
+                continue
+            if medians[dy] > top_median + min_jump_mm:
+                cut_y = y0 + dy
+                # Remove this CC's pixels at row cut_y and below.
+                below_zone = rows_idx >= cut_y
+                out[cc_pix & below_zone] = False
+                break
+    return out
+
+
 def remove_ground_by_local_gradient(
     canopy_mask: np.ndarray,
     depth_mm: np.ndarray | None,
@@ -4999,6 +5086,35 @@ def main():
                     help="Only consider grass-color pixels at row "
                          ">= this. Default 300 protects upper-canopy "
                          "sunlit leaves from being removed as grass.")
+    # Plan C Strategy 3: per-CC top-vs-row depth jump
+    ap.add_argument("--canopy-crop-top-vs-row-depth-jump",
+                    action="store_true",
+                    help="For each canopy CC, compute median depth "
+                         "of the TOP rows (top 25%%). Walk down; the "
+                         "FIRST row where the row's median depth "
+                         "exceeds the top-rows median by > "
+                         "--canopy-row-jump-min-mm gets cropped, "
+                         "along with everything below it in that CC. "
+                         "Catches the 'balloon' failure case where "
+                         "SAM segments tree+ground as one CC: top is "
+                         "tree-depth (~1.5 m), bottom jumps to "
+                         "ground-depth (~2.5 m). LEAF PROTECTION: "
+                         "threshold (default 500 mm) is large enough "
+                         "that tree branches at varying depths "
+                         "(typically vary <300 mm) don't trigger; "
+                         "only ground transitions do.")
+    ap.add_argument("--canopy-row-jump-min-mm", type=float,
+                    default=500.0,
+                    help="Minimum row-median - top-median jump for "
+                         "crop. Default 500 mm.")
+    ap.add_argument("--canopy-row-jump-top-frac", type=float,
+                    default=0.25,
+                    help="Use top fraction of CC rows for the "
+                         "tree-baseline median. Default 0.25.")
+    ap.add_argument("--canopy-row-jump-min-pixels-per-row",
+                    type=int, default=10,
+                    help="Require at least this many pixels in a "
+                         "row for its median to count. Default 10.")
     ap.add_argument("--canopy-trunk-memory-frames", type=int,
                     default=0,
                     help="Carry trunks forward across frames. When "
@@ -6831,6 +6947,38 @@ def main():
                             print(
                                 f"[warn] HSV grass removal failed "
                                 f"({_gh_err!r})",
+                                file=sys.stderr,
+                            )
+
+                    # PLAN C STRATEGY 3: per-CC top-vs-row depth
+                    # jump. Catches the "balloon" failure case --
+                    # CC top is tree-depth, but the bottom rows'
+                    # median jumps to ground-depth. Find that
+                    # transition row and crop below.
+                    if (args.canopy_crop_top_vs_row_depth_jump
+                            and canopy_mask_img is not None
+                            and depth_mm is not None
+                            and canopy_mask_img.any()):
+                        try:
+                            canopy_mask_img = (
+                                crop_canopy_at_top_vs_row_depth_jump(
+                                    canopy_mask_img,
+                                    depth_mm,
+                                    min_jump_mm=(
+                                        args.canopy_row_jump_min_mm
+                                    ),
+                                    top_frac=(
+                                        args.canopy_row_jump_top_frac
+                                    ),
+                                    min_pixels_per_row=(
+                                        args.canopy_row_jump_min_pixels_per_row
+                                    ),
+                                )
+                            )
+                        except Exception as _tj_err:
+                            print(
+                                f"[warn] top-vs-row jump crop "
+                                f"failed ({_tj_err!r})",
                                 file=sys.stderr,
                             )
 

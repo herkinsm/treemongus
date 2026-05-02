@@ -127,6 +127,10 @@ echo "[batch] Using python: $PY"
   --canopy-grass-hue-min 35 --canopy-grass-hue-max 65 \
   --canopy-grass-sat-min 60 --canopy-grass-val-min 80 \
   --canopy-grass-min-y 300 \
+  --canopy-crop-top-vs-row-depth-jump \
+  --canopy-row-jump-min-mm 500 \
+  --canopy-row-jump-top-frac 0.25 \
+  --canopy-row-jump-min-pixels-per-row 10 \
   --canopy-trunk-memory-frames 5 --canopy-trunk-memory-iou 0.3 \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \
