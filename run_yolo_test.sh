@@ -87,10 +87,10 @@ echo "[batch] Using python: $PY"
   --canopy-sam-min-valid-depth-frac 0.30 \
   --canopy-sam-supplement-with-edge-aug \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
-  --canopy-edge-tree-min-height-px 100 --canopy-edge-tree-max-top-row 250 \
-  --canopy-edge-tree-min-aspect-ratio 1.2 \
-  --canopy-edge-tree-max-depth-std-mm 1500 \
-  --canopy-edge-tree-min-green-frac 0.15 \
+  --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \
+  --canopy-edge-tree-min-aspect-ratio 0.8 \
+  --canopy-edge-tree-max-depth-std-mm 3000 \
+  --canopy-edge-tree-min-green-frac 0.0 \
   --canopy-edge-tree-max-depth-mm 3000 \
   --flower-edge-margin-sides-px 0 \
   --flower-require-tree-in-frame --flower-foreground-canopy-max-depth-mm 2500 \

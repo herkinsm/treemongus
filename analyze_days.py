@@ -5042,14 +5042,16 @@ def main():
                 if args.depth or args.tree_mask:
                     depth_mm = load_depth_mm(depth_path_for(img_path), (img.height, img.width))
 
-                # SAM 3-based canopy: the PRIMARY source when the
-                # --canopy-sam-prompt is set. SAM 3 returns pixel-
-                # accurate apple-tree masks; we union them after
-                # filtering by score, size, frame-position, and
-                # median depth. This replaces build_tree_mask + edge
-                # augmentation + tree-shape filter for the cases
-                # where SAM finds at least one tree.
-                _sam_canopy_used = False
+                # SAM 3-based canopy: ADDITIVE source. We always
+                # run BOTH the SAM 3 query (when --canopy-sam-prompt
+                # is set) AND the heuristic build_tree_mask + edge
+                # augmentation, then union them. This way SAM gives
+                # pixel-accurate masks where it works, and the
+                # heuristic covers the cases SAM misses (half-trees
+                # at edges, partial segmentations, blossom-dominant
+                # trees that don't look like SAM's pretrained 'apple
+                # tree' prototype). Neither has to be perfect alone.
+                _sct_canopy: np.ndarray | None = None
                 if (args.tree_mask and args.canopy_sam_prompt
                         and isinstance(infer, dict)
                         and args.canopy_sam_prompt in infer):
@@ -5073,62 +5075,10 @@ def main():
                             args.canopy_sam_min_valid_depth_frac
                         ),
                     )
-                    if _sct_canopy.any():
-                        canopy_mask_img = _sct_canopy
-                        _sam_canopy_used = True
+                    if not _sct_canopy.any():
+                        _sct_canopy = None
 
-                # SAM canopy SUPPLEMENT pass: run edge-tree
-                # augmentation on top of SAM canopy when SAM was
-                # used, so trees SAM only partially segmented (tops
-                # cut off, adjacent half-trees missed) get filled
-                # in by the depth-based shape detector. Edge
-                # augmentation has its own shape filters tuned to
-                # accept tree-shaped CCs at the L/R edges, so the
-                # union doesn't readmit grass.
-                if (_sam_canopy_used
-                        and args.canopy_sam_supplement_with_edge_aug
-                        and args.canopy_include_edge_trees
-                        and depth_mm is not None
-                        and canopy_mask_img is not None):
-                    try:
-                        _rgb_supp = np.asarray(img)
-                        canopy_mask_img = augment_canopy_with_edge_trees(
-                            canopy_mask_img,
-                            depth_mm,
-                            _rgb_supp,
-                            depth_min_mm=args.depth_min_mm,
-                            depth_max_mm=(
-                                args.canopy_edge_tree_max_depth_mm
-                            ),
-                            min_area_px=(
-                                args.canopy_edge_tree_min_area_px
-                            ),
-                            min_height_px=(
-                                args.canopy_edge_tree_min_height_px
-                            ),
-                            max_top_row=(
-                                args.canopy_edge_tree_max_top_row
-                            ),
-                            min_aspect_ratio=(
-                                args.canopy_edge_tree_min_aspect_ratio
-                            ),
-                            max_depth_std_mm=(
-                                args.canopy_edge_tree_max_depth_std_mm
-                            ),
-                            min_green_frac=(
-                                args.canopy_edge_tree_min_green_frac
-                            ),
-                        )
-                    except Exception as _supp_err:
-                        print(
-                            f"[warn] SAM-canopy edge supplement "
-                            f"failed ({_supp_err!r}); using SAM "
-                            f"canopy as-is",
-                            file=sys.stderr,
-                        )
-
-                if (args.tree_mask and depth_mm is not None
-                        and not _sam_canopy_used):
+                if (args.tree_mask and depth_mm is not None):
                     if args.use_build_tree_mask:
                         # Robust canopy detection from tree_mask.py:
                         # depth band + HSV sky exclusion + ROI-anchored
@@ -5291,6 +5241,21 @@ def main():
                                 f"unfiltered mask",
                                 file=sys.stderr,
                             )
+
+                # UNION SAM canopy with the heuristic canopy. SAM
+                # gives pixel-accurate masks for trees it detects;
+                # the heuristic catches half-trees, blossom-dominant
+                # trees, and partially-segmented tree tops that SAM
+                # missed. Either alone has gaps; the union covers
+                # both.
+                if _sct_canopy is not None:
+                    if canopy_mask_img is None:
+                        canopy_mask_img = _sct_canopy
+                    else:
+                        canopy_mask_img = (
+                            canopy_mask_img.astype(bool)
+                            | _sct_canopy.astype(bool)
+                        )
 
                 # Per-frame canopy tracking. Either:
                 #   cc method:    extract connected components from
