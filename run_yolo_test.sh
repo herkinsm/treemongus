@@ -69,7 +69,7 @@ echo "[batch] Using python: $PY"
   --flower-multi-prompts flower blossom "apple blossom" \
   --flower-require-blossom-color --flower-min-blossom-color-frac 0.10 \
   --flower-min-area-px 4 --no-flower-reject-yellow \
-  --flower-max-mask-green-frac 0.30 \
+  --flower-max-mask-green-frac 0.55 --flower-green-blossom-override-frac 0.20 \
   --depth-min-mm 600 --depth-max-mm 3000 --depth-near-frac 0.40 \
   --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \

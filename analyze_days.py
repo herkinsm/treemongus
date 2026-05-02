@@ -2315,6 +2315,7 @@ def flower_quality_keep(masks_np: np.ndarray,
                          max_mask_green_frac: float = 0.0,
                          green_h_lo: int = 35, green_h_hi: int = 85,
                          green_s_min: int = 40, green_v_min: int = 35,
+                         green_blossom_override_frac: float = 0.20,
                          ) -> tuple[np.ndarray, dict, list[int]]:
     """Boolean keep-array + per-rejection diagnostics + per-mask area, mirroring
     the gates in sprayer_pipeline/flower_detector.py:
@@ -2345,7 +2346,10 @@ def flower_quality_keep(masks_np: np.ndarray,
         import cv2
         hsv = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2HSV)
         H_ch, S_ch, V_ch = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-        if require_blossom_color:
+        # Compute blossom_pixel_mask whenever we need to gate on
+        # blossom presence -- either for the require_blossom_color
+        # check or as the override for the leaf-green check.
+        if require_blossom_color or max_mask_green_frac > 0:
             white = (S_ch <= blossom_white_s_max) & (V_ch >= blossom_white_v_min)
             in_pink_hue = (((H_ch >= blossom_pink_h_lo) & (H_ch <= blossom_pink_h_hi))
                            | ((H_ch >= blossom_pink_h_lo2) & (H_ch <= blossom_pink_h_hi2)))
@@ -2428,6 +2432,20 @@ def flower_quality_keep(masks_np: np.ndarray,
         # inside the mask register as white). But the mask still has
         # a substantial fraction of green leaf pixels. Reject if the
         # green-pixel fraction exceeds the cap.
+        #
+        # IMPORTANT: a real flower cluster ON a branch naturally
+        # picks up surrounding leaves in the SAM mask (typical
+        # green frac 30-50%). We don't want to reject those. Two
+        # safeguards:
+        #   1. The cap (max_mask_green_frac) is itself fairly high
+        #      (~0.50 in run scripts) so leaf-dominated masks have
+        #      to be clearly leaf-y.
+        #   2. If the mask's blossom-color fraction is at or above
+        #      green_blossom_override_frac, it's a real cluster;
+        #      skip the green check entirely. Leaf-with-sky has
+        #      substantially less blossom-color coverage than a
+        #      real cluster, so this override fires only for the
+        #      clusters we want to keep.
         if max_mask_green_frac > 0 and green_pixel_mask is not None:
             mb = np.asarray(m).astype(bool)
             if mb.ndim == 3:
@@ -2437,7 +2455,19 @@ def flower_quality_keep(masks_np: np.ndarray,
                 frac_green = (
                     float((mb & green_pixel_mask).sum()) / float(total)
                 )
-                if frac_green > max_mask_green_frac:
+                # Compute blossom frac for the override even if the
+                # blossom-color gate above didn't fire (e.g.,
+                # require_blossom_color is on but the mask passed
+                # min_blossom_color_frac).
+                if blossom_pixel_mask is not None:
+                    frac_blossom = (
+                        float((mb & blossom_pixel_mask).sum())
+                        / float(total)
+                    )
+                else:
+                    frac_blossom = 0.0
+                if (frac_green > max_mask_green_frac
+                        and frac_blossom < green_blossom_override_frac):
                     keep[i] = False
                     diag["leaf_green"] += 1
                     continue
@@ -3865,6 +3895,18 @@ def main():
     ap.add_argument("--flower-green-val-min", type=int, default=35,
                     help="Minimum value (V) for a pixel to count as "
                          "leaf-green (0-255; default 35).")
+    ap.add_argument("--flower-green-blossom-override-frac", type=float,
+                    default=0.20,
+                    help="Skip --flower-max-mask-green-frac when the "
+                         "mask's BLOSSOM-color fraction (white|pink) "
+                         "is at least this much. A real flower "
+                         "cluster on a branch picks up surrounding "
+                         "leaves so its green frac can exceed the "
+                         "cap, but its blossom frac is also high. "
+                         "A leaf-with-sky has lots of green and only "
+                         "a small white-from-sky fraction -- the "
+                         "override doesn't fire and the cap rejects "
+                         "it. Default 0.20 (20%%).")
     # Multi-prompt union for flowers — run multiple flower-related prompts
     # and NMS-merge their detections under a single canonical 'flower' label.
     # Trades cost for recall: each prompt catches blossoms the others miss.
@@ -5890,6 +5932,9 @@ def main():
                             green_h_hi=args.flower_green_hue_max,
                             green_s_min=args.flower_green_sat_min,
                             green_v_min=args.flower_green_val_min,
+                            green_blossom_override_frac=(
+                                args.flower_green_blossom_override_frac
+                            ),
                         )
                         # Roll up rejections per (session, prompt).
                         rt_key = (day, category, session, prompt)
