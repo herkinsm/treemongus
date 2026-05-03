@@ -8032,6 +8032,11 @@ def main():
                 _ov_active_trunk_boxes: list = []
                 _ov_active_trunk_scores: list = []
                 _ov_active_trunk_ages: list = []
+                # High-trust SAM mask diagnostic. Set in the canopy-
+                # construction block when --high-sam-trust-threshold
+                # > 0; init here so the overlay block is safe even
+                # when construction was skipped.
+                _high_trust_mask = None
                 if (args.track_canopy and canopy_mask_img is not None):
                     if current_canopy_tracker is None:
                         current_canopy_tracker = CanopyTracker(
@@ -8535,6 +8540,40 @@ def main():
                                             0.6, (255, 255, 255), 2,
                                             _cv2_co.LINE_AA,
                                         )
+                        # High-trust SAM mask (light-blue tint +
+                        # contour). Pixels here have at least one
+                        # tree-prompt SAM mask scoring above
+                        # --high-sam-trust-threshold; ground filters
+                        # restore them per-pixel when otherwise cut.
+                        # If the canopy balloon (yellow contour
+                        # below) sits INSIDE this region, SAM is the
+                        # source and the threshold needs raising.
+                        # If the balloon is OUTSIDE this region,
+                        # ground filters are running but failing.
+                        _ht_frac_pct = 0.0
+                        if _high_trust_mask is not None:
+                            _ht_b = np.asarray(_high_trust_mask).astype(bool)
+                            if (_ht_b.shape == cm_bool.shape
+                                    and _ht_b.any()):
+                                _ht_frac_pct = (
+                                    100.0
+                                    * float(_ht_b.sum())
+                                    / float(_ht_b.size)
+                                )
+                                _ht_tint = np.zeros_like(rgb_co)
+                                _ht_tint[_ht_b] = (60, 180, 255)
+                                rgb_co = _cv2_co.addWeighted(
+                                    rgb_co, 0.88, _ht_tint, 0.12, 0,
+                                )
+                                _ht_u8 = _ht_b.astype(np.uint8) * 255
+                                _ht_contours, _ = _cv2_co.findContours(
+                                    _ht_u8, _cv2_co.RETR_EXTERNAL,
+                                    _cv2_co.CHAIN_APPROX_SIMPLE,
+                                )
+                                _cv2_co.drawContours(
+                                    rgb_co, _ht_contours, -1,
+                                    (60, 180, 255), 1,
+                                )
                         # Bright outline on canopy boundary.
                         cm_u8 = cm_bool.astype(np.uint8) * 255
                         contours, _ = _cv2_co.findContours(
@@ -8660,6 +8699,7 @@ def main():
                         hdr = (
                             f"canopy_frac={_cf*100:.1f}%  "
                             f"trees={len(frame_canopy_components)}  "
+                            f"HT{_ht_frac_pct:.0f}%  "
                             f"trunks A{_ct_assoc}/K{_ct_kept}/"
                             f"Rs{_ct_score}/Rg{_ct_stake}/"
                             f"Rd{_ct_depth}/G{_ct_ghost}"
