@@ -7329,6 +7329,18 @@ def main():
             _soft_trust_mask = None
             _trust_for_filters = None
             _canopy_pre_subtract = None
+            # Trunk-stage diagnostic counters set inside the
+            # canopy_overlay save block. Init here so the
+            # per-frame metrics CSV row reads zeros instead of
+            # stale values from the previous frame when the
+            # overlay path is skipped (overlay disabled, or
+            # the save try-block errored before they were set).
+            _ct_assoc = 0
+            _ct_kept = 0
+            _ct_score = 0
+            _ct_stake = 0
+            _ct_depth = 0
+            _ct_ghost = 0
 
             # Detect session change → flush trackers for the previous session
             # and start fresh ones for the new session.
