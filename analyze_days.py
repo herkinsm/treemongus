@@ -5200,6 +5200,17 @@ def main():
                          "the same tree. Default 80. Tighter = "
                          "stricter (less over-merging risk; less "
                          "tolerance for camera motion).")
+    ap.add_argument("--canopy-temporal-merge-trunk-band-radius-px",
+                    type=int, default=0,
+                    help="When > 0, restrict temporal-merge carry-"
+                         "forward to columns WITHIN this many pixels "
+                         "of a current-frame trunk's centerline. "
+                         "Columns BETWEEN two trees (in the gap) "
+                         "won't get pixels carried forward, even if "
+                         "the per-column nearest trunk is consistent "
+                         "across frames. Prevents inter-tree merging "
+                         "via the gap region. Default 0 = disabled. "
+                         "Try 150 for trees ~300 px wide.")
     ap.add_argument("--canopy-crop-below-trunk", action="store_true",
                     help="For each canopy CC that overlaps a SAM "
                          "trunk bbox, crop the CC at row "
@@ -7229,10 +7240,58 @@ def main():
 
                         # Add previous canopy pixels still in
                         # foreground, optionally gated by the
-                        # trunk-aware mask.
+                        # trunk-aware mask AND the trunk-band
+                        # mask (restricts carry-forward to columns
+                        # within X px of a trunk centerline so
+                        # the GAP between trees doesn't get
+                        # bridged).
                         _to_add = _prev_dil & _fg_clean_tm
                         if _trunk_aware_mask is not None:
                             _to_add = _to_add & _trunk_aware_mask
+                        # Trunk-band restriction.
+                        _band_r = int(
+                            args.canopy_temporal_merge_trunk_band_radius_px
+                        )
+                        if (_band_r > 0
+                                and isinstance(infer, dict)
+                                and args.canopy_trunk_prompt in infer):
+                            try:
+                                _W = canopy_mask_img.shape[1]
+                                _band_mask_per_col = np.zeros(
+                                    _W, dtype=bool,
+                                )
+                                _ti = infer[args.canopy_trunk_prompt]
+                                _tb_all = _ti.get("boxes")
+                                _ts_all = _ti.get("scores")
+                                if (_tb_all is not None
+                                        and len(_tb_all)):
+                                    _ssl = (
+                                        _ts_all
+                                        if _ts_all is not None
+                                        else [1.0] * len(_tb_all)
+                                    )
+                                    for _bb, _ss in zip(
+                                        _tb_all, _ssl,
+                                    ):
+                                        if (float(_ss)
+                                                >= args.canopy_trunk_min_score):
+                                            _cx = int(
+                                                round(
+                                                    (float(_bb[0])
+                                                     + float(_bb[2])) / 2.0
+                                                )
+                                            )
+                                            _l = max(0, _cx - _band_r)
+                                            _r = min(_W, _cx + _band_r)
+                                            _band_mask_per_col[_l:_r] = True
+                                if _band_mask_per_col.any():
+                                    _band_mask = np.broadcast_to(
+                                        _band_mask_per_col[None, :],
+                                        canopy_mask_img.shape,
+                                    )
+                                    _to_add = _to_add & _band_mask
+                            except Exception:
+                                pass
                         canopy_mask_img = (
                             canopy_mask_img.astype(bool) | _to_add
                         )

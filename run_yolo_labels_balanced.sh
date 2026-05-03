@@ -128,13 +128,14 @@ echo "[batch] Using python: $PY"
   --canopy-grass-sat-min 60 --canopy-grass-val-min 80 \
   --canopy-grass-min-y 300 \
   --canopy-crop-top-vs-row-depth-jump \
-  --canopy-row-jump-min-mm 400 \
+  --canopy-row-jump-min-mm 500 \
   --canopy-row-jump-top-frac 0.25 \
   --canopy-row-jump-min-pixels-per-row 10 \
   --canopy-trunk-memory-frames 5 --canopy-trunk-memory-iou 0.3 \
   --canopy-temporal-merge --canopy-temporal-merge-dilate-px 8 \
   --canopy-temporal-merge-trunk-aware \
   --canopy-temporal-merge-trunk-tolerance-px 80 \
+  --canopy-temporal-merge-trunk-band-radius-px 150 \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \
   --canopy-edge-tree-min-aspect-ratio 0.8 \
