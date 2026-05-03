@@ -3129,6 +3129,87 @@ def partition_canopy_by_trunks(
     return components, out_labels
 
 
+def cap_components_to_max_trees(
+    components: list[dict],
+    max_trees: int,
+) -> list[dict]:
+    """Cap per-frame canopy component count by absorbing the
+    smaller components into the closest of the top-max_trees
+    by centroid distance.
+
+    Apple orchards typically have at most 1-2 trees per frame.
+    The Voronoi partition can produce many more cells when the
+    "tree trunk" SAM prompt over-detects (one real tree -> many
+    trunk bboxes -> many Voronoi cells) and when TrunkMemory
+    carries multi-frame ghost trunks. This step coalesces those
+    extra cells back into 1-2 trees by:
+
+      1. Sort components by area descending; primary = top-N.
+      2. For each smaller (secondary) component, pick the
+         primary whose centroid is closest.
+      3. Rewrite the secondary's label_id pixels to the
+         primary's label_id IN THE SHARED labels image.
+      4. Expand the primary's bbox + area to absorb the
+         secondary.
+
+    The labels image is shared by reference across all
+    components; mutating it once propagates to every component
+    that holds a reference. Returns only the primaries.
+    """
+    if not components or max_trees <= 0:
+        return components
+    if len(components) <= max_trees:
+        return components
+    sorted_idx = sorted(
+        range(len(components)),
+        key=lambda i: components[i].get("area", 0),
+        reverse=True,
+    )
+    primary_idx = sorted_idx[:max_trees]
+    secondary_idx = sorted_idx[max_trees:]
+    primary = [components[i] for i in primary_idx]
+    secondary = [components[i] for i in secondary_idx]
+    pri_cx: list[float] = []
+    pri_cy: list[float] = []
+    for p in primary:
+        x1, y1, x2, y2 = p["bbox"]
+        pri_cx.append((float(x1) + float(x2)) / 2.0)
+        pri_cy.append((float(y1) + float(y2)) / 2.0)
+    labels_img = primary[0].get("labels")
+    for sec in secondary:
+        sx1, sy1, sx2, sy2 = sec["bbox"]
+        scx = (float(sx1) + float(sx2)) / 2.0
+        scy = (float(sy1) + float(sy2)) / 2.0
+        best = 0
+        best_d = float("inf")
+        for pi in range(len(primary)):
+            d = (
+                (scx - pri_cx[pi]) ** 2
+                + (scy - pri_cy[pi]) ** 2
+            )
+            if d < best_d:
+                best_d = d
+                best = pi
+        sec_lid = int(sec.get("label_id", 0))
+        pri_lid = int(primary[best].get("label_id", 0))
+        if (labels_img is not None
+                and sec_lid > 0 and pri_lid > 0
+                and sec_lid != pri_lid):
+            labels_img[labels_img == sec_lid] = pri_lid
+        pb = primary[best]["bbox"]
+        primary[best]["bbox"] = (
+            int(min(pb[0], sec["bbox"][0])),
+            int(min(pb[1], sec["bbox"][1])),
+            int(max(pb[2], sec["bbox"][2])),
+            int(max(pb[3], sec["bbox"][3])),
+        )
+        primary[best]["area"] = int(
+            primary[best].get("area", 0)
+            + sec.get("area", 0)
+        )
+    return primary
+
+
 def augment_canopy_with_edge_trees(
     canopy_mask: np.ndarray,
     depth_mm: np.ndarray,
@@ -5634,6 +5715,16 @@ def main():
                     help="Minimum CC pixel area to count as a tree. "
                          "Below this, treat as canopy noise / fragment "
                          "and skip.")
+    ap.add_argument("--canopy-max-trees-per-frame", type=int, default=0,
+                    help="Cap the per-frame canopy component count. "
+                         "If the partition produces more components, "
+                         "the smaller ones are absorbed (pixels "
+                         "relabeled, bbox/area merged) into the "
+                         "closest of the top-N by centroid distance. "
+                         "Use 1-2 for apple orchards where multiple "
+                         "disconnected canopy fragments per frame are "
+                         "almost always branches of the same tree. "
+                         "0 = disabled (default).")
     ap.add_argument("--canopy-track-method",
                     choices=("cc", "trunk"), default="cc",
                     help="How to partition the canopy mask into per-"
@@ -8408,6 +8499,17 @@ def main():
                                     min_trunk_area_px=args.canopy_track_min_cc_area,
                                 )
                             )
+                            # Cap per-frame component count: absorb
+                            # smaller components into the closest of
+                            # the top-N. Same CC of canopy = same
+                            # tree (branches connect them).
+                            if args.canopy_max_trees_per_frame > 0:
+                                frame_canopy_components = (
+                                    cap_components_to_max_trees(
+                                        frame_canopy_components,
+                                        args.canopy_max_trees_per_frame,
+                                    )
+                                )
                             # Track on TRUNK bboxes (most stable
                             # cross-frame anchor; canopy partition
                             # bbox can flop around as branches sway).
@@ -8426,6 +8528,13 @@ def main():
                                 canopy_mask_img,
                                 min_area_px=args.canopy_track_min_cc_area,
                             )
+                            if args.canopy_max_trees_per_frame > 0:
+                                frame_canopy_components = (
+                                    cap_components_to_max_trees(
+                                        frame_canopy_components,
+                                        args.canopy_max_trees_per_frame,
+                                    )
+                                )
                             frame_tree_ids = current_canopy_tracker.step(
                                 frame_canopy_components,
                             )
@@ -8434,6 +8543,13 @@ def main():
                             canopy_mask_img,
                             min_area_px=args.canopy_track_min_cc_area,
                         )
+                        if args.canopy_max_trees_per_frame > 0:
+                            frame_canopy_components = (
+                                cap_components_to_max_trees(
+                                    frame_canopy_components,
+                                    args.canopy_max_trees_per_frame,
+                                )
+                            )
                         frame_tree_ids = current_canopy_tracker.step(
                             frame_canopy_components,
                         )

@@ -185,6 +185,7 @@ echo "[batch] Using python: $PY"
   --flower-require-tree-in-frame --flower-foreground-canopy-max-depth-mm 2500 \
   --flower-max-behind-foreground-mm 1000 \
   --track-canopy --canopy-track-iou 0.3 --canopy-track-max-age 5 --canopy-track-min-cc-area 2000 \
+  --canopy-max-trees-per-frame 2 \
   --canopy-track-method trunk --canopy-trunk-min-score 0.20 --canopy-trunk-prompt "tree trunk" \
   --canopy-trunk-reject-green-stakes --canopy-trunk-max-green-pct 0.35 \
   --canopy-trunk-green-threshold 15 --canopy-trunk-min-brown-pct 0.20 \
