@@ -8490,11 +8490,22 @@ def main():
                             )
                         cm_bool = canopy_mask_img.astype(bool)
                         # Base layer: red tint inside canopy.
-                        tint = np.zeros_like(rgb_co)
-                        tint[cm_bool] = (255, 60, 60)
-                        rgb_co = _cv2_co.addWeighted(
-                            rgb_co, 0.7, tint, 0.3, 0,
-                        )
+                        # addWeighted darkens the WHOLE image by
+                        # the alpha factor regardless of whether
+                        # tint is zero outside canopy, so use
+                        # np.where to limit the blend to the
+                        # canopy region. Otherwise non-canopy
+                        # pixels would be at 70% brightness.
+                        if cm_bool.any():
+                            tint = np.zeros_like(rgb_co)
+                            tint[cm_bool] = (255, 60, 60)
+                            _blended_cm = _cv2_co.addWeighted(
+                                rgb_co, 0.7, tint, 0.3, 0,
+                            )
+                            rgb_co = np.where(
+                                cm_bool[..., None],
+                                _blended_cm, rgb_co,
+                            )
                         # Per-tree partition tints (different hue
                         # per tree id) when canopy tracking is on.
                         if frame_canopy_components and frame_tree_ids:
@@ -8509,6 +8520,18 @@ def main():
                                     (60, 220, 220), (220, 140, 60),
                                     (140, 220, 60), (60, 140, 220),
                                 ]
+                                # Build a SINGLE per-tree tint
+                                # accumulator, then blend once.
+                                # Original code did addWeighted per
+                                # tree, which compounded the alpha
+                                # multiplier outside each tree's
+                                # pixels (0.85^N -> ~0 with many
+                                # trees, blacking out the image).
+                                _tt_accum = np.zeros_like(rgb_co)
+                                _tt_mask = np.zeros(
+                                    rgb_co.shape[:2], dtype=bool,
+                                )
+                                _tt_label_pts: list = []
                                 for cc, tid in zip(
                                     frame_canopy_components,
                                     frame_tree_ids,
@@ -8522,24 +8545,35 @@ def main():
                                     pix = (_labels_img == lid)
                                     if not pix.any():
                                         continue
-                                    tt = np.zeros_like(rgb_co)
-                                    tt[pix] = color
-                                    rgb_co = _cv2_co.addWeighted(
-                                        rgb_co, 0.85, tt, 0.15, 0,
-                                    )
-                                    # Tree id label at centroid.
+                                    _tt_accum[pix] = color
+                                    _tt_mask = _tt_mask | pix
                                     ys, xs = np.where(pix)
                                     if ys.size:
-                                        cy_t = int(ys.mean())
-                                        cx_t = int(xs.mean())
-                                        _cv2_co.putText(
-                                            rgb_co,
-                                            f"T{int(tid)}",
-                                            (cx_t, cy_t),
-                                            _cv2_co.FONT_HERSHEY_SIMPLEX,
-                                            0.6, (255, 255, 255), 2,
-                                            _cv2_co.LINE_AA,
+                                        _tt_label_pts.append((
+                                            int(xs.mean()),
+                                            int(ys.mean()),
+                                            int(tid),
+                                        ))
+                                if _tt_mask.any():
+                                    _blended_tt = (
+                                        _cv2_co.addWeighted(
+                                            rgb_co, 0.85,
+                                            _tt_accum, 0.15, 0,
                                         )
+                                    )
+                                    rgb_co = np.where(
+                                        _tt_mask[..., None],
+                                        _blended_tt, rgb_co,
+                                    )
+                                for cx_t, cy_t, _tid in _tt_label_pts:
+                                    _cv2_co.putText(
+                                        rgb_co,
+                                        f"T{_tid}",
+                                        (cx_t, cy_t),
+                                        _cv2_co.FONT_HERSHEY_SIMPLEX,
+                                        0.6, (255, 255, 255), 2,
+                                        _cv2_co.LINE_AA,
+                                    )
                         # High-trust SAM mask (light-blue tint +
                         # contour). Pixels here have at least one
                         # tree-prompt SAM mask scoring above
@@ -8562,8 +8596,15 @@ def main():
                                 )
                                 _ht_tint = np.zeros_like(rgb_co)
                                 _ht_tint[_ht_b] = (60, 180, 255)
-                                rgb_co = _cv2_co.addWeighted(
+                                # np.where to keep non-HT pixels at
+                                # full brightness (addWeighted alone
+                                # would darken the whole image).
+                                _blended_ht = _cv2_co.addWeighted(
                                     rgb_co, 0.88, _ht_tint, 0.12, 0,
+                                )
+                                rgb_co = np.where(
+                                    _ht_b[..., None],
+                                    _blended_ht, rgb_co,
                                 )
                                 _ht_u8 = _ht_b.astype(np.uint8) * 255
                                 _ht_contours, _ = _cv2_co.findContours(
