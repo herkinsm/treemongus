@@ -3967,7 +3967,20 @@ def refine_canopy_mask(
                 V_c = hsv[:, :, 2]
                 sky_blue = (H_c >= 85) & (H_c <= 145) & (S_c > 8)
                 sky_bright = (V_c > 185) & (S_c < 15)
-                sky_pix = sky_blue | sky_bright
+                # Overcast / grey sky: very low saturation,
+                # mid-to-high V, no depth return. Tree leaves
+                # don't reach S < 10 even in shadow (foliage
+                # always has some saturation); the no-depth
+                # check is the safety lock that prevents
+                # mistaking shaded leaves for sky.
+                no_depth = (
+                    depth_mm.astype(np.float32) == 0
+                ) if depth_mm is not None else np.zeros_like(H_c, dtype=bool)
+                sky_overcast = (
+                    (S_c < 10) & (V_c > 100) & (V_c < 200)
+                    & no_depth
+                )
+                sky_pix = sky_blue | sky_bright | sky_overcast
                 fg_clean = fg & ~sky_pix
             except Exception:
                 fg_clean = fg

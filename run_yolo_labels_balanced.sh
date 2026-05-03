@@ -116,7 +116,7 @@ echo "[batch] Using python: $PY"
   --canopy-fill-small-holes --canopy-max-hole-area-px 1500 \
   --canopy-max-hole-aspect-ratio 3.0 \
   --canopy-max-bottom-row 460 \
-  --canopy-post-fill-bg-depth-mm 3500 \
+  --canopy-post-fill-bg-depth-mm 3000 \
   --canopy-crop-ground-gradient \
   --canopy-ground-gradient-bottom-frac 0.30 \
   --canopy-ground-gradient-max-corr 0.70 \
@@ -128,7 +128,7 @@ echo "[batch] Using python: $PY"
   --canopy-grass-sat-min 60 --canopy-grass-val-min 80 \
   --canopy-grass-min-y 300 \
   --canopy-crop-top-vs-row-depth-jump \
-  --canopy-row-jump-min-mm 500 \
+  --canopy-row-jump-min-mm 400 \
   --canopy-row-jump-top-frac 0.25 \
   --canopy-row-jump-min-pixels-per-row 10 \
   --canopy-trunk-memory-frames 5 --canopy-trunk-memory-iou 0.3 \
