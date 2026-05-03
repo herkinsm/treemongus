@@ -3949,6 +3949,7 @@ def remove_grass_by_hsv(
     sat_min: int = 60,
     val_min: int = 80,
     min_y: int = 300,
+    high_trust_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Remove pixels in canopy matching bright sunlit grass HSV.
 
@@ -3967,6 +3968,12 @@ def remove_grass_by_hsv(
          shaded leaves under apple-tree canopy don't reach this.
       3. The hue band [35, 65] biases yellow-green; pure deeper
          green leaves (H 60-85) are partly excluded.
+      4. high_trust_mask: if provided, OR-restore pixels in
+         (original_canopy & high_trust_mask) at the end. SAM-
+         confident-tree pixels are protected from being cut as
+         grass (matches the restoration pattern used by other
+         SUBTRACT filters such as remove_grass_by_depth_plane
+         and cut_canopy_invalid_depth).
     """
     if canopy_mask is None or rgb_arr is None:
         return canopy_mask
@@ -3991,7 +3998,12 @@ def remove_grass_by_hsv(
     )
     rows = np.arange(h)[:, None]
     in_lower = rows >= int(min_y)
-    return cm & ~(grass_color & in_lower)
+    out = cm & ~(grass_color & in_lower)
+    if high_trust_mask is not None:
+        ht = np.asarray(high_trust_mask).astype(bool)
+        if ht.shape == out.shape:
+            out = out | (cm & ht)
+    return out
 
 
 def cut_canopy_invalid_depth(
@@ -7070,6 +7082,16 @@ def main():
             if args.max_images is not None and total_imgs >= args.max_images:
                 break
 
+            # Per-frame diagnostic state. Init at loop top so each
+            # frame starts fresh regardless of which conditional
+            # paths run downstream. Without this, a value computed
+            # on frame N (e.g. _high_trust_mask, _filter_cut_masks)
+            # persists into frame N+1 if frame N+1 takes a path
+            # that doesn't reset it -- producing stale overlays.
+            _filter_cut_masks: dict = {}
+            _high_trust_mask = None
+            _canopy_pre_subtract = None
+
             # Detect session change → flush trackers for the previous session
             # and start fresh ones for the new session.
             session_key = (day, category, session)
@@ -7724,13 +7746,6 @@ def main():
                         except Exception:
                             pass
 
-                    # Per-filter cut tracking dict. Each SUBTRACT
-                    # filter snapshots canopy pre/post and OR's its
-                    # cut delta into this dict under a short name.
-                    # Drawn in the canopy_overlay JPG so you can see
-                    # WHAT each filter removed this frame.
-                    _filter_cut_masks: dict = {}
-
                     # Extract current-frame trunk bboxes once for
                     # use by ALL trunk-aware ground filters below.
                     _aware_trunks_pre: list = []
@@ -7831,6 +7846,20 @@ def main():
                         except Exception:
                             _high_trust_mask = None
 
+                    # PRE-SUBTRACT canopy snapshot. Captured here at
+                    # the boundary between REFINE-phase additive
+                    # operations (closing, hole-fill, dilation,
+                    # extend-via-trunks, edge-augment) and SUBTRACT-
+                    # phase cuts (per-CC ground gradient, HSV grass,
+                    # depth-plane, etc.). Drawn as a thin contour in
+                    # the cuts overlay so you can see the FULL set
+                    # of pixels SUBTRACT removed (not just the per-
+                    # filter cuts which only track HSV-G/DPL/IVD).
+                    if canopy_mask_img is not None:
+                        _canopy_pre_subtract = (
+                            canopy_mask_img.astype(bool).copy()
+                        )
+
                     # PER-CC GROUND-GRADIENT CROP. For each CC,
                     # examine the bottom fraction of rows. If
                     # depth correlates strongly with row in that
@@ -7922,6 +7951,7 @@ def main():
                                 sat_min=args.canopy_grass_sat_min,
                                 val_min=args.canopy_grass_val_min,
                                 min_y=args.canopy_grass_min_y,
+                                high_trust_mask=_high_trust_mask,
                             )
                             _cut_hsv = _pre_hsv & ~canopy_mask_img.astype(bool)
                             if _cut_hsv.any():
@@ -8393,6 +8423,7 @@ def main():
                                 sat_min=args.canopy_grass_sat_min,
                                 val_min=args.canopy_grass_val_min,
                                 min_y=args.canopy_grass_min_y,
+                                high_trust_mask=_high_trust_mask,
                             )
                         except Exception:
                             pass
@@ -8638,20 +8669,10 @@ def main():
                 _ov_active_trunk_boxes: list = []
                 _ov_active_trunk_scores: list = []
                 _ov_active_trunk_ages: list = []
-                # High-trust SAM mask diagnostic. Set in the canopy-
-                # construction block when --high-sam-trust-threshold
-                # > 0; ensure it's at least defined (None) here so
-                # the overlay block is safe when construction was
-                # skipped. CRITICAL: do NOT unconditionally reset --
-                # that would zero out the value the SUBTRACT phase
-                # just computed (silent HT0% bug).
-                if "_high_trust_mask" not in locals():
-                    _high_trust_mask = None
-                # Per-filter cut tracking. SUBTRACT filters
-                # populate this earlier in the frame; ensure it's
-                # at least defined here for the overlay block.
-                if "_filter_cut_masks" not in locals():
-                    _filter_cut_masks = {}
+                # _high_trust_mask, _filter_cut_masks, and
+                # _canopy_pre_subtract are now initialized at the
+                # per-frame loop top. SUBTRACT-phase code may have
+                # populated them; if not, they remain None / {}.
                 if (args.track_canopy and canopy_mask_img is not None):
                     if current_canopy_tracker is None:
                         current_canopy_tracker = CanopyTracker(
@@ -9635,7 +9656,30 @@ def main():
                             rgb_cu = np.where(
                                 _cmb_f[..., None], _bl_f, rgb_cu,
                             )
-                        # Layer 3: final canopy boundary (thin
+                        # Layer 3a: pre-SUBTRACT canopy boundary
+                        # (thin light-purple contour, 1px). Shows
+                        # what canopy looked like immediately after
+                        # REFINE; the difference between this and
+                        # the yellow final canopy is everything
+                        # SUBTRACT removed (sum of all SUBTRACT
+                        # filters, not just the per-filter cuts).
+                        if (_canopy_pre_subtract is not None
+                                and _canopy_pre_subtract.shape
+                                    == cm_b_cu.shape
+                                and _canopy_pre_subtract.any()):
+                            _pre_u8 = (
+                                _canopy_pre_subtract.astype(np.uint8)
+                                * 255
+                            )
+                            _pre_cnt, _ = _cv2_cu.findContours(
+                                _pre_u8, _cv2_cu.RETR_EXTERNAL,
+                                _cv2_cu.CHAIN_APPROX_SIMPLE,
+                            )
+                            _cv2_cu.drawContours(
+                                rgb_cu, _pre_cnt, -1,
+                                (200, 130, 240), 1,
+                            )
+                        # Layer 3b: final canopy boundary (thin
                         # bright yellow contour, 1px).
                         cm_u8_cu = cm_b_cu.astype(np.uint8) * 255
                         _cnt_cu, _ = _cv2_cu.findContours(
@@ -9661,9 +9705,21 @@ def main():
                                 * float(_high_trust_mask.sum())
                                 / float(_high_trust_mask.size)
                             )
+                        # Total pixels SUBTRACT removed (sum of all
+                        # cuts, not just the per-filter ones we
+                        # track). Computed from the pre-SUBTRACT
+                        # snapshot if available.
+                        _sub_total = 0
+                        if (_canopy_pre_subtract is not None
+                                and _canopy_pre_subtract.shape
+                                    == cm_b_cu.shape):
+                            _sub_total = int(
+                                (_canopy_pre_subtract & ~cm_b_cu).sum()
+                            )
                         _hdr_cu = (
                             f"canopy_frac={_cf_cu*100:.1f}%  "
-                            f"HT{_ht_pct_cu:.0f}%"
+                            f"HT{_ht_pct_cu:.0f}%  "
+                            f"SUB-cut={_sub_total}"
                         )
                         for _fn in ("HSV-G", "DPL", "IVD"):
                             _hdr_cu += (
