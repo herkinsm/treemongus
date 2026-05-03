@@ -8128,6 +8128,23 @@ def main():
                         except Exception:
                             _soft_trust_mask = None
 
+                    # Defensive union: soft should always be a
+                    # SUPERSET of high (lower threshold catches
+                    # everything the higher threshold caught,
+                    # plus more). If user accidentally sets
+                    # soft >= high, soft would be NARROWER and
+                    # _trust_for_filters would shield fewer
+                    # pixels than just using HT directly. Union
+                    # them so soft is guaranteed >= HT in
+                    # coverage regardless of threshold values.
+                    if (_soft_trust_mask is not None
+                            and _high_trust_mask is not None
+                            and _soft_trust_mask.shape
+                                == _high_trust_mask.shape):
+                        _soft_trust_mask = (
+                            _soft_trust_mask | _high_trust_mask
+                        )
+
                     # Effective shield mask passed to SUBTRACT
                     # filters as their high_trust_mask param.
                     # When soft is enabled and a superset of high
@@ -9340,14 +9357,21 @@ def main():
                                         _ht_scores
                                     )
                                     # Synthetic trunks have no
-                                    # SAM mask. If a previous run
-                                    # had any masks, drop them so
-                                    # length stays aligned (the
-                                    # fall-back-to-bbox path in
-                                    # crop_canopy_below_trunks
-                                    # handles missing masks).
+                                    # SAM mask. Pad the masks
+                                    # list with None entries so
+                                    # length still matches boxes
+                                    # AND the real SAM trunks
+                                    # keep their masks (so the
+                                    # mask-based clip in crop_
+                                    # canopy_below_trunks still
+                                    # fires for them). The fall-
+                                    # back-to-bbox path handles
+                                    # the None entries for the
+                                    # synthetic trunks.
                                     if _kept_trunk_masks:
-                                        _kept_trunk_masks = []
+                                        _kept_trunk_masks.extend(
+                                            [None] * len(_ht_boxes)
+                                        )
                             except Exception as _hts_err:
                                 print(
                                     f"[warn] heuristic trunk "
@@ -9376,6 +9400,17 @@ def main():
                             _ov_active_trunk_ages = [
                                 0
                             ] * len(_ov_active_trunk_boxes)
+                        # Pad ages with 0 for any extra entries
+                        # in _ov_active_trunk_boxes that didn't
+                        # come from memory.trunks (e.g. heuristic-
+                        # synthesized trunks added AFTER the
+                        # memory step). Without this padding the
+                        # ages list is shorter than the boxes
+                        # list and zip() in the overlay drawer
+                        # silently drops the synthesized trunks.
+                        while (len(_ov_active_trunk_ages)
+                                < len(_ov_active_trunk_boxes)):
+                            _ov_active_trunk_ages.append(0)
 
                         # Save current frame's filtered trunks for
                         # use by the NEXT frame's trunk-aware
@@ -9412,11 +9447,23 @@ def main():
                                 for _tm, _tb in zip(
                                     _kept_trunk_masks, _kept_trunk_boxes,
                                 ):
-                                    _tmb = np.asarray(_tm).astype(bool)
-                                    if _tmb.ndim == 3:
-                                        _tmb = _tmb.any(axis=0)
-                                    if _tmb.shape == _cm_b.shape:
-                                        _cm_b = _cm_b | _tmb
+                                    # Synthetic-trunk entries
+                                    # are None (no SAM mask).
+                                    # Skip mask-union for those;
+                                    # the vertical-extension
+                                    # below the loop body still
+                                    # runs from the bbox.
+                                    if _tm is None:
+                                        _tmb = None
+                                    else:
+                                        _tmb = (
+                                            np.asarray(_tm)
+                                            .astype(bool)
+                                        )
+                                        if _tmb.ndim == 3:
+                                            _tmb = _tmb.any(axis=0)
+                                        if _tmb.shape == _cm_b.shape:
+                                            _cm_b = _cm_b | _tmb
                                     # Vertical extension: draw a 5px-
                                     # wide line from trunk top going
                                     # up by _v_ext rows. Bridges
@@ -10220,6 +10267,33 @@ def main():
                             f"{_cu_err!r}",
                             file=sys.stderr,
                         )
+
+                # Reconcile per-filter cut masks with the FINAL
+                # canopy state. SUBTRACT phase 2 (post-temporal-
+                # merge) runs the same filter chain again on a
+                # different starting canopy, and canopy smoothing
+                # then fills small holes -- both can put pixels
+                # back that an earlier filter "cut". Intersecting
+                # each cut mask with NOT-final-canopy makes sure
+                # the cuts overlay only shows pixels actually
+                # missing from the final canopy. Without this,
+                # green / orange / pink / etc. cut fills can
+                # appear INSIDE the yellow final-canopy boundary,
+                # which is visually confusing.
+                if (canopy_mask_img is not None
+                        and _filter_cut_masks):
+                    try:
+                        _final_b = canopy_mask_img.astype(bool)
+                        for _fname in list(
+                            _filter_cut_masks.keys()
+                        ):
+                            _cm_f = _filter_cut_masks[_fname]
+                            if _cm_f.shape == _final_b.shape:
+                                _filter_cut_masks[_fname] = (
+                                    _cm_f & ~_final_b
+                                )
+                    except Exception:
+                        pass
 
                 # Per-frame canopy diagnostic metrics row. Captures
                 # everything you'd otherwise have to read off a JPG
