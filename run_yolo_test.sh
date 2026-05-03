@@ -67,9 +67,10 @@ echo "[batch] Using python: $PY"
 #   1. high-sam-trust-threshold 0.20 -> 0.15. AT 0.18 now lands
 #      in high_trust_mask -> real-tree pixels get protected
 #      from the more aggressive cuts below.
-#   2. max-bottom-row 400 -> 350. More aggressive hard floor.
-#      Tree pixels between rows 350 and the floor survive via
-#      (1)'s protection; grass below 350 is cut.
+#   2. max-bottom-row stays at 400 -- tried 350 and reverted.
+#      The 350 floor clipped real canopy off the bottom of
+#      orchard trees; AT mask covers upper foliage only so
+#      high_trust didn't protect lower canopy from the floor.
 #   3. canopy-trunk-prompt "apple tree trunk" -> "tree trunk".
 #      Original prompt is producing 17-43 score-rejected boxes
 #      per frame at 0.01-0.07. Pure noise. If the simpler
@@ -135,7 +136,7 @@ echo "[batch] Using python: $PY"
   --canopy-stake-min-aspect-ratio 4.0 --canopy-stake-min-area-px 50 \
   --canopy-fill-small-holes --canopy-max-hole-area-px 1500 \
   --canopy-max-hole-aspect-ratio 3.0 \
-  --canopy-max-bottom-row 350 \
+  --canopy-max-bottom-row 400 \
   --canopy-post-fill-bg-depth-mm 3000 \
   --canopy-crop-ground-gradient \
   --canopy-ground-gradient-bottom-frac 0.30 \
