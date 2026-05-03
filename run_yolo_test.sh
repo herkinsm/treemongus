@@ -170,6 +170,9 @@ echo "[batch] Using python: $PY"
   --canopy-grass-plane-min-slope 0.5 \
   --canopy-grass-plane-max-slope 50 \
   --canopy-grass-plane-max-fit-residual-mm 500 \
+  --canopy-grass-plane-require-trunk-in-cc \
+  --canopy-cut-invalid-depth \
+  --canopy-cut-invalid-depth-max-mm 3500 \
   --canopy-crop-top-vs-row-depth-jump \
   --canopy-row-jump-min-mm 500 \
   --canopy-row-jump-top-frac 0.25 \
@@ -194,7 +197,7 @@ echo "[batch] Using python: $PY"
   --flower-max-behind-foreground-mm 1000 \
   --track-canopy --canopy-track-iou 0.3 --canopy-track-max-age 5 --canopy-track-min-cc-area 2000 \
   --canopy-max-trees-per-frame 2 \
-  --canopy-track-method trunk --canopy-trunk-min-score 0.15 --canopy-trunk-prompt "tree trunk" \
+  --canopy-track-method trunk --canopy-trunk-min-score 0.10 --canopy-trunk-prompt "tree trunk" \
   --canopy-trunk-reject-green-stakes --canopy-trunk-max-green-pct 0.35 \
   --canopy-trunk-green-threshold 15 --canopy-trunk-min-brown-pct 0.20 \
   --canopy-trunk-max-depth-mm 3000 --canopy-trunk-depth-min-pixels 5 \

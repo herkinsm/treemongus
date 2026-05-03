@@ -3994,6 +3994,52 @@ def remove_grass_by_hsv(
     return cm & ~(grass_color & in_lower)
 
 
+def cut_canopy_invalid_depth(
+    canopy_mask: np.ndarray,
+    depth_mm: np.ndarray | None,
+    *,
+    depth_min_mm: float = 600.0,
+    depth_max_mm: float = 3500.0,
+    high_trust_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Remove canopy pixels whose depth is invalid or out of
+    the foreground band.
+
+    The D455 returns depth=0 on sky, dark/non-reflective
+    surfaces, distant background, motion blur, and at the
+    sensor's field-of-view edges. REFINE phase (closing,
+    hole-fill) can bridge across these invalid-depth pixels
+    and pull non-foreground regions (clouds, distant horizon,
+    barn walls etc.) into the canopy mask. The bg-depth
+    filter only checks depth > threshold, so it does NOT
+    catch depth==0 -- those pixels slip through every
+    SUBTRACT filter.
+
+    This is the final canopy gate: every surviving pixel
+    must have a measured depth in [depth_min_mm,
+    depth_max_mm]. high_trust_mask pixels are restored after
+    cutting (rare case where SAM was confident on a region
+    with sparse depth returns).
+    """
+    if canopy_mask is None or depth_mm is None:
+        return canopy_mask
+    cm_orig = np.asarray(canopy_mask).astype(bool)
+    if not cm_orig.any():
+        return cm_orig
+    if depth_mm.shape != cm_orig.shape:
+        return cm_orig
+    valid = (
+        (depth_mm >= float(depth_min_mm))
+        & (depth_mm <= float(depth_max_mm))
+    )
+    out = cm_orig & valid
+    if high_trust_mask is not None:
+        ht = np.asarray(high_trust_mask).astype(bool)
+        if ht.shape == out.shape:
+            out = out | (cm_orig & ht)
+    return out
+
+
 def remove_grass_by_depth_plane(
     canopy_mask: np.ndarray,
     depth_mm: np.ndarray | None,
@@ -4008,6 +4054,7 @@ def remove_grass_by_depth_plane(
     min_slope_mm_per_row: float = 0.5,
     max_slope_mm_per_row: float = 50.0,
     max_median_fit_residual_mm: float = 500.0,
+    require_trunk_in_cc: bool = False,
     high_trust_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Cut ground from canopy by fitting a plane to candidate
@@ -4022,6 +4069,15 @@ def remove_grass_by_depth_plane(
     works on dry/yellow/brown grass, mixed terrain, or
     desaturated lighting equally.
 
+    When require_trunk_in_cc is True, the cut is restricted to
+    canopy CCs that contain at least one of the supplied
+    trunk_boxes -- without a trunk anchor, we don't have
+    confidence about where tree ends and ground begins, and
+    foliage at depth similar to the plane could be wrongly
+    cut. CCs without a trunk are left intact in that mode and
+    must be cleaned by other filters (e.g. cut_canopy_invalid_
+    depth, HSV grass).
+
     Algorithm:
       1. Build candidate ground mask: valid foreground depth,
          row >= candidate_min_y, outside any trunk bbox.
@@ -4035,7 +4091,9 @@ def remove_grass_by_depth_plane(
       4. For canopy pixels with row >= apply_min_y AND valid
          depth, compute residual = |actual - predicted|. Cut
          if residual < residual_mm.
-      5. If high_trust_mask provided, restore pixels in
+      5. If require_trunk_in_cc, restrict cut to CCs that
+         contain at least one trunk bbox interior pixel.
+      6. If high_trust_mask provided, restore pixels in
          (original_canopy & high_trust_mask).
 
     Returns the modified canopy mask. On any input error or
@@ -4116,6 +4174,40 @@ def remove_grass_by_depth_plane(
         & (full_rows >= float(apply_min_y))
         & (abs_resid < float(residual_mm))
     )
+    # Trunk-in-CC restriction: only allow the cut inside CCs
+    # that contain a trunk. CCs without trunks are uncertain
+    # (could be a tree SAM/heuristic missed) and we err on
+    # the preserving side. Other filters (invalid-depth, HSV)
+    # can still cut them by their own criteria.
+    if require_trunk_in_cc and trunk_boxes:
+        try:
+            import cv2 as _cv2_cc
+        except Exception:
+            _cv2_cc = None
+        if _cv2_cc is not None:
+            cm_u8 = cm_orig.astype(np.uint8) * 255
+            n_cc, labels, _stats, _ = (
+                _cv2_cc.connectedComponentsWithStats(
+                    cm_u8, connectivity=8,
+                )
+            )
+            if n_cc > 1:
+                cc_has_trunk = np.zeros(n_cc, dtype=bool)
+                for tb in trunk_boxes:
+                    x1 = max(0, int(round(float(tb[0]))))
+                    y1 = max(0, int(round(float(tb[1]))))
+                    x2 = min(w - 1, int(round(float(tb[2]))))
+                    y2 = min(h - 1, int(round(float(tb[3]))))
+                    if x1 > x2 or y1 > y2:
+                        continue
+                    cc_in_box = labels[y1:y2 + 1, x1:x2 + 1]
+                    for cc_id in np.unique(cc_in_box):
+                        if int(cc_id) > 0:
+                            cc_has_trunk[int(cc_id)] = True
+                # cc_has_trunk[labels] broadcasts to (h, w)
+                # bool of CC-has-trunk per pixel.
+                trunk_cc_pixels = cc_has_trunk[labels]
+                cut = cut & trunk_cc_pixels
     out[cut] = False
     if high_trust_mask is not None:
         ht = np.asarray(high_trust_mask).astype(bool)
@@ -5711,6 +5803,36 @@ def main():
                     help="Max median candidate-fit residual. Above "
                          "this the candidate set was probably mixed "
                          "tree+ground; abort the fit.")
+    ap.add_argument("--canopy-grass-plane-require-trunk-in-cc",
+                    action="store_true",
+                    help="Restrict the depth-plane cut to canopy "
+                         "CCs that contain at least one trunk bbox. "
+                         "Without a trunk anchor we don't have "
+                         "confidence about where the tree ends and "
+                         "ground begins; foliage at depth similar "
+                         "to the plane could be wrongly cut. CCs "
+                         "without a trunk are left intact in this "
+                         "mode and must be cleaned by other filters "
+                         "(invalid-depth, HSV grass, etc.).")
+    # Final canopy gate: invalid / out-of-band depth.
+    ap.add_argument("--canopy-cut-invalid-depth",
+                    action="store_true",
+                    help="At the end of SUBTRACT, remove canopy "
+                         "pixels whose depth is 0 (D455 couldn't "
+                         "measure) or outside the foreground band "
+                         "[depth_min_mm, --canopy-cut-invalid-depth-"
+                         "max-mm]. Catches REFINE-phase fills that "
+                         "bridge across sky / barn / distant "
+                         "background pixels which slip through "
+                         "every other SUBTRACT filter (bg-depth "
+                         "only checks > threshold, not == 0).")
+    ap.add_argument("--canopy-cut-invalid-depth-max-mm",
+                    type=float, default=3500.0,
+                    help="Upper bound for valid foreground depth "
+                         "in the invalid-depth canopy gate. Set "
+                         "slightly above --canopy-post-fill-bg-"
+                         "depth-mm to give a cushion at the "
+                         "boundary.")
     # Plan C Strategy 3: per-CC top-vs-row depth jump
     ap.add_argument("--canopy-crop-top-vs-row-depth-jump",
                     action="store_true",
@@ -7836,6 +7958,9 @@ def main():
                                     max_median_fit_residual_mm=(
                                         args.canopy_grass_plane_max_fit_residual_mm
                                     ),
+                                    require_trunk_in_cc=(
+                                        args.canopy_grass_plane_require_trunk_in_cc
+                                    ),
                                     high_trust_mask=_high_trust_mask,
                                 )
                             )
@@ -8275,6 +8400,9 @@ def main():
                                     max_median_fit_residual_mm=(
                                         args.canopy_grass_plane_max_fit_residual_mm
                                     ),
+                                    require_trunk_in_cc=(
+                                        args.canopy_grass_plane_require_trunk_in_cc
+                                    ),
                                     high_trust_mask=_high_trust_mask,
                                 )
                             )
@@ -8407,6 +8535,33 @@ def main():
                             file=sys.stderr,
                         )
 
+                # FINAL canopy gate: every surviving pixel must
+                # have measured depth in [depth_min_mm, max_mm].
+                # Catches REFINE-phase fills (closing, hole-fill,
+                # dilation) that bridged across invalid-depth
+                # pixels (sky, distant background, sensor blanks)
+                # which slip through every other SUBTRACT filter.
+                if (args.canopy_cut_invalid_depth
+                        and canopy_mask_img is not None
+                        and depth_mm is not None
+                        and canopy_mask_img.any()):
+                    try:
+                        canopy_mask_img = cut_canopy_invalid_depth(
+                            canopy_mask_img,
+                            depth_mm,
+                            depth_min_mm=args.depth_min_mm,
+                            depth_max_mm=(
+                                args.canopy_cut_invalid_depth_max_mm
+                            ),
+                            high_trust_mask=_high_trust_mask,
+                        )
+                    except Exception as _ivd_err:
+                        print(
+                            f"[warn] invalid-depth canopy gate "
+                            f"failed ({_ivd_err!r})",
+                            file=sys.stderr,
+                        )
+
                 # Per-frame canopy tracking. Either:
                 #   cc method:    extract connected components from
                 #                 the canopy mask (cheap; fails on
@@ -8440,9 +8595,13 @@ def main():
                 _ov_active_trunk_ages: list = []
                 # High-trust SAM mask diagnostic. Set in the canopy-
                 # construction block when --high-sam-trust-threshold
-                # > 0; init here so the overlay block is safe even
-                # when construction was skipped.
-                _high_trust_mask = None
+                # > 0; ensure it's at least defined (None) here so
+                # the overlay block is safe when construction was
+                # skipped. CRITICAL: do NOT unconditionally reset --
+                # that would zero out the value the SUBTRACT phase
+                # just computed (silent HT0% bug).
+                if "_high_trust_mask" not in locals():
+                    _high_trust_mask = None
                 if (args.track_canopy and canopy_mask_img is not None):
                     if current_canopy_tracker is None:
                         current_canopy_tracker = CanopyTracker(
