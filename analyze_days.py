@@ -9192,6 +9192,20 @@ def main():
                                     _kept_raw_idx,
                                     [id(b) for b in _kept_trunk_boxes],
                                 ))
+                                # id->mask lookup for post-filter
+                                # mask realignment. Length-aligned
+                                # iteration: pre-filter boxes and
+                                # masks are 1:1 here.
+                                _stake_id_to_mask: dict = {}
+                                if (_kept_trunk_masks
+                                        and len(_kept_trunk_masks)
+                                            == len(_kept_trunk_boxes)):
+                                    _stake_id_to_mask = {
+                                        id(b): m for b, m in zip(
+                                            _kept_trunk_boxes,
+                                            _kept_trunk_masks,
+                                        )
+                                    }
                                 _kept_trunk_boxes, _kept_trunk_scores = (
                                     filter_painted_stake_trunks(
                                         _kept_trunk_boxes,
@@ -9215,20 +9229,22 @@ def main():
                                             'stake'
                                         )
                                 _kept_raw_idx = _new_kept_raw_idx
-                                # ALSO drop the matching masks so the
-                                # depth-filter sees the right ones.
+                                # ALSO realign masks. The filter
+                                # preserves box object identity
+                                # (kept_boxes.append(box)), so we
+                                # map id->mask BEFORE the filter
+                                # and rebuild the masks list AFTER
+                                # by looking up each surviving
+                                # box's id. The previous index-
+                                # based realignment was buggy when
+                                # the filter dropped non-trailing
+                                # boxes (paired wrong mask with
+                                # wrong box).
                                 if _masks_for_filter is not None:
                                     _kept_trunk_masks = [
-                                        m for m, b in zip(
-                                            _kept_trunk_masks,
-                                            list(_kept_trunk_boxes)
-                                            + [None] * (
-                                                len(_kept_trunk_masks)
-                                                - len(_kept_trunk_boxes)
-                                            ),
-                                        )
-                                        if b is not None
-                                    ][:len(_kept_trunk_boxes)]
+                                        _stake_id_to_mask.get(id(b))
+                                        for b in _kept_trunk_boxes
+                                    ]
                             # Reject background-row trunks by depth.
                             # A real foreground trunk sits in the
                             # canopy depth band (~1-3 m). A back-row
@@ -9239,17 +9255,38 @@ def main():
                             if (args.canopy_trunk_max_depth_mm > 0
                                     and depth_mm is not None
                                     and _kept_trunk_boxes):
+                                # np.stack fails on None entries, which
+                                # could exist after the stake filter's
+                                # id-based realignment if any id lookup
+                                # missed (shouldn't happen with object-
+                                # identity preservation, but be defensive).
                                 _masks_for_dfilter = (
                                     np.stack(_kept_trunk_masks, axis=0)
                                     if (_kept_trunk_masks
                                         and len(_kept_trunk_masks)
-                                            == len(_kept_trunk_boxes))
+                                            == len(_kept_trunk_boxes)
+                                        and all(
+                                            m is not None
+                                            for m in _kept_trunk_masks
+                                        ))
                                     else None
                                 )
                                 _pre_depth_pairs = list(zip(
                                     _kept_raw_idx,
                                     [id(b) for b in _kept_trunk_boxes],
                                 ))
+                                # id->mask lookup for mask
+                                # realignment after the filter.
+                                _depth_id_to_mask: dict = {}
+                                if (_kept_trunk_masks
+                                        and len(_kept_trunk_masks)
+                                            == len(_kept_trunk_boxes)):
+                                    _depth_id_to_mask = {
+                                        id(b): m for b, m in zip(
+                                            _kept_trunk_boxes,
+                                            _kept_trunk_masks,
+                                        )
+                                    }
                                 _kept_trunk_boxes, _kept_trunk_scores = (
                                     filter_far_trunks(
                                         _kept_trunk_boxes,
@@ -9271,6 +9308,18 @@ def main():
                                         _ov_raw_trunk_reasons[_ri] = (
                                             'depth'
                                         )
+                                # Realign masks to surviving boxes.
+                                # Same id-based pattern as the
+                                # stake filter -- previously this
+                                # filter wasn't updating masks at
+                                # all, leaving _kept_trunk_masks
+                                # length-mismatched with the
+                                # filtered _kept_trunk_boxes.
+                                if _depth_id_to_mask:
+                                    _kept_trunk_masks = [
+                                        _depth_id_to_mask.get(id(b))
+                                        for b in _kept_trunk_boxes
+                                    ]
                                 _kept_raw_idx = _new_kept_raw_idx
                         # Snapshot the FRESH (post-filter, pre-memory)
                         # trunk set for the overlay. Anything in
