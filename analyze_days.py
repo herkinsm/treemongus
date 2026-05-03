@@ -4107,6 +4107,7 @@ def crop_canopy_below_trunks(
     canopy_mask: np.ndarray,
     trunk_boxes: list,
     *,
+    trunk_masks: list | np.ndarray | None = None,
     buffer_below_px: int = 30,
 ) -> np.ndarray:
     """Crop each canopy CC at the bottom of its trunk(s).
@@ -4118,11 +4119,23 @@ def crop_canopy_below_trunks(
     the same canopy CC below trunk_y2 + buffer is ground and
     should be removed.
 
+    When trunk_masks is provided AND the SAM bbox extends below
+    the actual segmentation, the cut uses the MASK'S lowest row
+    instead -- the bbox can over-extend (especially with the
+    "tree trunk" prompt that captures the whole foliage+trunk
+    column), but the segmentation is usually tighter on the
+    real wooden trunk. Using min(bbox_y2, mask_y2) gives the
+    tighter, more aggressive cut. If no mask is supplied for a
+    given trunk, the bbox bottom is used unchanged.
+
     Implementation:
       1. CC-label the canopy mask.
-      2. For each CC, find every trunk bbox whose interior
+      2. For each CC, find every trunk whose bbox interior
          contains at least one canopy-mask pixel of that CC.
-      3. Cut the CC at row max(trunk_y2 for those trunks) +
+      3. Compute that trunk's effective cut row =
+         min(bbox_y2, mask_y2_within_bbox_columns)
+         (or just bbox_y2 if no mask).
+      4. Cut the CC at row max(cut_row for those trunks) +
          buffer_below_px. Pixels of this CC below that row
          are removed.
 
@@ -4142,6 +4155,10 @@ def crop_canopy_below_trunks(
     except Exception:
         return cm
     h, w = cm.shape
+    use_masks = (
+        trunk_masks is not None
+        and len(trunk_masks) == len(trunk_boxes)
+    )
     cm_u8 = cm.astype(np.uint8) * 255
     n_cc, labels, _stats, _ = _cv2.connectedComponentsWithStats(
         cm_u8, connectivity=8,
@@ -4153,19 +4170,36 @@ def crop_canopy_below_trunks(
         cc_pix = (labels == cc_id)
         if not cc_pix.any():
             continue
-        cc_trunk_y2: list[int] = []
-        for tb in trunk_boxes:
+        cc_trunk_cuts: list[int] = []
+        for ti, tb in enumerate(trunk_boxes):
             x1 = max(0, int(round(float(tb[0]))))
             y1 = max(0, int(round(float(tb[1]))))
             x2 = min(w - 1, int(round(float(tb[2]))))
             y2 = min(h - 1, int(round(float(tb[3]))))
             if x2 < x1 or y2 < y1:
                 continue
-            if cc_pix[y1:y2 + 1, x1:x2 + 1].any():
-                cc_trunk_y2.append(y2)
-        if not cc_trunk_y2:
+            if not cc_pix[y1:y2 + 1, x1:x2 + 1].any():
+                continue
+            cut_y = y2
+            if use_masks:
+                m = trunk_masks[ti]
+                if m is not None:
+                    if hasattr(m, "ndim") and m.ndim == 3:
+                        m = m.any(axis=0)
+                    mb = np.asarray(m).astype(bool)
+                    if mb.shape == (h, w):
+                        # Lowest row where the mask is True
+                        # within this bbox's column band.
+                        col_band = mb[:, x1:x2 + 1]
+                        ys_in = np.where(col_band.any(axis=1))[0]
+                        if ys_in.size:
+                            mask_y2 = int(ys_in.max())
+                            # Tighter of the two cuts.
+                            cut_y = min(cut_y, mask_y2)
+            cc_trunk_cuts.append(cut_y)
+        if not cc_trunk_cuts:
             continue
-        cut_row = max(cc_trunk_y2) + int(buffer_below_px)
+        cut_row = max(cc_trunk_cuts) + int(buffer_below_px)
         if cut_row < h - 1:
             below = np.zeros_like(out)
             below[cut_row + 1:, :] = True
@@ -8351,6 +8385,11 @@ def main():
                                         crop_canopy_below_trunks(
                                             canopy_mask_img,
                                             _kept_trunk_boxes,
+                                            trunk_masks=(
+                                                _kept_trunk_masks
+                                                if _kept_trunk_masks
+                                                else None
+                                            ),
                                             buffer_below_px=(
                                                 args.canopy_crop_below_trunk_buffer_px
                                             ),
