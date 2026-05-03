@@ -5162,6 +5162,25 @@ def main():
                          "frame's trunk detections to memory entries. "
                          "Higher = stricter match (less drift across "
                          "frames). Default 0.3.")
+    ap.add_argument("--canopy-temporal-merge", action="store_true",
+                    help="Carry the canopy forward across frames "
+                         "to prevent same-tree splitting. After "
+                         "current canopy is built, OR with "
+                         "(previous_canopy AND current_foreground "
+                         "AND not_sky). Pixels that were canopy in "
+                         "the previous frame and are still foreground "
+                         "(depth in band, not sky) get re-included. "
+                         "Bridges current-frame CCs that should be "
+                         "one tree but got split by transient gaps "
+                         "(trunk visible through canopy, dilation "
+                         "cap, hole-fill misses). Per session; "
+                         "resets when session changes.")
+    ap.add_argument("--canopy-temporal-merge-dilate-px", type=int,
+                    default=8,
+                    help="Dilate the previous canopy mask by this "
+                         "many pixels before AND-ing with current "
+                         "foreground. Compensates for small camera "
+                         "motion between frames. Default 8.")
     ap.add_argument("--canopy-crop-below-trunk", action="store_true",
                     help="For each canopy CC that overlaps a SAM "
                          "trunk bbox, crop the CC at row "
@@ -6210,6 +6229,13 @@ def main():
     # tree IDs are scoped to one orchard-pass.
     current_canopy_tracker: CanopyTracker | None = None
     current_trunk_memory: TrunkMemory | None = None
+    # Per-session previous-frame canopy mask. Used by temporal-
+    # merge: pixels that were canopy in the previous frame AND
+    # are still foreground depth + non-sky in the current frame
+    # get added to the current canopy. Bridges current-frame CCs
+    # that should be one tree but got split (e.g., trunk creates
+    # a gap in the canopy mask).
+    current_prev_canopy_mask: np.ndarray | None = None
     # Per-(session, tree_id) summary for the new trees CSV.
     tree_summaries: list[dict] = []
     # Per-frame, per-tree row for trees_per_frame CSV.
@@ -6281,6 +6307,7 @@ def main():
                     if args.canopy_trunk_memory_frames > 0
                     else None
                 )
+                current_prev_canopy_mask = None
                 current_session_key = session_key
 
             t_img = time.time()
@@ -7027,6 +7054,93 @@ def main():
                     if _crow < canopy_mask_img.shape[0]:
                         canopy_mask_img = canopy_mask_img.astype(bool).copy()
                         canopy_mask_img[_crow + 1:, :] = False
+
+                # TEMPORAL CANOPY MERGE. If the previous frame's
+                # canopy spanned across what is now multiple
+                # current-frame CCs, those CCs should be one tree.
+                # Add pixels that were canopy LAST frame AND are
+                # still foreground depth + non-sky in THIS frame.
+                # Bridges same-tree CCs that got split by gaps the
+                # current frame's processing created.
+                if (args.canopy_temporal_merge
+                        and current_prev_canopy_mask is not None
+                        and canopy_mask_img is not None
+                        and depth_mm is not None
+                        and current_prev_canopy_mask.shape ==
+                            canopy_mask_img.shape):
+                    try:
+                        import cv2 as _cv2_tm
+                        # Slightly dilate previous mask to handle
+                        # small camera motion between frames.
+                        _tm_dil = int(
+                            args.canopy_temporal_merge_dilate_px
+                        )
+                        if _tm_dil > 0:
+                            _tm_kern = _cv2_tm.getStructuringElement(
+                                _cv2_tm.MORPH_ELLIPSE,
+                                (2 * _tm_dil + 1, 2 * _tm_dil + 1),
+                            )
+                            _prev_dil = _cv2_tm.dilate(
+                                current_prev_canopy_mask.astype(np.uint8),
+                                _tm_kern, iterations=1,
+                            ) > 0
+                        else:
+                            _prev_dil = current_prev_canopy_mask.astype(bool)
+                        # Current foreground depth (not sky).
+                        _depth_f_tm = depth_mm.astype(np.float32)
+                        _fg_tm = (
+                            (_depth_f_tm >= float(args.depth_min_mm))
+                            & (_depth_f_tm <= float(args.depth_max_mm))
+                        )
+                        # Sky exclusion mirrors the same rule used
+                        # in refine_canopy_mask.
+                        try:
+                            _rgb_tm = np.asarray(img)
+                            _hsv_tm = _cv2_tm.cvtColor(
+                                _rgb_tm.astype(np.uint8),
+                                _cv2_tm.COLOR_RGB2HSV,
+                            )
+                            _Ht = _hsv_tm[:, :, 0]
+                            _St = _hsv_tm[:, :, 1]
+                            _Vt = _hsv_tm[:, :, 2]
+                            _sky_blue = (
+                                (_Ht >= 85) & (_Ht <= 145) & (_St > 8)
+                            )
+                            _sky_bright = (_Vt > 185) & (_St < 15)
+                            _no_d = (_depth_f_tm == 0)
+                            _sky_overcast = (
+                                (_St < 10) & (_Vt > 100) & (_Vt < 200)
+                                & _no_d
+                            )
+                            _sky_tm = (
+                                _sky_blue | _sky_bright | _sky_overcast
+                            )
+                            _fg_clean_tm = _fg_tm & ~_sky_tm
+                        except Exception:
+                            _fg_clean_tm = _fg_tm
+                        # Add previous canopy pixels still in
+                        # foreground.
+                        canopy_mask_img = (
+                            canopy_mask_img.astype(bool)
+                            | (_prev_dil & _fg_clean_tm)
+                        )
+                    except Exception as _tm_err:
+                        print(
+                            f"[warn] temporal canopy merge failed "
+                            f"({_tm_err!r}); using current canopy "
+                            f"only",
+                            file=sys.stderr,
+                        )
+
+                # Update previous-frame canopy AT END of frame
+                # processing for use in the NEXT frame.
+                if args.canopy_temporal_merge:
+                    if canopy_mask_img is not None:
+                        current_prev_canopy_mask = (
+                            canopy_mask_img.astype(bool).copy()
+                        )
+                    else:
+                        current_prev_canopy_mask = None
 
                 # FINAL tree-shape filter: catches CCs that became
                 # wide+short AFTER closing bridged smaller CCs. The
