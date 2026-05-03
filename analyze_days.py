@@ -8574,6 +8574,79 @@ def main():
                                     rgb_co, _ht_contours, -1,
                                     (60, 180, 255), 1,
                                 )
+                        # Per-prompt SAM mask contours. Top-scoring
+                        # mask from each canopy SAM prompt drawn in
+                        # a distinct color with "<abbr> <score>"
+                        # label. Lets you see which prompt is
+                        # responsible when the canopy balloons --
+                        # if e.g. the "tree canopy" outline covers
+                        # grass at score 0.18, that prompt is the
+                        # source. Cutoff 0.10 (below the unioning
+                        # threshold of --canopy-sam-min-score=0.15)
+                        # so you also see weak detections that did
+                        # NOT make it into canopy_mask.
+                        _pp_colors = [
+                            (255, 255, 255),
+                            (255, 80, 200),
+                            (140, 255, 80),
+                            (100, 255, 200),
+                            (180, 130, 255),
+                        ]
+                        if (isinstance(infer, dict)
+                                and _canopy_sam_prompt_set):
+                            for _ppi, _ppname in enumerate(
+                                _canopy_sam_prompt_set,
+                            ):
+                                if _ppname not in infer:
+                                    continue
+                                _pp_data = infer[_ppname]
+                                _pp_masks = _pp_data.get("masks")
+                                _pp_scores = _pp_data.get("scores")
+                                if (_pp_masks is None
+                                        or _pp_scores is None
+                                        or len(_pp_masks) == 0):
+                                    continue
+                                _top_i = int(np.argmax(_pp_scores))
+                                _top_s = float(_pp_scores[_top_i])
+                                if _top_s < 0.10:
+                                    continue
+                                _top_m = np.asarray(
+                                    _pp_masks[_top_i],
+                                ).astype(bool)
+                                if _top_m.ndim == 3:
+                                    _top_m = _top_m.any(axis=0)
+                                if _top_m.shape != cm_bool.shape:
+                                    continue
+                                _pc = _pp_colors[
+                                    _ppi % len(_pp_colors)
+                                ]
+                                _pp_u8 = (
+                                    _top_m.astype(np.uint8) * 255
+                                )
+                                _pp_cnt, _ = _cv2_co.findContours(
+                                    _pp_u8, _cv2_co.RETR_EXTERNAL,
+                                    _cv2_co.CHAIN_APPROX_SIMPLE,
+                                )
+                                _cv2_co.drawContours(
+                                    rgb_co, _pp_cnt, -1, _pc, 1,
+                                )
+                                _ys_pp, _xs_pp = np.where(_top_m)
+                                if _ys_pp.size:
+                                    _abbr = ''.join(
+                                        w[0].upper()
+                                        for w in _ppname.split()
+                                        if w
+                                    )[:3]
+                                    _cv2_co.putText(
+                                        rgb_co,
+                                        f"{_abbr} {_top_s:.2f}",
+                                        (
+                                            int(_xs_pp.min()),
+                                            max(0, int(_ys_pp.min()) - 4),
+                                        ),
+                                        _cv2_co.FONT_HERSHEY_SIMPLEX,
+                                        0.45, _pc, 1, _cv2_co.LINE_AA,
+                                    )
                         # Bright outline on canopy boundary.
                         cm_u8 = cm_bool.astype(np.uint8) * 255
                         contours, _ = _cv2_co.findContours(
