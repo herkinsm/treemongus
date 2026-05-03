@@ -3994,6 +3994,136 @@ def remove_grass_by_hsv(
     return cm & ~(grass_color & in_lower)
 
 
+def remove_grass_by_depth_plane(
+    canopy_mask: np.ndarray,
+    depth_mm: np.ndarray | None,
+    *,
+    trunk_boxes: list | None = None,
+    candidate_min_y: int = 320,
+    apply_min_y: int = 200,
+    residual_mm: float = 200.0,
+    min_candidates: int = 200,
+    depth_min_mm: float = 600.0,
+    depth_max_mm: float = 3500.0,
+    min_slope_mm_per_row: float = 0.5,
+    max_slope_mm_per_row: float = 50.0,
+    max_median_fit_residual_mm: float = 500.0,
+    high_trust_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Cut ground from canopy by fitting a plane to candidate
+    ground pixels and removing canopy pixels whose depth
+    matches the plane within residual_mm.
+
+    Ground in an orchard is approximately a tilted plane in
+    (col, row, depth) space (camera angled down at field).
+    Tree foliage has high-frequency depth variation between
+    leaves and branches, producing large residuals against the
+    plane. This is color-agnostic, so unlike HSV grass it
+    works on dry/yellow/brown grass, mixed terrain, or
+    desaturated lighting equally.
+
+    Algorithm:
+      1. Build candidate ground mask: valid foreground depth,
+         row >= candidate_min_y, outside any trunk bbox.
+      2. Fit plane depth = a*col + b*row + c via least
+         squares.
+      3. Sanity check: b in [min_slope, max_slope] (depth
+         increases going down at a reasonable rate); median
+         fit residual <= max_median_fit_residual_mm. If the
+         fit looks suspicious, abort -- candidate-ground
+         selection probably picked up tree pixels.
+      4. For canopy pixels with row >= apply_min_y AND valid
+         depth, compute residual = |actual - predicted|. Cut
+         if residual < residual_mm.
+      5. If high_trust_mask provided, restore pixels in
+         (original_canopy & high_trust_mask).
+
+    Returns the modified canopy mask. On any input error or
+    failed sanity check, returns the input mask unchanged.
+    """
+    if canopy_mask is None or depth_mm is None:
+        return canopy_mask
+    cm_orig = np.asarray(canopy_mask).astype(bool)
+    if not cm_orig.any():
+        return cm_orig
+    h, w = cm_orig.shape
+    if depth_mm.shape != (h, w):
+        return cm_orig
+    valid_depth = (
+        (depth_mm >= float(depth_min_mm))
+        & (depth_mm <= float(depth_max_mm))
+    )
+    rows_grid = np.broadcast_to(
+        np.arange(h, dtype=np.float32).reshape(-1, 1), (h, w),
+    )
+    cand = valid_depth & (rows_grid >= float(candidate_min_y))
+    # Exclude trunk bbox interiors so a tilted-tree wouldn't
+    # corrupt the fit.
+    if trunk_boxes:
+        for tb in trunk_boxes:
+            x1 = max(0, int(round(float(tb[0]))))
+            y1 = max(0, int(round(float(tb[1]))))
+            x2 = min(w - 1, int(round(float(tb[2]))))
+            y2 = min(h - 1, int(round(float(tb[3]))))
+            if x1 <= x2 and y1 <= y2:
+                cand[y1:y2 + 1, x1:x2 + 1] = False
+    if int(cand.sum()) < int(min_candidates):
+        return cm_orig
+    # Least-squares plane fit: depth = a*col + b*row + c.
+    ys, xs = np.where(cand)
+    cols_f = xs.astype(np.float32)
+    rows_f = ys.astype(np.float32)
+    depths_f = depth_mm[ys, xs].astype(np.float32)
+    X = np.stack(
+        [cols_f, rows_f, np.ones_like(cols_f)], axis=1,
+    )
+    try:
+        coeffs, _resid, _rank, _sv = np.linalg.lstsq(
+            X, depths_f, rcond=None,
+        )
+    except Exception:
+        return cm_orig
+    a_c = float(coeffs[0])
+    b_r = float(coeffs[1])
+    c_0 = float(coeffs[2])
+    # Sanity check 1: ground depth should INCREASE with row
+    # (camera angled down). b too small or negative means we
+    # fit something that isn't ground; abort.
+    if (b_r < float(min_slope_mm_per_row)
+            or b_r > float(max_slope_mm_per_row)):
+        return cm_orig
+    # Sanity check 2: candidate-ground residuals should be
+    # small. Large median residual means candidates were
+    # tree+ground mix and the fit is unreliable.
+    pred_cand = X @ coeffs
+    median_fit_resid = float(
+        np.median(np.abs(depths_f - pred_cand))
+    )
+    if median_fit_resid > float(max_median_fit_residual_mm):
+        return cm_orig
+    # Apply: cut canopy pixels close to the plane.
+    out = cm_orig.copy()
+    full_cols = np.broadcast_to(
+        np.arange(w, dtype=np.float32).reshape(1, -1), (h, w),
+    )
+    full_rows = rows_grid
+    pred_depth = a_c * full_cols + b_r * full_rows + c_0
+    actual_depth = depth_mm.astype(np.float32)
+    abs_resid = np.abs(actual_depth - pred_depth)
+    cut = (
+        out
+        & valid_depth
+        & (full_rows >= float(apply_min_y))
+        & (abs_resid < float(residual_mm))
+    )
+    out[cut] = False
+    if high_trust_mask is not None:
+        ht = np.asarray(high_trust_mask).astype(bool)
+        if ht.shape == out.shape:
+            out = out | (cm_orig & ht)
+    return out
+
+
 def crop_canopy_ground_gradient(
     canopy_mask: np.ndarray,
     depth_mm: np.ndarray | None,
@@ -5536,6 +5666,51 @@ def main():
                     help="Only consider grass-color pixels at row "
                          ">= this. Default 300 protects upper-canopy "
                          "sunlit leaves from being removed as grass.")
+    # Plan C Strategy 2b: depth-plane-based grass removal.
+    ap.add_argument("--canopy-remove-grass-by-depth-plane",
+                    action="store_true",
+                    help="Color-agnostic ground removal. Fits a "
+                         "tilted plane to candidate ground pixels "
+                         "(lower-frame foreground depth, outside "
+                         "trunk bboxes) and cuts canopy pixels whose "
+                         "actual depth matches the plane within "
+                         "--canopy-grass-plane-residual-mm. Sparse "
+                         "leaves at varying depths produce large "
+                         "residuals and survive; flat ground (any "
+                         "color) fits the plane and gets cut.")
+    ap.add_argument("--canopy-grass-plane-candidate-min-y",
+                    type=int, default=320,
+                    help="Pull plane-fit candidate pixels from rows "
+                         ">= this. Default 320 = clearly below the "
+                         "horizon for typical D455 mounting.")
+    ap.add_argument("--canopy-grass-plane-apply-min-y",
+                    type=int, default=200,
+                    help="Only cut canopy pixels at row >= this. "
+                         "Default 200 protects upper foliage even "
+                         "if it accidentally lies on the plane.")
+    ap.add_argument("--canopy-grass-plane-residual-mm",
+                    type=float, default=200.0,
+                    help="Plane-residual tolerance in mm. Pixels "
+                         "with |actual_depth - predicted_depth| < "
+                         "this are cut as ground.")
+    ap.add_argument("--canopy-grass-plane-min-candidates",
+                    type=int, default=200,
+                    help="Minimum candidate-ground pixels required "
+                         "to attempt the plane fit.")
+    ap.add_argument("--canopy-grass-plane-min-slope",
+                    type=float, default=0.5,
+                    help="Min mm/row slope (b coefficient). Below "
+                         "this we abort the fit -- depth isn't "
+                         "increasing enough with row to be ground.")
+    ap.add_argument("--canopy-grass-plane-max-slope",
+                    type=float, default=50.0,
+                    help="Max mm/row slope. Above this is suspicious "
+                         "and we abort the fit.")
+    ap.add_argument("--canopy-grass-plane-max-fit-residual-mm",
+                    type=float, default=500.0,
+                    help="Max median candidate-fit residual. Above "
+                         "this the candidate set was probably mixed "
+                         "tree+ground; abort the fit.")
     # Plan C Strategy 3: per-CC top-vs-row depth jump
     ap.add_argument("--canopy-crop-top-vs-row-depth-jump",
                     action="store_true",
@@ -7606,8 +7781,68 @@ def main():
                             )
                         except Exception as _gh_err:
                             print(
-                                f"[warn] HSV grass removal failed "
+                                f"[warn] HSV grass removal failed"
                                 f"({_gh_err!r})",
+                                file=sys.stderr,
+                            )
+
+                    # PLAN C STRATEGY 2b: depth-plane ground
+                    # removal. Color-agnostic complement to HSV
+                    # grass: fits a tilted plane to candidate
+                    # ground pixels and cuts canopy whose actual
+                    # depth matches the plane within tolerance.
+                    # Catches dry/yellow/brown grass that HSV
+                    # misses; sparse-leaf-on-grass survives
+                    # because individual leaves have varying
+                    # depth offsets from the plane.
+                    if (args.canopy_remove_grass_by_depth_plane
+                            and canopy_mask_img is not None
+                            and depth_mm is not None
+                            and canopy_mask_img.any()):
+                        try:
+                            canopy_mask_img = (
+                                remove_grass_by_depth_plane(
+                                    canopy_mask_img,
+                                    depth_mm,
+                                    trunk_boxes=(
+                                        _aware_trunks_pre
+                                        if _aware_trunks_pre
+                                        else None
+                                    ),
+                                    candidate_min_y=(
+                                        args.canopy_grass_plane_candidate_min_y
+                                    ),
+                                    apply_min_y=(
+                                        args.canopy_grass_plane_apply_min_y
+                                    ),
+                                    residual_mm=(
+                                        args.canopy_grass_plane_residual_mm
+                                    ),
+                                    min_candidates=(
+                                        args.canopy_grass_plane_min_candidates
+                                    ),
+                                    depth_min_mm=args.depth_min_mm,
+                                    depth_max_mm=(
+                                        args.canopy_post_fill_bg_depth_mm
+                                        if args.canopy_post_fill_bg_depth_mm > 0
+                                        else 3500.0
+                                    ),
+                                    min_slope_mm_per_row=(
+                                        args.canopy_grass_plane_min_slope
+                                    ),
+                                    max_slope_mm_per_row=(
+                                        args.canopy_grass_plane_max_slope
+                                    ),
+                                    max_median_fit_residual_mm=(
+                                        args.canopy_grass_plane_max_fit_residual_mm
+                                    ),
+                                    high_trust_mask=_high_trust_mask,
+                                )
+                            )
+                        except Exception as _gp_err:
+                            print(
+                                f"[warn] depth-plane grass removal "
+                                f"failed ({_gp_err!r})",
                                 file=sys.stderr,
                             )
 
@@ -7996,6 +8231,52 @@ def main():
                                 sat_min=args.canopy_grass_sat_min,
                                 val_min=args.canopy_grass_val_min,
                                 min_y=args.canopy_grass_min_y,
+                            )
+                        except Exception:
+                            pass
+                    # Depth-plane grass removal (Plan C Strategy 2b)
+                    if (args.canopy_remove_grass_by_depth_plane
+                            and canopy_mask_img is not None
+                            and depth_mm is not None):
+                        try:
+                            canopy_mask_img = (
+                                remove_grass_by_depth_plane(
+                                    canopy_mask_img,
+                                    depth_mm,
+                                    trunk_boxes=(
+                                        _aware_trunks_pre
+                                        if _aware_trunks_pre
+                                        else None
+                                    ),
+                                    candidate_min_y=(
+                                        args.canopy_grass_plane_candidate_min_y
+                                    ),
+                                    apply_min_y=(
+                                        args.canopy_grass_plane_apply_min_y
+                                    ),
+                                    residual_mm=(
+                                        args.canopy_grass_plane_residual_mm
+                                    ),
+                                    min_candidates=(
+                                        args.canopy_grass_plane_min_candidates
+                                    ),
+                                    depth_min_mm=args.depth_min_mm,
+                                    depth_max_mm=(
+                                        args.canopy_post_fill_bg_depth_mm
+                                        if args.canopy_post_fill_bg_depth_mm > 0
+                                        else 3500.0
+                                    ),
+                                    min_slope_mm_per_row=(
+                                        args.canopy_grass_plane_min_slope
+                                    ),
+                                    max_slope_mm_per_row=(
+                                        args.canopy_grass_plane_max_slope
+                                    ),
+                                    max_median_fit_residual_mm=(
+                                        args.canopy_grass_plane_max_fit_residual_mm
+                                    ),
+                                    high_trust_mask=_high_trust_mask,
+                                )
                             )
                         except Exception:
                             pass

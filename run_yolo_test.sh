@@ -162,6 +162,14 @@ echo "[batch] Using python: $PY"
   --canopy-grass-hue-min 25 --canopy-grass-hue-max 90 \
   --canopy-grass-sat-min 50 --canopy-grass-val-min 80 \
   --canopy-grass-min-y 200 \
+  --canopy-remove-grass-by-depth-plane \
+  --canopy-grass-plane-candidate-min-y 320 \
+  --canopy-grass-plane-apply-min-y 200 \
+  --canopy-grass-plane-residual-mm 200 \
+  --canopy-grass-plane-min-candidates 200 \
+  --canopy-grass-plane-min-slope 0.5 \
+  --canopy-grass-plane-max-slope 50 \
+  --canopy-grass-plane-max-fit-residual-mm 500 \
   --canopy-crop-top-vs-row-depth-jump \
   --canopy-row-jump-min-mm 500 \
   --canopy-row-jump-top-frac 0.25 \
