@@ -125,6 +125,10 @@ echo "[batch] Using python: $PY"
   --canopy-row-jump-min-mm 500 \
   --canopy-row-jump-top-frac 0.25 \
   --canopy-row-jump-min-pixels-per-row 10 \
+  --canopy-crop-thin-bottom-bands \
+  --canopy-band-max-height-px 25 \
+  --canopy-band-min-width-jump-px 200 \
+  --canopy-band-check-above-rows 30 \
   --canopy-trunk-memory-frames 5 --canopy-trunk-memory-iou 0.3 \
   --canopy-temporal-merge --canopy-temporal-merge-dilate-px 8 \
   --canopy-temporal-merge-trunk-aware \

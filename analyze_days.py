@@ -3510,6 +3510,98 @@ def fill_small_canopy_holes(
     return out
 
 
+def crop_thin_bottom_bands(
+    canopy_mask: np.ndarray,
+    *,
+    band_max_height_px: int = 25,
+    min_width_jump_px: int = 200,
+    check_above_rows: int = 30,
+) -> np.ndarray:
+    """For each canopy CC, detect a thin horizontal band at the
+    very bottom that is much wider than the rows just above it,
+    and crop it.
+
+    This catches the case where a tree's canopy CC has a thin
+    ground/grass band attached at the bottom -- the band is
+    connected to the tree by a few pixels but extends sideways
+    past the tree's actual canopy width. Per-pixel and per-CC
+    gradient detectors miss this because:
+      - Per-pixel gradient needs valid depth N rows BELOW each
+        candidate; for pixels in the bottom ~25 rows of a 480-
+        row frame, depth_below is out-of-frame.
+      - Per-CC ground gradient examines bottom 30% by pixel
+        count -- the tree dominates that, washing out any band-
+        local gradient.
+
+    Algorithm: per CC, compute per-row width within the bottom
+    band_max_height_px rows. Compare to mean width in the
+    check_above_rows rows just above. If band-mean exceeds
+    above-mean by min_width_jump_px, the band is a ground
+    extension and gets cropped.
+
+    Leaf protection:
+      1. Only the BOTTOM band_max_height_px rows are even
+         examined (default 25).
+      2. Comparison against rows IMMEDIATELY above (default 30
+         rows) -- a tree narrowing toward its trunk doesn't
+         exhibit a sudden widening at the bottom.
+      3. Width-jump threshold is large (200 px) -- random row-
+         to-row width fluctuations within a tree are <50 px.
+    """
+    if canopy_mask is None:
+        return canopy_mask
+    cm = canopy_mask.astype(bool)
+    if not cm.any():
+        return cm
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return cm
+    cm_u8 = cm.astype(np.uint8) * 255
+    n_cc, labels, stats, _ = _cv2.connectedComponentsWithStats(
+        cm_u8, connectivity=8,
+    )
+    if n_cc <= 1:
+        return cm
+    out = cm.copy()
+    for cc_id in range(1, n_cc):
+        y0 = int(stats[cc_id, _cv2.CC_STAT_TOP])
+        h_cc = int(stats[cc_id, _cv2.CC_STAT_HEIGHT])
+        if h_cc < int(band_max_height_px) + int(check_above_rows):
+            continue
+        cc_pix = (labels == cc_id)
+        # Per-row pixel count for THIS CC.
+        cc_per_row = cc_pix.sum(axis=1)
+        bottom_y = y0 + h_cc - 1
+        band_top = bottom_y - int(band_max_height_px) + 1
+        above_top = band_top - int(check_above_rows)
+        if above_top < y0:
+            continue
+        band_widths = cc_per_row[band_top:bottom_y + 1]
+        above_widths = cc_per_row[above_top:band_top]
+        if band_widths.size == 0 or above_widths.size == 0:
+            continue
+        band_max_w = float(band_widths.max())
+        above_mean_w = float(above_widths.mean())
+        if band_max_w <= above_mean_w + float(min_width_jump_px):
+            continue
+        # Find FIRST row in the band region where width exceeds
+        # the threshold -- that's where the band actually starts.
+        # Crop from there down (tree rows above the band stay).
+        threshold_w = above_mean_w + float(min_width_jump_px)
+        crop_start = -1
+        for dy in range(band_top, bottom_y + 1):
+            if float(cc_per_row[dy]) > threshold_w:
+                crop_start = dy
+                break
+        if crop_start < 0:
+            continue
+        crop_zone = np.zeros_like(cc_pix)
+        crop_zone[crop_start:bottom_y + 1, :] = True
+        out[cc_pix & crop_zone] = False
+    return out
+
+
 def crop_canopy_at_top_vs_row_depth_jump(
     canopy_mask: np.ndarray,
     depth_mm: np.ndarray | None,
@@ -5167,6 +5259,32 @@ def main():
                     type=int, default=10,
                     help="Require at least this many pixels in a "
                          "row for its median to count. Default 10.")
+    # Thin-bottom-band detector
+    ap.add_argument("--canopy-crop-thin-bottom-bands",
+                    action="store_true",
+                    help="Detect thin horizontal bands at the BOTTOM "
+                         "of each CC and crop them. Catches ground "
+                         "bands that are connected to a tree CC by "
+                         "a few pixels but extend sideways past the "
+                         "tree's actual canopy width. Per-pixel and "
+                         "per-CC depth-gradient detectors miss this "
+                         "case at the frame edge.")
+    ap.add_argument("--canopy-band-max-height-px", type=int,
+                    default=25,
+                    help="Maximum band height to detect (default 25 "
+                         "px). Tree-base portions are usually "
+                         "narrow + tall; ground bands are thin + "
+                         "wide.")
+    ap.add_argument("--canopy-band-min-width-jump-px", type=int,
+                    default=200,
+                    help="Band must be wider than the rows above "
+                         "by at least this many px (default 200). "
+                         "Large enough that random tree-row width "
+                         "fluctuations don't trigger.")
+    ap.add_argument("--canopy-band-check-above-rows", type=int,
+                    default=30,
+                    help="Number of rows ABOVE the band to compare "
+                         "widths against. Default 30.")
     ap.add_argument("--canopy-trunk-memory-frames", type=int,
                     default=0,
                     help="Carry trunks forward across frames. When "
@@ -7141,6 +7259,32 @@ def main():
                         canopy_mask_img = canopy_mask_img.astype(bool).copy()
                         canopy_mask_img[_crow + 1:, :] = False
 
+                # THIN-BOTTOM-BAND DETECTOR. Per CC, find a thin
+                # horizontal band at the bottom where the row-
+                # width is much wider than rows above. Crops it.
+                if (args.canopy_crop_thin_bottom_bands
+                        and canopy_mask_img is not None
+                        and canopy_mask_img.any()):
+                    try:
+                        canopy_mask_img = crop_thin_bottom_bands(
+                            canopy_mask_img,
+                            band_max_height_px=(
+                                args.canopy_band_max_height_px
+                            ),
+                            min_width_jump_px=(
+                                args.canopy_band_min_width_jump_px
+                            ),
+                            check_above_rows=(
+                                args.canopy_band_check_above_rows
+                            ),
+                        )
+                    except Exception as _band_err:
+                        print(
+                            f"[warn] thin-band crop failed "
+                            f"({_band_err!r})",
+                            file=sys.stderr,
+                        )
+
                 # TEMPORAL CANOPY MERGE. If the previous frame's
                 # canopy spanned across what is now multiple
                 # current-frame CCs, those CCs should be one tree.
@@ -7485,6 +7629,23 @@ def main():
                                 canopy_mask_img.astype(bool).copy()
                             )
                             canopy_mask_img[_crow2 + 1:, :] = False
+                    # Thin-bottom-band crop (post-merge cleanup)
+                    if args.canopy_crop_thin_bottom_bands:
+                        try:
+                            canopy_mask_img = crop_thin_bottom_bands(
+                                canopy_mask_img,
+                                band_max_height_px=(
+                                    args.canopy_band_max_height_px
+                                ),
+                                min_width_jump_px=(
+                                    args.canopy_band_min_width_jump_px
+                                ),
+                                check_above_rows=(
+                                    args.canopy_band_check_above_rows
+                                ),
+                            )
+                        except Exception:
+                            pass
 
                 # Update previous-frame canopy AT END of frame
                 # processing for use in the NEXT frame. We save
