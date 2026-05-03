@@ -86,6 +86,7 @@ echo "[batch] Using python: $PY"
   --canopy-sam-prompt "apple tree" --canopy-sam-min-score 0.10 \
   --canopy-sam-multi-prompts "apple tree" "tree branches" "tree canopy" "fruit tree" \
   --canopy-sam-min-pixels 500 --canopy-sam-min-lower-frac 0.50 \
+  --canopy-sam-foreground-min-bottom-row 350 \
   --canopy-sam-min-valid-depth-frac 0.30 \
   --canopy-sam-rgb-fallback-min-veg-frac 0.20 \
   --canopy-sam-max-top-row 280 \

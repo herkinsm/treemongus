@@ -3275,6 +3275,7 @@ def build_canopy_from_sam_trees(
     min_aspect_ratio: float = 0.5,
     max_depth_row_corr: float = 0.70,
     high_sam_trust_threshold: float = 0.0,
+    foreground_min_bottom_row: int = 0,
 ) -> np.ndarray:
     """Build a canopy mask from SAM 3 tree segmentations.
 
@@ -3361,6 +3362,14 @@ def build_canopy_from_sam_trees(
         ys_any = m.any(axis=1)
         ys = np.where(ys_any)[0]
         if ys.size == 0 or int(ys.max()) < pos_threshold_y:
+            continue
+        # FOREGROUND MIN BOTTOM ROW. Rejects background trees
+        # that are confined to the middle-frame even when SAM
+        # is highly confident. Applies REGARDLESS of high-SAM-
+        # trust override, since position is a geometry
+        # property independent of SAM's confidence.
+        if (foreground_min_bottom_row > 0
+                and int(ys.max()) < int(foreground_min_bottom_row)):
             continue
         # Extends-up check: a TREE extends into the upper
         # canopy band (top row <= max_top_row). A GROUND BAND
@@ -3719,6 +3728,7 @@ def remove_ground_by_local_gradient(
     min_depth_jump_mm: float = 300.0,
     min_y: int = 200,
     require_in_cc_bottom_frac: float = 0.5,
+    trunk_boxes: list | None = None,
 ) -> np.ndarray:
     """Per-pixel ground removal by local vertical depth gradient.
 
@@ -3771,13 +3781,30 @@ def remove_ground_by_local_gradient(
     n_cc, labels, stats, _ = _cv2.connectedComponentsWithStats(
         cm_u8, connectivity=8,
     )
+    # Build a "skip-this-CC" mask for CCs with detected trunks.
+    # Trunks prove the CC is a tree extending down to trunk base;
+    # crop-below-trunk handles the actual ground transition.
     in_cc_bottom = np.zeros_like(cm, dtype=bool)
     if n_cc > 1 and require_in_cc_bottom_frac > 0:
         for cc_id in range(1, n_cc):
             y0 = int(stats[cc_id, _cv2.CC_STAT_TOP])
             h_cc = int(stats[cc_id, _cv2.CC_STAT_HEIGHT])
-            cut_y = y0 + int(round(h_cc * (1.0 - require_in_cc_bottom_frac)))
             cc_pix = (labels == cc_id)
+            # Trunk-aware skip
+            if trunk_boxes:
+                _skip = False
+                for _tb in trunk_boxes:
+                    _tx1 = max(0, int(round(float(_tb[0]))))
+                    _ty1 = max(0, int(round(float(_tb[1]))))
+                    _tx2 = min(W - 1, int(round(float(_tb[2]))))
+                    _ty2 = min(H - 1, int(round(float(_tb[3]))))
+                    if _tx2 >= _tx1 and _ty2 >= _ty1:
+                        if cc_pix[_ty1:_ty2 + 1, _tx1:_tx2 + 1].any():
+                            _skip = True
+                            break
+                if _skip:
+                    continue
+            cut_y = y0 + int(round(h_cc * (1.0 - require_in_cc_bottom_frac)))
             in_cc_bottom |= cc_pix & (np.arange(H)[:, None] >= cut_y)
     elif require_in_cc_bottom_frac <= 0:
         in_cc_bottom = cm.copy()
@@ -3871,6 +3898,7 @@ def crop_canopy_ground_gradient(
     bottom_frac: float = 0.30,
     max_corr: float = 0.70,
     min_pixels: int = 100,
+    trunk_boxes: list | None = None,
 ) -> np.ndarray:
     """Crop the bottom of any canopy CC whose lower portion has
     a ground-like depth-row correlation.
@@ -3906,6 +3934,7 @@ def crop_canopy_ground_gradient(
     if n_cc <= 1:
         return cm
     valid = (depth_mm > 0) & (depth_mm < 60000)
+    H_full, W_full = cm.shape
     out = cm.copy()
     for cc_id in range(1, n_cc):
         x = int(stats[cc_id, _cv2.CC_STAT_LEFT])
@@ -3914,10 +3943,30 @@ def crop_canopy_ground_gradient(
         area = int(stats[cc_id, _cv2.CC_STAT_AREA])
         if area < min_pixels or h_cc < 5:
             continue
+        cc_pix = (labels == cc_id)
+        # TRUNK-AWARE SKIP: same logic as top-vs-row jump --
+        # if a trunk overlaps this CC, the CC is a tree
+        # extending down to the trunk base; crop-below-trunk
+        # handles the actual ground transition. Tree perspective
+        # gives moderate row-depth correlation that triggers the
+        # crop here, false-cutting tree bottoms.
+        if trunk_boxes:
+            _skip_cc = False
+            for _tb in trunk_boxes:
+                _tx1 = max(0, int(round(float(_tb[0]))))
+                _ty1 = max(0, int(round(float(_tb[1]))))
+                _tx2 = min(W_full - 1, int(round(float(_tb[2]))))
+                _ty2 = min(H_full - 1, int(round(float(_tb[3]))))
+                if _tx2 >= _tx1 and _ty2 >= _ty1:
+                    if cc_pix[_ty1:_ty2 + 1,
+                              _tx1:_tx2 + 1].any():
+                        _skip_cc = True
+                        break
+            if _skip_cc:
+                continue
         bottom_h = max(1, int(round(h_cc * bottom_frac)))
         bottom_y_start = y + h_cc - bottom_h
         bottom_y_end = y + h_cc
-        cc_pix = (labels == cc_id)
         bottom_region = np.zeros_like(cc_pix)
         bottom_region[bottom_y_start:bottom_y_end, :] = True
         bottom_pix = cc_pix & bottom_region & valid
@@ -4721,6 +4770,16 @@ def main():
     ap.add_argument("--depth-near-frac", type=float, default=0.5,
                     help="Count a detection as near-field if >= this fraction of its "
                          "mask pixels lie inside the depth band (default 0.5).")
+    ap.add_argument("--canopy-sam-foreground-min-bottom-row",
+                    type=int, default=0,
+                    help="Reject SAM tree masks whose max(y) is "
+                         "below this row. Applies REGARDLESS of "
+                         "--high-sam-trust-threshold; geometry "
+                         "of background trees (max_y in middle "
+                         "of frame) is independent of SAM's "
+                         "confidence. Default 0 = disabled. "
+                         "Try 350 (foreground trees extend into "
+                         "the lower 27%% of a 480-row frame).")
     ap.add_argument("--high-sam-trust-threshold", type=float,
                     default=0.0,
                     help="If a SAM detection's score is >= this "
@@ -6663,6 +6722,9 @@ def main():
                             high_sam_trust_threshold=(
                                 args.high_sam_trust_threshold
                             ),
+                            foreground_min_bottom_row=(
+                                args.canopy_sam_foreground_min_bottom_row
+                            ),
                         )
                         if _u_p.any():
                             _u |= _u_p
@@ -7094,11 +7156,33 @@ def main():
                         except Exception:
                             pass
 
+                    # Extract current-frame trunk bboxes once for
+                    # use by ALL trunk-aware ground filters below.
+                    _aware_trunks_pre: list = []
+                    if (isinstance(infer, dict)
+                            and args.canopy_trunk_prompt in infer):
+                        _ti_g = infer[args.canopy_trunk_prompt]
+                        _tb_g = _ti_g.get("boxes")
+                        _ts_g = _ti_g.get("scores")
+                        if _tb_g is not None and len(_tb_g):
+                            _ssl_g = (
+                                _ts_g if _ts_g is not None
+                                else [1.0] * len(_tb_g)
+                            )
+                            for _bb_g, _ss_g in zip(_tb_g, _ssl_g):
+                                if (float(_ss_g)
+                                        >= args.canopy_trunk_min_score):
+                                    _aware_trunks_pre.append([
+                                        float(x) for x in _bb_g
+                                    ])
+
                     # PER-CC GROUND-GRADIENT CROP. For each CC,
                     # examine the bottom fraction of rows. If
                     # depth correlates strongly with row in that
                     # subregion, crop those rows -- it's ground
                     # the canopy mask incorrectly extended into.
+                    # Trunk-aware: skip CCs with detected trunks
+                    # (crop-below-trunk handles those).
                     if (args.canopy_crop_ground_gradient
                             and canopy_mask_img is not None
                             and depth_mm is not None
@@ -7114,6 +7198,7 @@ def main():
                                     max_corr=(
                                         args.canopy_ground_gradient_max_corr
                                     ),
+                                    trunk_boxes=_aware_trunks_pre,
                                 )
                             )
                         except Exception as _gg_err:
@@ -7151,6 +7236,7 @@ def main():
                                     require_in_cc_bottom_frac=(
                                         args.canopy_grad_cc_bottom_frac
                                     ),
+                                    trunk_boxes=_aware_trunks_pre,
                                 )
                             )
                         except Exception as _gr_err:
