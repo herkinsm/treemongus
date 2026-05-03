@@ -109,6 +109,9 @@ echo "[batch] Using python: $PY"
   --canopy-filter-min-area-px 400 \
   --canopy-filter-max-top-row 300 \
   --canopy-add-trunk-masks --canopy-trunk-vertical-extension-px 100 \
+  --canopy-extend-via-trunks \
+  --canopy-extend-trunk-band-radius-px 80 \
+  --canopy-extend-below-trunk-top-px 30 \
   --canopy-crop-below-trunk --canopy-crop-below-trunk-buffer-px 30 \
   --canopy-exclude-painted-stakes \
   --canopy-stake-hue-min 30 --canopy-stake-hue-max 90 \

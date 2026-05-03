@@ -4022,6 +4022,87 @@ def crop_canopy_ground_gradient(
     return out
 
 
+def extend_canopy_via_trunks(
+    canopy_mask: np.ndarray,
+    depth_mm: np.ndarray | None,
+    trunk_boxes: list,
+    *,
+    column_band_radius_px: int = 80,
+    depth_min_mm: float = 600.0,
+    depth_max_mm: float = 3000.0,
+    extend_below_trunk_top_px: int = 30,
+) -> np.ndarray:
+    """For each detected trunk, EXTEND the canopy mask
+    downward within the trunk's column band to include
+    foreground-depth pixels down to trunk_y2 + buffer.
+
+    Catches the case where SAM detected the upper tree
+    canopy but missed the lower portion (trunk + lower
+    branches that look semantically less "tree" because
+    they're sparse, in shadow, or visually merged with
+    ground). Since the trunk is detected, we KNOW the tree
+    extends down to trunk_y2; this function fills in the
+    foreground-depth pixels in that vertical extent.
+
+    Algorithm per trunk:
+      1. Define column band [trunk_cx - radius, trunk_cx + radius].
+      2. Find topmost existing canopy row in this band.
+      3. From canopy_top down to trunk_y2 + buffer, in this
+         band, add ANY pixel that has valid foreground depth.
+
+    Leaf-protection / ground-protection:
+      1. Only the column band of detected trunks is touched
+         (default radius 80 px). Trees without trunks unaffected.
+      2. Vertical extent capped at trunk_y2 + buffer (default
+         30 px). Doesn't extend into ground way below the
+         trunk.
+      3. Only foreground-depth pixels added; sky / far-bg /
+         no-return pixels stay out.
+    """
+    if (canopy_mask is None or depth_mm is None
+            or not trunk_boxes):
+        return canopy_mask
+    cm = canopy_mask.astype(bool).copy()
+    H, W = cm.shape
+    fg = (
+        (depth_mm.astype(np.float32) >= float(depth_min_mm))
+        & (depth_mm.astype(np.float32) <= float(depth_max_mm))
+    )
+    for tb in trunk_boxes:
+        try:
+            tx1 = int(round(float(tb[0])))
+            ty1 = int(round(float(tb[1])))
+            tx2 = int(round(float(tb[2])))
+            ty2 = int(round(float(tb[3])))
+        except Exception:
+            continue
+        cx = (tx1 + tx2) // 2
+        col_lo = max(0, cx - int(column_band_radius_px))
+        col_hi = min(W, cx + int(column_band_radius_px))
+        if col_hi <= col_lo:
+            continue
+        # Topmost canopy row in this column band.
+        band_canopy = cm[:, col_lo:col_hi]
+        if not band_canopy.any():
+            # Nothing to anchor on; use trunk's top.
+            canopy_top = ty1
+        else:
+            band_rows_any = band_canopy.any(axis=1)
+            canopy_top = int(np.argmax(band_rows_any))
+        # Extension zone: rows from canopy_top to trunk_y2 +
+        # buffer, in the trunk's column band.
+        zone_bottom = min(
+            H - 1, ty2 + int(extend_below_trunk_top_px),
+        )
+        if zone_bottom <= canopy_top:
+            continue
+        zone = np.zeros_like(cm)
+        zone[canopy_top:zone_bottom + 1, col_lo:col_hi] = True
+        # Add foreground-depth pixels in this zone.
+        cm = cm | (zone & fg)
+    return cm
+
+
 def crop_canopy_below_trunks(
     canopy_mask: np.ndarray,
     trunk_boxes: list,
@@ -5147,6 +5228,27 @@ def main():
                          "bridged through the trunk pixels into one "
                          "CC. The trunk mask itself is narrow so it "
                          "doesn't add ground.")
+    ap.add_argument("--canopy-extend-via-trunks", action="store_true",
+                    help="For each detected trunk, extend the canopy "
+                         "mask DOWN within the trunk's column band "
+                         "to include foreground-depth pixels down to "
+                         "trunk_y2 + buffer. Catches the case where "
+                         "SAM detected the upper tree but missed the "
+                         "lower portion. The trunk being detected is "
+                         "ground truth that the tree extends further; "
+                         "this fills in the foreground-depth pixels "
+                         "in that vertical extent. Only the trunk's "
+                         "column band is touched (default radius 80 "
+                         "px), so trees without trunks are unaffected.")
+    ap.add_argument("--canopy-extend-trunk-band-radius-px",
+                    type=int, default=80,
+                    help="Column band radius for canopy extension. "
+                         "Default 80.")
+    ap.add_argument("--canopy-extend-below-trunk-top-px",
+                    type=int, default=30,
+                    help="Extend canopy down to trunk_y2 + this many "
+                         "pixels. Default 30 (covers low-hanging "
+                         "branches just past the visible trunk).")
     ap.add_argument("--canopy-trunk-vertical-extension-px", type=int,
                     default=100,
                     help="When --canopy-add-trunk-masks is on, also "
@@ -7205,6 +7307,44 @@ def main():
                                     _aware_trunks_pre.append([
                                         float(x) for x in _bb_g
                                     ])
+
+                    # CANOPY EXTENSION VIA TRUNKS. For each
+                    # detected trunk, extend the canopy mask down
+                    # within the trunk's column band to include
+                    # foreground-depth pixels down to trunk_y2 +
+                    # buffer. Catches the case where SAM detected
+                    # only the upper tree but missed the lower
+                    # portion (sparse / shadowed lower foliage).
+                    # The trunk being detected is ground truth
+                    # that the tree extends further. Runs BEFORE
+                    # ground filters so any overshoot can be
+                    # cleaned up.
+                    if (args.canopy_extend_via_trunks
+                            and _aware_trunks_pre
+                            and canopy_mask_img is not None
+                            and depth_mm is not None):
+                        try:
+                            canopy_mask_img = (
+                                extend_canopy_via_trunks(
+                                    canopy_mask_img,
+                                    depth_mm,
+                                    _aware_trunks_pre,
+                                    column_band_radius_px=(
+                                        args.canopy_extend_trunk_band_radius_px
+                                    ),
+                                    depth_min_mm=args.depth_min_mm,
+                                    depth_max_mm=args.depth_max_mm,
+                                    extend_below_trunk_top_px=(
+                                        args.canopy_extend_below_trunk_top_px
+                                    ),
+                                )
+                            )
+                        except Exception as _ext_err:
+                            print(
+                                f"[warn] trunk-based canopy extension "
+                                f"failed ({_ext_err!r})",
+                                file=sys.stderr,
+                            )
 
                     # Build a "high-trust SAM mask" = union of SAM
                     # tree-prompt masks with score >= the high-
