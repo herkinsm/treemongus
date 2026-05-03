@@ -3691,18 +3691,12 @@ def crop_canopy_at_top_vs_row_depth_jump(
                         break
             if _skip_cc:
                 continue
-        # HIGH-TRUST-SAM SKIP: if a high-confidence SAM tree
-        # mask substantially overlaps this CC (>= overlap_frac
-        # of the CC's pixels), skip the crop. SAM segmenting
-        # the full tree at high confidence is itself an anchor
-        # -- we don't need a separate trunk detection to trust
-        # the CC is a complete tree.
-        if high_trust_mask is not None:
-            _cc_area = float(cc_pix.sum())
-            if _cc_area > 0:
-                _ov = float((cc_pix & high_trust_mask).sum())
-                if (_ov / _cc_area) >= float(high_trust_min_overlap_frac):
-                    continue
+        # NOTE: high-trust SAM pixel restoration is done at the
+        # END of the function (OR back high_trust_mask pixels
+        # that were in the original canopy). This is per-pixel,
+        # so ground pixels OUTSIDE SAM's actual segmentation
+        # still get cut while real SAM-detected tree pixels
+        # are preserved.
         # Compute per-row median depth WITHIN this CC.
         medians = np.full(h_cc, np.nan, dtype=np.float64)
         for dy in range(h_cc):
@@ -3731,6 +3725,12 @@ def crop_canopy_at_top_vs_row_depth_jump(
                 below_zone = rows_idx >= cut_y
                 out[cc_pix & below_zone] = False
                 break
+    # HIGH-TRUST PIXEL RESTORATION: pixels that were in the
+    # original canopy AND in the high-confidence SAM tree mask
+    # are RESTORED. Ground pixels outside SAM's segmentation
+    # stay cut; real tree pixels in SAM's mask are preserved.
+    if high_trust_mask is not None:
+        out = out | (cm & high_trust_mask)
     return out
 
 
@@ -3820,17 +3820,7 @@ def remove_ground_by_local_gradient(
                             break
                 if _skip:
                     continue
-            # HIGH-TRUST-SAM SKIP
-            if high_trust_mask is not None:
-                _cc_area = float(cc_pix.sum())
-                if _cc_area > 0:
-                    _ov = float(
-                        (cc_pix & high_trust_mask).sum()
-                    )
-                    if (_ov / _cc_area) >= float(
-                        high_trust_min_overlap_frac
-                    ):
-                        continue
+            # NOTE: high-trust pixel restoration done at function end.
             cut_y = y0 + int(round(h_cc * (1.0 - require_in_cc_bottom_frac)))
             in_cc_bottom |= cc_pix & (np.arange(H)[:, None] >= cut_y)
     elif require_in_cc_bottom_frac <= 0:
@@ -3860,8 +3850,13 @@ def remove_ground_by_local_gradient(
     )
 
     if is_ground.any():
-        return cm & ~is_ground
-    return cm
+        out = cm & ~is_ground
+    else:
+        out = cm
+    # HIGH-TRUST PIXEL RESTORATION
+    if high_trust_mask is not None:
+        out = out | (cm & high_trust_mask)
+    return out
 
 
 def remove_grass_by_hsv(
@@ -3993,13 +3988,9 @@ def crop_canopy_ground_gradient(
                         break
             if _skip_cc:
                 continue
-        # HIGH-TRUST-SAM SKIP
-        if high_trust_mask is not None:
-            _cc_area = float(cc_pix.sum())
-            if _cc_area > 0:
-                _ov = float((cc_pix & high_trust_mask).sum())
-                if (_ov / _cc_area) >= float(high_trust_min_overlap_frac):
-                    continue
+        # NOTE: high-trust pixel restoration done at function
+        # end -- see crop_canopy_at_top_vs_row_depth_jump for
+        # rationale.
         bottom_h = max(1, int(round(h_cc * bottom_frac)))
         bottom_y_start = y + h_cc - bottom_h
         bottom_y_end = y + h_cc
@@ -4025,6 +4016,9 @@ def crop_canopy_ground_gradient(
             crop_zone = np.zeros_like(cc_pix)
             crop_zone[bottom_y_start:bottom_y_end, :] = True
             out[cc_pix & crop_zone] = False
+    # HIGH-TRUST PIXEL RESTORATION
+    if high_trust_mask is not None:
+        out = out | (cm & high_trust_mask)
     return out
 
 
