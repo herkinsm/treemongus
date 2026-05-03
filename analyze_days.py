@@ -7710,6 +7710,13 @@ def main():
                         except Exception:
                             pass
 
+                    # Per-filter cut tracking dict. Each SUBTRACT
+                    # filter snapshots canopy pre/post and OR's its
+                    # cut delta into this dict under a short name.
+                    # Drawn in the canopy_overlay JPG so you can see
+                    # WHAT each filter removed this frame.
+                    _filter_cut_masks: dict = {}
+
                     # Extract current-frame trunk bboxes once for
                     # use by ALL trunk-aware ground filters below.
                     _aware_trunks_pre: list = []
@@ -7892,6 +7899,7 @@ def main():
                             and canopy_mask_img.any()):
                         try:
                             _rgb_grass = np.asarray(img)
+                            _pre_hsv = canopy_mask_img.astype(bool).copy()
                             canopy_mask_img = remove_grass_by_hsv(
                                 canopy_mask_img,
                                 _rgb_grass,
@@ -7901,6 +7909,13 @@ def main():
                                 val_min=args.canopy_grass_val_min,
                                 min_y=args.canopy_grass_min_y,
                             )
+                            _cut_hsv = _pre_hsv & ~canopy_mask_img.astype(bool)
+                            if _cut_hsv.any():
+                                _filter_cut_masks["HSV-G"] = (
+                                    _filter_cut_masks.get(
+                                        "HSV-G", np.zeros_like(_cut_hsv),
+                                    ) | _cut_hsv
+                                )
                         except Exception as _gh_err:
                             print(
                                 f"[warn] HSV grass removal failed"
@@ -7922,6 +7937,7 @@ def main():
                             and depth_mm is not None
                             and canopy_mask_img.any()):
                         try:
+                            _pre_dpl = canopy_mask_img.astype(bool).copy()
                             canopy_mask_img = (
                                 remove_grass_by_depth_plane(
                                     canopy_mask_img,
@@ -7964,6 +7980,13 @@ def main():
                                     high_trust_mask=_high_trust_mask,
                                 )
                             )
+                            _cut_dpl = _pre_dpl & ~canopy_mask_img.astype(bool)
+                            if _cut_dpl.any():
+                                _filter_cut_masks["DPL"] = (
+                                    _filter_cut_masks.get(
+                                        "DPL", np.zeros_like(_cut_dpl),
+                                    ) | _cut_dpl
+                                )
                         except Exception as _gp_err:
                             print(
                                 f"[warn] depth-plane grass removal "
@@ -8546,6 +8569,7 @@ def main():
                         and depth_mm is not None
                         and canopy_mask_img.any()):
                     try:
+                        _pre_ivd = canopy_mask_img.astype(bool).copy()
                         canopy_mask_img = cut_canopy_invalid_depth(
                             canopy_mask_img,
                             depth_mm,
@@ -8555,6 +8579,13 @@ def main():
                             ),
                             high_trust_mask=_high_trust_mask,
                         )
+                        _cut_ivd = _pre_ivd & ~canopy_mask_img.astype(bool)
+                        if _cut_ivd.any():
+                            _filter_cut_masks["IVD"] = (
+                                _filter_cut_masks.get(
+                                    "IVD", np.zeros_like(_cut_ivd),
+                                ) | _cut_ivd
+                            )
                     except Exception as _ivd_err:
                         print(
                             f"[warn] invalid-depth canopy gate "
@@ -8602,6 +8633,11 @@ def main():
                 # just computed (silent HT0% bug).
                 if "_high_trust_mask" not in locals():
                     _high_trust_mask = None
+                # Per-filter cut tracking. SUBTRACT filters
+                # populate this earlier in the frame; ensure it's
+                # at least defined here for the overlay block.
+                if "_filter_cut_masks" not in locals():
+                    _filter_cut_masks = {}
                 if (args.track_canopy and canopy_mask_img is not None):
                     if current_canopy_tracker is None:
                         current_canopy_tracker = CanopyTracker(
@@ -9210,6 +9246,46 @@ def main():
                                     rgb_co, _ht_contours, -1,
                                     (60, 180, 255), 1,
                                 )
+                        # Per-filter cut visualization. For each
+                        # SUBTRACT filter that snapshotted its cut
+                        # delta, draw the cut region's contour in a
+                        # distinct color with a small letter label.
+                        # Lets you see WHAT each filter actually
+                        # removed this frame at a glance.
+                        _cut_colors = {
+                            "HSV-G": (160, 240, 100),
+                            "DPL":   (240, 160, 100),
+                            "IVD":   (240, 100, 200),
+                        }
+                        for _fname, _cmask in _filter_cut_masks.items():
+                            _cmb = np.asarray(_cmask).astype(bool)
+                            if not _cmb.any():
+                                continue
+                            if _cmb.shape != cm_bool.shape:
+                                continue
+                            _ccolor = _cut_colors.get(
+                                _fname, (200, 200, 200),
+                            )
+                            _cu8 = _cmb.astype(np.uint8) * 255
+                            _ccnt, _ = _cv2_co.findContours(
+                                _cu8, _cv2_co.RETR_EXTERNAL,
+                                _cv2_co.CHAIN_APPROX_SIMPLE,
+                            )
+                            _cv2_co.drawContours(
+                                rgb_co, _ccnt, -1, _ccolor, 1,
+                            )
+                            # Letter label at centroid of cut.
+                            _ys_c, _xs_c = np.where(_cmb)
+                            if _ys_c.size:
+                                _cv2_co.putText(
+                                    rgb_co, _fname,
+                                    (
+                                        int(_xs_c.mean()),
+                                        int(_ys_c.mean()),
+                                    ),
+                                    _cv2_co.FONT_HERSHEY_SIMPLEX,
+                                    0.4, _ccolor, 1, _cv2_co.LINE_AA,
+                                )
                         # Per-prompt SAM mask contours. Top-scoring
                         # mask from each canopy SAM prompt drawn in
                         # a distinct color with "<abbr> <score>"
@@ -9422,6 +9498,48 @@ def main():
                             rgb_co, hdr, (8, 22),
                             _cv2_co.FONT_HERSHEY_SIMPLEX,
                             0.6, (255, 255, 255), 1, _cv2_co.LINE_AA,
+                        )
+                        # Second header line: active filters.
+                        # Compact codes so you can confirm at a
+                        # glance which SUBTRACT filters are on.
+                        _f_parts: list = []
+                        if args.canopy_remove_grass_by_hsv:
+                            _f_parts.append("HSV-G")
+                        if args.canopy_remove_grass_by_depth_plane:
+                            _flag = "DPL"
+                            if args.canopy_grass_plane_require_trunk_in_cc:
+                                _flag = "DPL[trunk]"
+                            _f_parts.append(_flag)
+                        if args.canopy_cut_invalid_depth:
+                            _f_parts.append("IVD")
+                        if args.canopy_crop_ground_gradient:
+                            _f_parts.append("CCGr")
+                        if args.canopy_remove_ground_by_gradient:
+                            _f_parts.append("LocG")
+                        if args.canopy_crop_top_vs_row_depth_jump:
+                            _f_parts.append("TVR")
+                        if args.canopy_crop_thin_bottom_bands:
+                            _f_parts.append("TBB")
+                        if args.canopy_crop_below_trunk:
+                            _f_parts.append("CBT")
+                        if args.canopy_max_bottom_row > 0:
+                            _f_parts.append(
+                                f"HF{args.canopy_max_bottom_row}"
+                            )
+                        if args.canopy_post_fill_bg_depth_mm > 0:
+                            _f_parts.append(
+                                f"BgD{int(args.canopy_post_fill_bg_depth_mm)}"
+                            )
+                        _flt_hdr = "filters: " + " ".join(_f_parts)
+                        _cv2_co.putText(
+                            rgb_co, _flt_hdr, (8, 42),
+                            _cv2_co.FONT_HERSHEY_SIMPLEX,
+                            0.45, (0, 0, 0), 3, _cv2_co.LINE_AA,
+                        )
+                        _cv2_co.putText(
+                            rgb_co, _flt_hdr, (8, 42),
+                            _cv2_co.FONT_HERSHEY_SIMPLEX,
+                            0.45, (200, 240, 200), 1, _cv2_co.LINE_AA,
                         )
                         _cv2_co.imwrite(
                             str(co_path),
