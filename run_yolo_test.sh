@@ -56,6 +56,16 @@ echo "[batch] Using python: $PY"
 "$PY" -c "import sam3; print('[batch] sam3 OK')" \
     || { echo "[batch] sam3 import failed -- aborting"; exit 1; }
 
+# TEST RUN: --canopy-sam-multi-prompts narrowed to just "apple tree"
+# (was: "apple tree" "tree branches" "tree canopy" "fruit tree").
+# Per-prompt overlay diagnostics showed TB firing on barns at score
+# 0.47 and TC firing on horizon tree-rows at 0.24-0.37 while none
+# of them scored on the actual foreground apple trees (HT0%
+# repeatedly). Expecting HT% > 0 in canopy_overlays JPGs if
+# "apple tree" alone hits real trees, and a slight drop in
+# canopy_frac as the false-positive masks stop being unioned in.
+# To revert, set --canopy-sam-multi-prompts to:
+#   "apple tree" "tree branches" "tree canopy" "fruit tree"
 "$PY" analyze_days.py \
   --root "/fs/scratch/PAS0228/2023 day 4" \
   --out "$HOME/sam3_yolo_test" \
@@ -84,7 +94,7 @@ echo "[batch] Using python: $PY"
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
   --use-build-tree-mask --tree-mask-min-overlap 0.10 --tree-mask-dilate-px 8 \
   --canopy-sam-prompt "apple tree" --canopy-sam-min-score 0.10 \
-  --canopy-sam-multi-prompts "apple tree" "tree branches" "tree canopy" "fruit tree" \
+  --canopy-sam-multi-prompts "apple tree" \
   --canopy-sam-min-pixels 500 --canopy-sam-min-lower-frac 0.50 \
   --canopy-sam-foreground-min-bottom-row 350 \
   --canopy-sam-min-valid-depth-frac 0.30 \
