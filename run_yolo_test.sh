@@ -120,6 +120,12 @@ echo "[batch] Using python: $PY"
   --flower-anther-min-area-px 100 \
   --depth-min-mm 600 --depth-max-mm 3000 --depth-near-frac 0.40 \
   --high-sam-trust-threshold 0.15 \
+  --soft-sam-trust-threshold 0.10 \
+  --canopy-heuristic-trunk-fallback \
+  --canopy-heuristic-trunk-band-px 25 \
+  --canopy-heuristic-trunk-walk-px 100 \
+  --canopy-heuristic-trunk-min-run-px 30 \
+  --canopy-smooth-px 3 \
   --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
   --use-build-tree-mask --tree-mask-min-overlap 0.10 --tree-mask-dilate-px 8 \

@@ -4006,6 +4006,33 @@ def remove_grass_by_hsv(
     return out
 
 
+def _track_filter_cut(
+    cut_dict: dict,
+    name: str,
+    pre_mask: np.ndarray | None,
+    post_mask: np.ndarray | None,
+) -> None:
+    """Compute (pre & ~post) and OR-merge into cut_dict[name].
+    Used by SUBTRACT call sites to record which pixels each
+    filter removed. Silent no-op on None inputs or shape
+    mismatch.
+    """
+    if pre_mask is None or post_mask is None:
+        return
+    try:
+        pre_b = np.asarray(pre_mask).astype(bool)
+        post_b = np.asarray(post_mask).astype(bool)
+    except Exception:
+        return
+    if pre_b.shape != post_b.shape:
+        return
+    cut = pre_b & ~post_b
+    if not cut.any():
+        return
+    prev = cut_dict.get(name)
+    cut_dict[name] = (prev | cut) if prev is not None else cut.copy()
+
+
 def cut_canopy_invalid_depth(
     canopy_mask: np.ndarray,
     depth_mm: np.ndarray | None,
@@ -4416,6 +4443,137 @@ def extend_canopy_via_trunks(
         # Add foreground-depth pixels in this zone.
         cm = cm | (zone & fg)
     return cm
+
+
+def synthesize_heuristic_trunks(
+    canopy_mask: np.ndarray,
+    depth_mm: np.ndarray | None,
+    existing_trunk_boxes: list,
+    *,
+    column_band_radius_px: int = 25,
+    walk_down_px: int = 100,
+    min_run_length_px: int = 30,
+    depth_min_mm: float = 600.0,
+    depth_max_mm: float = 3500.0,
+) -> tuple[list, list]:
+    """For canopy CCs that have no SAM-detected trunk, walk
+    DOWN from the CC's bottom-centroid in a column band and
+    look for a contiguous run of foreground-depth pixels --
+    that's almost certainly the wooden trunk that SAM missed.
+    Synthesize a trunk bbox covering that run.
+
+    Algorithm per CC:
+      1. Find CC bottom-most pixel and its column.
+      2. Use centroid column of bottom 1/3 of CC pixels as
+         the column anchor (more stable than absolute bottom).
+      3. Walk down from the CC's bottom row in a column band
+         [cx - r, cx + r], counting valid foreground-depth
+         pixels per row.
+      4. Find the longest contiguous run of rows with at
+         least one valid pixel. If run >= min_run_length_px,
+         create a synthetic trunk bbox covering it.
+      5. Return (boxes, scores) -- scores = 0.0 to mark
+         these as synthetic / lower-confidence so downstream
+         can distinguish if needed (currently treated the
+         same as SAM trunks for partition / cropping).
+
+    Skips CCs that already have an existing_trunk_box
+    interior intersecting them (those CCs are already
+    anchored).
+    """
+    if canopy_mask is None or depth_mm is None:
+        return [], []
+    cm = np.asarray(canopy_mask).astype(bool)
+    if not cm.any():
+        return [], []
+    h, w = cm.shape
+    if depth_mm.shape != (h, w):
+        return [], []
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return [], []
+    cm_u8 = cm.astype(np.uint8) * 255
+    n_cc, labels, _stats, _ = (
+        _cv2.connectedComponentsWithStats(cm_u8, connectivity=8)
+    )
+    if n_cc <= 1:
+        return [], []
+    # Mark CCs that already have an existing trunk overlap.
+    cc_has_trunk = np.zeros(n_cc, dtype=bool)
+    for tb in existing_trunk_boxes:
+        x1 = max(0, int(round(float(tb[0]))))
+        y1 = max(0, int(round(float(tb[1]))))
+        x2 = min(w - 1, int(round(float(tb[2]))))
+        y2 = min(h - 1, int(round(float(tb[3]))))
+        if x1 > x2 or y1 > y2:
+            continue
+        cc_in_box = labels[y1:y2 + 1, x1:x2 + 1]
+        for cc_id in np.unique(cc_in_box):
+            if int(cc_id) > 0:
+                cc_has_trunk[int(cc_id)] = True
+    valid_depth = (
+        (depth_mm >= float(depth_min_mm))
+        & (depth_mm <= float(depth_max_mm))
+    )
+    new_boxes: list = []
+    new_scores: list = []
+    for cc_id in range(1, n_cc):
+        if cc_has_trunk[cc_id]:
+            continue
+        cc_pix = (labels == cc_id)
+        if not cc_pix.any():
+            continue
+        ys_cc, xs_cc = np.where(cc_pix)
+        cc_bottom = int(ys_cc.max())
+        # Column anchor: centroid of bottom 1/3 of CC pixels.
+        bottom_third = ys_cc >= int(
+            ys_cc.min() + 2 * (cc_bottom - ys_cc.min()) / 3
+        )
+        if bottom_third.any():
+            cx = int(round(float(xs_cc[bottom_third].mean())))
+        else:
+            cx = int(round(float(xs_cc.mean())))
+        # Column band [cx - r, cx + r].
+        r = int(column_band_radius_px)
+        x1 = max(0, cx - r)
+        x2 = min(w - 1, cx + r)
+        if x2 <= x1:
+            continue
+        # Walk down from CC bottom for up to walk_down_px rows.
+        y_start = cc_bottom + 1
+        y_end = min(h, cc_bottom + 1 + int(walk_down_px))
+        if y_end <= y_start:
+            continue
+        col_band = valid_depth[y_start:y_end, x1:x2 + 1]
+        rows_with_valid = col_band.any(axis=1)
+        # Find longest contiguous run of True.
+        best_start = -1
+        best_len = 0
+        cur_start = -1
+        cur_len = 0
+        for i, hit in enumerate(rows_with_valid):
+            if hit:
+                if cur_start < 0:
+                    cur_start = i
+                    cur_len = 1
+                else:
+                    cur_len += 1
+                if cur_len > best_len:
+                    best_len = cur_len
+                    best_start = cur_start
+            else:
+                cur_start = -1
+                cur_len = 0
+        if best_len < int(min_run_length_px):
+            continue
+        ty1 = y_start + best_start
+        ty2 = ty1 + best_len - 1
+        new_boxes.append(
+            [float(x1), float(ty1), float(x2), float(ty2)]
+        )
+        new_scores.append(0.0)
+    return new_boxes, new_scores
 
 
 def crop_canopy_below_trunks(
@@ -5263,6 +5421,25 @@ def main():
                          "confidence. Default 0 = disabled. "
                          "Try 350 (foreground trees extend into "
                          "the lower 27%% of a 480-row frame).")
+    ap.add_argument("--soft-sam-trust-threshold", type=float,
+                    default=0.0,
+                    help="A SECOND, looser SAM-trust threshold used "
+                         "ONLY for cut-protection in SUBTRACT-phase "
+                         "filters (HSV-G, depth-plane, invalid-"
+                         "depth, ground-gradient, etc.). Pixels in "
+                         "ANY tree-prompt SAM mask scoring >= this "
+                         "threshold get OR-restored after each "
+                         "SUBTRACT filter. Default 0 = disabled "
+                         "(only --high-sam-trust-threshold is used "
+                         "for shielding). Recommended 0.10 when "
+                         "--high-sam-trust-threshold is 0.15: "
+                         "captures the 0.10-0.14 score bracket "
+                         "where SAM was somewhat confident about a "
+                         "tree but not enough to expand canopy. "
+                         "The high threshold remains in charge of "
+                         "the diagnostic HT% display and any "
+                         "expansion uses; the soft threshold ONLY "
+                         "shields from cuts.")
     ap.add_argument("--high-sam-trust-threshold", type=float,
                     default=0.0,
                     help="If a SAM detection's score is >= this "
@@ -5868,6 +6045,48 @@ def main():
                          "slightly above --canopy-post-fill-bg-"
                          "depth-mm to give a cushion at the "
                          "boundary.")
+    # Heuristic trunk fallback when SAM trunk detection fails.
+    ap.add_argument("--canopy-heuristic-trunk-fallback",
+                    action="store_true",
+                    help="When a canopy CC has no SAM-detected "
+                         "trunk inside it, walk down from the "
+                         "CC's bottom-centroid in a column band "
+                         "looking for a contiguous run of "
+                         "foreground-depth pixels and synthesize "
+                         "a virtual trunk there. Resurrects all "
+                         "trunk-aware features (crop-below-trunk, "
+                         "Voronoi partition anchor, depth-plane "
+                         "trunk-in-CC restriction) on frames "
+                         "where SAM trunk detection returned 0 "
+                         "usable trunks (Rs100+/A0/K0). Synthetic "
+                         "trunks have score 0.0 in the overlay "
+                         "so you can distinguish them from real "
+                         "SAM detections.")
+    ap.add_argument("--canopy-heuristic-trunk-band-px",
+                    type=int, default=25,
+                    help="Half-width of the column band (in px) "
+                         "below the CC bottom that's scanned for "
+                         "foreground-depth trunk pixels.")
+    ap.add_argument("--canopy-heuristic-trunk-walk-px",
+                    type=int, default=100,
+                    help="Max rows to walk down from the CC "
+                         "bottom looking for a trunk run.")
+    ap.add_argument("--canopy-heuristic-trunk-min-run-px",
+                    type=int, default=30,
+                    help="Minimum contiguous foreground-depth "
+                         "run length (rows) to accept as a "
+                         "synthetic trunk.")
+    # Final canopy boundary smoothing.
+    ap.add_argument("--canopy-smooth-px", type=int, default=0,
+                    help="Apply morphological closing with kernel "
+                         "size (2*N+1) as a final step before "
+                         "partition. Removes small holes left by "
+                         "HSV-G / DPL / IVD cuts that make the "
+                         "canopy boundary look swiss-cheesed in "
+                         "the visual mask. 0 disables. Typical "
+                         "useful values: 2-4 (kernel 5-9). Larger "
+                         "kernels can bridge nearby canopy CCs "
+                         "that should stay separate.")
     # Plan C Strategy 3: per-CC top-vs-row depth jump
     ap.add_argument("--canopy-crop-top-vs-row-depth-jump",
                     action="store_true",
@@ -7066,6 +7285,11 @@ def main():
     tree_summaries: list[dict] = []
     # Per-frame, per-tree row for trees_per_frame CSV.
     tree_per_frame_rows: list[dict] = []
+    # Per-frame canopy diagnostic metrics for canopy_frame_metrics
+    # CSV. One row per processed frame, with auto-flags so you can
+    # grep/sort to find problem frames instead of clicking through
+    # every overlay JPG.
+    canopy_frame_metrics_rows: list[dict] = []
     # tracks_detail entries get a "tree_id" column populated
     # when canopy tracking is on; collect alongside flower
     # tracks so the per-track CSV can show which tree each
@@ -7102,6 +7326,8 @@ def main():
             # that doesn't reset it -- producing stale overlays.
             _filter_cut_masks: dict = {}
             _high_trust_mask = None
+            _soft_trust_mask = None
+            _trust_for_filters = None
             _canopy_pre_subtract = None
 
             # Detect session change → flush trackers for the previous session
@@ -7858,6 +8084,67 @@ def main():
                         except Exception:
                             _high_trust_mask = None
 
+                    # SOFT-trust SAM mask: same construction as
+                    # _high_trust_mask but at --soft-sam-trust-
+                    # threshold (lower). Pixels here are passed
+                    # to filters as the high_trust_mask param so
+                    # SAM-moderately-confident pixels get cut-
+                    # protected too. _high_trust_mask remains in
+                    # charge of the HT% display + any expansion.
+                    # Soft is a SUPERSET of high (lower bar =
+                    # more pixels qualify).
+                    if (args.soft_sam_trust_threshold > 0
+                            and isinstance(infer, dict)
+                            and canopy_mask_img is not None):
+                        try:
+                            _sm = np.zeros(
+                                canopy_mask_img.shape, dtype=bool,
+                            )
+                            for _p_st in _canopy_sam_prompt_set:
+                                if _p_st not in infer:
+                                    continue
+                                _pi_st = infer[_p_st]
+                                _ms_st = _pi_st.get("masks")
+                                _ss_st = _pi_st.get("scores")
+                                if (_ms_st is None
+                                        or _ss_st is None
+                                        or len(_ms_st) == 0):
+                                    continue
+                                for _mm_st, _sc_st in zip(
+                                    _ms_st, _ss_st,
+                                ):
+                                    if (float(_sc_st)
+                                            < args.soft_sam_trust_threshold):
+                                        continue
+                                    _b_st = (
+                                        np.asarray(_mm_st).astype(bool)
+                                    )
+                                    if _b_st.ndim == 3:
+                                        _b_st = _b_st.any(axis=0)
+                                    if _b_st.shape == _sm.shape:
+                                        _sm = _sm | _b_st
+                            if _sm.any():
+                                _soft_trust_mask = _sm
+                        except Exception:
+                            _soft_trust_mask = None
+
+                    # Effective shield mask passed to SUBTRACT
+                    # filters as their high_trust_mask param.
+                    # When soft is enabled and a superset of high
+                    # (its construction threshold is lower so it
+                    # captures HT + the moderate-confidence ring),
+                    # filters protect the broader set of pixels.
+                    # When soft is off or empty, falls back to
+                    # high. Diagnostic HT% display and the cuts-
+                    # overlay HT tint still use the narrower
+                    # _high_trust_mask -- soft only changes filter
+                    # protection.
+                    _trust_for_filters = (
+                        _soft_trust_mask
+                        if _soft_trust_mask is not None
+                        else _high_trust_mask
+                    )
+
                     # PRE-SUBTRACT canopy snapshot. Captured here at
                     # the boundary between REFINE-phase additive
                     # operations (closing, hole-fill, dilation,
@@ -7884,6 +8171,9 @@ def main():
                             and depth_mm is not None
                             and canopy_mask_img.any()):
                         try:
+                            _pre_ccgr = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
                             canopy_mask_img = (
                                 crop_canopy_ground_gradient(
                                     canopy_mask_img,
@@ -7895,8 +8185,12 @@ def main():
                                         args.canopy_ground_gradient_max_corr
                                     ),
                                     trunk_boxes=_aware_trunks_pre,
-                                    high_trust_mask=_high_trust_mask,
+                                    high_trust_mask=_trust_for_filters,
                                 )
+                            )
+                            _track_filter_cut(
+                                _filter_cut_masks, "CCGr",
+                                _pre_ccgr, canopy_mask_img,
                             )
                         except Exception as _gg_err:
                             print(
@@ -7919,6 +8213,9 @@ def main():
                             and depth_mm is not None
                             and canopy_mask_img.any()):
                         try:
+                            _pre_locg = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
                             canopy_mask_img = (
                                 remove_ground_by_local_gradient(
                                     canopy_mask_img,
@@ -7934,8 +8231,12 @@ def main():
                                         args.canopy_grad_cc_bottom_frac
                                     ),
                                     trunk_boxes=_aware_trunks_pre,
-                                    high_trust_mask=_high_trust_mask,
+                                    high_trust_mask=_trust_for_filters,
                                 )
+                            )
+                            _track_filter_cut(
+                                _filter_cut_masks, "LocG",
+                                _pre_locg, canopy_mask_img,
                             )
                         except Exception as _gr_err:
                             print(
@@ -7963,15 +8264,12 @@ def main():
                                 sat_min=args.canopy_grass_sat_min,
                                 val_min=args.canopy_grass_val_min,
                                 min_y=args.canopy_grass_min_y,
-                                high_trust_mask=_high_trust_mask,
+                                high_trust_mask=_trust_for_filters,
                             )
-                            _cut_hsv = _pre_hsv & ~canopy_mask_img.astype(bool)
-                            if _cut_hsv.any():
-                                _filter_cut_masks["HSV-G"] = (
-                                    _filter_cut_masks.get(
-                                        "HSV-G", np.zeros_like(_cut_hsv),
-                                    ) | _cut_hsv
-                                )
+                            _track_filter_cut(
+                                _filter_cut_masks, "HSV-G",
+                                _pre_hsv, canopy_mask_img,
+                            )
                         except Exception as _gh_err:
                             print(
                                 f"[warn] HSV grass removal failed"
@@ -8033,16 +8331,13 @@ def main():
                                     require_trunk_in_cc=(
                                         args.canopy_grass_plane_require_trunk_in_cc
                                     ),
-                                    high_trust_mask=_high_trust_mask,
+                                    high_trust_mask=_trust_for_filters,
                                 )
                             )
-                            _cut_dpl = _pre_dpl & ~canopy_mask_img.astype(bool)
-                            if _cut_dpl.any():
-                                _filter_cut_masks["DPL"] = (
-                                    _filter_cut_masks.get(
-                                        "DPL", np.zeros_like(_cut_dpl),
-                                    ) | _cut_dpl
-                                )
+                            _track_filter_cut(
+                                _filter_cut_masks, "DPL",
+                                _pre_dpl, canopy_mask_img,
+                            )
                         except Exception as _gp_err:
                             print(
                                 f"[warn] depth-plane grass removal "
@@ -8087,6 +8382,9 @@ def main():
                                             _aware_trunks.append([
                                                 float(x) for x in _bb_aw
                                             ])
+                            _pre_tvr = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
                             canopy_mask_img = (
                                 crop_canopy_at_top_vs_row_depth_jump(
                                     canopy_mask_img,
@@ -8101,8 +8399,12 @@ def main():
                                         args.canopy_row_jump_min_pixels_per_row
                                     ),
                                     trunk_boxes=_aware_trunks,
-                                    high_trust_mask=_high_trust_mask,
+                                    high_trust_mask=_trust_for_filters,
                                 )
+                            )
+                            _track_filter_cut(
+                                _filter_cut_masks, "TVR",
+                                _pre_tvr, canopy_mask_img,
                             )
                         except Exception as _tj_err:
                             print(
@@ -8121,8 +8423,15 @@ def main():
                         and canopy_mask_img is not None):
                     _crow = int(args.canopy_max_bottom_row)
                     if _crow < canopy_mask_img.shape[0]:
+                        _pre_hf = (
+                            canopy_mask_img.astype(bool).copy()
+                        )
                         canopy_mask_img = canopy_mask_img.astype(bool).copy()
                         canopy_mask_img[_crow + 1:, :] = False
+                        _track_filter_cut(
+                            _filter_cut_masks, "HF",
+                            _pre_hf, canopy_mask_img,
+                        )
 
                 # THIN-BOTTOM-BAND DETECTOR. Per CC, find a thin
                 # horizontal band at the bottom where the row-
@@ -8131,6 +8440,9 @@ def main():
                         and canopy_mask_img is not None
                         and canopy_mask_img.any()):
                     try:
+                        _pre_tbb = (
+                            canopy_mask_img.astype(bool).copy()
+                        )
                         canopy_mask_img = crop_thin_bottom_bands(
                             canopy_mask_img,
                             band_max_height_px=(
@@ -8142,6 +8454,10 @@ def main():
                             check_above_rows=(
                                 args.canopy_band_check_above_rows
                             ),
+                        )
+                        _track_filter_cut(
+                            _filter_cut_masks, "TBB",
+                            _pre_tbb, canopy_mask_img,
                         )
                     except Exception as _band_err:
                         print(
@@ -8388,6 +8704,9 @@ def main():
                     # Per-CC ground gradient (Plan B Step 3)
                     if args.canopy_crop_ground_gradient:
                         try:
+                            _pre_ccgr2 = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
                             canopy_mask_img = (
                                 crop_canopy_ground_gradient(
                                     canopy_mask_img,
@@ -8400,11 +8719,18 @@ def main():
                                     ),
                                 )
                             )
+                            _track_filter_cut(
+                                _filter_cut_masks, "CCGr",
+                                _pre_ccgr2, canopy_mask_img,
+                            )
                         except Exception:
                             pass
                     # Per-pixel local gradient (Plan C Strategy 1)
                     if args.canopy_remove_ground_by_gradient:
                         try:
+                            _pre_locg2 = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
                             canopy_mask_img = (
                                 remove_ground_by_local_gradient(
                                     canopy_mask_img,
@@ -8421,12 +8747,19 @@ def main():
                                     ),
                                 )
                             )
+                            _track_filter_cut(
+                                _filter_cut_masks, "LocG",
+                                _pre_locg2, canopy_mask_img,
+                            )
                         except Exception:
                             pass
                     # HSV grass removal (Plan C Strategy 2)
                     if args.canopy_remove_grass_by_hsv:
                         try:
                             _rgb_pg = np.asarray(img)
+                            _pre_hsv2 = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
                             canopy_mask_img = remove_grass_by_hsv(
                                 canopy_mask_img,
                                 _rgb_pg,
@@ -8435,7 +8768,11 @@ def main():
                                 sat_min=args.canopy_grass_sat_min,
                                 val_min=args.canopy_grass_val_min,
                                 min_y=args.canopy_grass_min_y,
-                                high_trust_mask=_high_trust_mask,
+                                high_trust_mask=_trust_for_filters,
+                            )
+                            _track_filter_cut(
+                                _filter_cut_masks, "HSV-G",
+                                _pre_hsv2, canopy_mask_img,
                             )
                         except Exception:
                             pass
@@ -8444,6 +8781,9 @@ def main():
                             and canopy_mask_img is not None
                             and depth_mm is not None):
                         try:
+                            _pre_dpl2 = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
                             canopy_mask_img = (
                                 remove_grass_by_depth_plane(
                                     canopy_mask_img,
@@ -8483,8 +8823,12 @@ def main():
                                     require_trunk_in_cc=(
                                         args.canopy_grass_plane_require_trunk_in_cc
                                     ),
-                                    high_trust_mask=_high_trust_mask,
+                                    high_trust_mask=_trust_for_filters,
                                 )
+                            )
+                            _track_filter_cut(
+                                _filter_cut_masks, "DPL",
+                                _pre_dpl2, canopy_mask_img,
                             )
                         except Exception:
                             pass
@@ -8518,6 +8862,9 @@ def main():
                                             _aware_trunks.append([
                                                 float(x) for x in _bb_aw
                                             ])
+                            _pre_tvr2 = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
                             canopy_mask_img = (
                                 crop_canopy_at_top_vs_row_depth_jump(
                                     canopy_mask_img,
@@ -8532,8 +8879,12 @@ def main():
                                         args.canopy_row_jump_min_pixels_per_row
                                     ),
                                     trunk_boxes=_aware_trunks,
-                                    high_trust_mask=_high_trust_mask,
+                                    high_trust_mask=_trust_for_filters,
                                 )
+                            )
+                            _track_filter_cut(
+                                _filter_cut_masks, "TVR",
+                                _pre_tvr2, canopy_mask_img,
                             )
                         except Exception:
                             pass
@@ -8541,13 +8892,23 @@ def main():
                     if args.canopy_max_bottom_row > 0:
                         _crow2 = int(args.canopy_max_bottom_row)
                         if _crow2 < canopy_mask_img.shape[0]:
+                            _pre_hf2 = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
                             canopy_mask_img = (
                                 canopy_mask_img.astype(bool).copy()
                             )
                             canopy_mask_img[_crow2 + 1:, :] = False
+                            _track_filter_cut(
+                                _filter_cut_masks, "HF",
+                                _pre_hf2, canopy_mask_img,
+                            )
                     # Thin-bottom-band crop (post-merge cleanup)
                     if args.canopy_crop_thin_bottom_bands:
                         try:
+                            _pre_tbb2 = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
                             canopy_mask_img = crop_thin_bottom_bands(
                                 canopy_mask_img,
                                 band_max_height_px=(
@@ -8559,6 +8920,10 @@ def main():
                                 check_above_rows=(
                                     args.canopy_band_check_above_rows
                                 ),
+                            )
+                            _track_filter_cut(
+                                _filter_cut_masks, "TBB",
+                                _pre_tbb2, canopy_mask_img,
                             )
                         except Exception:
                             pass
@@ -8615,6 +8980,36 @@ def main():
                             file=sys.stderr,
                         )
 
+                # FINAL canopy boundary smoothing. Morphological
+                # closing on a small kernel removes the tiny holes
+                # left by HSV-G / DPL / IVD cuts at leaf-grass
+                # boundaries. Cosmetic mostly -- the tiny holes
+                # are correctly "not canopy" pixels but they make
+                # the visual mask look swiss-cheesed and produce
+                # ragged YOLO labels. Optional via
+                # --canopy-smooth-px (0 = off).
+                if (args.canopy_smooth_px > 0
+                        and canopy_mask_img is not None
+                        and canopy_mask_img.any()):
+                    try:
+                        import cv2 as _cv2_sm
+                        _ksm = 2 * int(args.canopy_smooth_px) + 1
+                        _kern_sm = _cv2_sm.getStructuringElement(
+                            _cv2_sm.MORPH_ELLIPSE, (_ksm, _ksm),
+                        )
+                        _closed = _cv2_sm.morphologyEx(
+                            canopy_mask_img.astype(np.uint8) * 255,
+                            _cv2_sm.MORPH_CLOSE,
+                            _kern_sm,
+                        )
+                        canopy_mask_img = (_closed > 0)
+                    except Exception as _sm_err:
+                        print(
+                            f"[warn] canopy smoothing failed "
+                            f"({_sm_err!r})",
+                            file=sys.stderr,
+                        )
+
                 # FINAL canopy gate: every surviving pixel must
                 # have measured depth in [depth_min_mm, max_mm].
                 # Catches REFINE-phase fills (closing, hole-fill,
@@ -8634,15 +9029,12 @@ def main():
                             depth_max_mm=(
                                 args.canopy_cut_invalid_depth_max_mm
                             ),
-                            high_trust_mask=_high_trust_mask,
+                            high_trust_mask=_trust_for_filters,
                         )
-                        _cut_ivd = _pre_ivd & ~canopy_mask_img.astype(bool)
-                        if _cut_ivd.any():
-                            _filter_cut_masks["IVD"] = (
-                                _filter_cut_masks.get(
-                                    "IVD", np.zeros_like(_cut_ivd),
-                                ) | _cut_ivd
-                            )
+                        _track_filter_cut(
+                            _filter_cut_masks, "IVD",
+                            _pre_ivd, canopy_mask_img,
+                        )
                     except Exception as _ivd_err:
                         print(
                             f"[warn] invalid-depth canopy gate "
@@ -8906,6 +9298,63 @@ def main():
                                     and len(_kept_trunk_masks)
                                         != len(_kept_trunk_boxes)):
                                 _kept_trunk_masks = []
+                        # Heuristic trunk fallback. For canopy CCs
+                        # that have no trunk inside (post SAM +
+                        # memory carry-forward), walk down from
+                        # the CC bottom and synthesize a virtual
+                        # trunk where foreground-depth pixels run
+                        # contiguously. Resurrects trunk-aware
+                        # features on frames where SAM trunk
+                        # detection failed entirely.
+                        if (args.canopy_heuristic_trunk_fallback
+                                and canopy_mask_img is not None
+                                and depth_mm is not None):
+                            try:
+                                _ht_boxes, _ht_scores = (
+                                    synthesize_heuristic_trunks(
+                                        canopy_mask_img,
+                                        depth_mm,
+                                        _kept_trunk_boxes,
+                                        column_band_radius_px=(
+                                            args.canopy_heuristic_trunk_band_px
+                                        ),
+                                        walk_down_px=(
+                                            args.canopy_heuristic_trunk_walk_px
+                                        ),
+                                        min_run_length_px=(
+                                            args.canopy_heuristic_trunk_min_run_px
+                                        ),
+                                        depth_min_mm=args.depth_min_mm,
+                                        depth_max_mm=(
+                                            args.canopy_post_fill_bg_depth_mm
+                                            if args.canopy_post_fill_bg_depth_mm > 0
+                                            else 3500.0
+                                        ),
+                                    )
+                                )
+                                if _ht_boxes:
+                                    _kept_trunk_boxes.extend(
+                                        _ht_boxes
+                                    )
+                                    _kept_trunk_scores.extend(
+                                        _ht_scores
+                                    )
+                                    # Synthetic trunks have no
+                                    # SAM mask. If a previous run
+                                    # had any masks, drop them so
+                                    # length stays aligned (the
+                                    # fall-back-to-bbox path in
+                                    # crop_canopy_below_trunks
+                                    # handles missing masks).
+                                    if _kept_trunk_masks:
+                                        _kept_trunk_masks = []
+                            except Exception as _hts_err:
+                                print(
+                                    f"[warn] heuristic trunk "
+                                    f"synthesis failed "
+                                    f"({_hts_err!r})",
+                                    file=sys.stderr,
+                                )
                         # Capture active trunks + ages for the
                         # overlay. age==0 = fresh this frame; age>0
                         # = ghost (carried forward from prior frame).
@@ -9649,6 +10098,11 @@ def main():
                             "HSV-G": (90, 230, 90),
                             "DPL":   (240, 150, 60),
                             "IVD":   (240, 80, 200),
+                            "CCGr":  (255, 100, 100),
+                            "LocG":  (140, 200, 220),
+                            "TVR":   (220, 200, 80),
+                            "TBB":   (180, 140, 220),
+                            "HF":    (200, 200, 100),
                         }
                         _cut_counts: dict = {}
                         for _fn, _cm in _filter_cut_masks.items():
@@ -9733,10 +10187,14 @@ def main():
                             f"HT{_ht_pct_cu:.0f}%  "
                             f"SUB-cut={_sub_total}"
                         )
-                        for _fn in ("HSV-G", "DPL", "IVD"):
-                            _hdr_cu += (
-                                f"  {_fn}={_cut_counts.get(_fn, 0)}"
-                            )
+                        for _fn in (
+                            "HSV-G", "DPL", "IVD",
+                            "CCGr", "LocG", "TVR", "TBB", "HF",
+                        ):
+                            if _cut_counts.get(_fn, 0) > 0:
+                                _hdr_cu += (
+                                    f"  {_fn}={_cut_counts.get(_fn, 0)}"
+                                )
                         _cv2_cu.putText(
                             rgb_cu, _hdr_cu, (8, 22),
                             _cv2_cu.FONT_HERSHEY_SIMPLEX,
@@ -9760,6 +10218,138 @@ def main():
                             f"[warn] could not save canopy cuts "
                             f"overlay for {img_path.name}: "
                             f"{_cu_err!r}",
+                            file=sys.stderr,
+                        )
+
+                # Per-frame canopy diagnostic metrics row. Captures
+                # everything you'd otherwise have to read off a JPG
+                # so you can sort/filter to find problem frames.
+                if canopy_mask_img is not None:
+                    try:
+                        _cm_b_metrics = canopy_mask_img.astype(bool)
+                        _frac_m = (
+                            float(_cm_b_metrics.sum())
+                            / float(_cm_b_metrics.size)
+                        )
+                        _ht_pct_m = 0.0
+                        if (_high_trust_mask is not None
+                                and _high_trust_mask.shape
+                                    == _cm_b_metrics.shape):
+                            _ht_pct_m = (
+                                100.0
+                                * float(_high_trust_mask.sum())
+                                / float(_high_trust_mask.size)
+                            )
+                        _sub_total_m = 0
+                        if (_canopy_pre_subtract is not None
+                                and _canopy_pre_subtract.shape
+                                    == _cm_b_metrics.shape):
+                            _sub_total_m = int(
+                                (
+                                    _canopy_pre_subtract
+                                    & ~_cm_b_metrics
+                                ).sum()
+                            )
+                        # Per-filter cut counts (None where filter
+                        # didn't track or didn't fire).
+                        _cnt_hsv = int(
+                            _filter_cut_masks["HSV-G"].sum()
+                        ) if "HSV-G" in _filter_cut_masks else 0
+                        _cnt_dpl = int(
+                            _filter_cut_masks["DPL"].sum()
+                        ) if "DPL" in _filter_cut_masks else 0
+                        _cnt_ivd = int(
+                            _filter_cut_masks["IVD"].sum()
+                        ) if "IVD" in _filter_cut_masks else 0
+                        _cnt_ccgr = int(
+                            _filter_cut_masks["CCGr"].sum()
+                        ) if "CCGr" in _filter_cut_masks else 0
+                        _cnt_locg = int(
+                            _filter_cut_masks["LocG"].sum()
+                        ) if "LocG" in _filter_cut_masks else 0
+                        _cnt_tvr = int(
+                            _filter_cut_masks["TVR"].sum()
+                        ) if "TVR" in _filter_cut_masks else 0
+                        _cnt_tbb = int(
+                            _filter_cut_masks["TBB"].sum()
+                        ) if "TBB" in _filter_cut_masks else 0
+                        _cnt_hf = int(
+                            _filter_cut_masks["HF"].sum()
+                        ) if "HF" in _filter_cut_masks else 0
+                        # Trunk counts (Rs aggregate).
+                        _rs_total = (
+                            int(locals().get("_ct_score", 0))
+                            + int(locals().get("_ct_stake", 0))
+                            + int(locals().get("_ct_depth", 0))
+                        )
+                        _trunks_assoc = int(
+                            locals().get("_ct_assoc", 0)
+                        )
+                        _trunks_kept = int(
+                            locals().get("_ct_kept", 0)
+                        )
+                        _trunks_ghost = int(
+                            locals().get("_ct_ghost", 0)
+                        )
+                        _trees_n = (
+                            len(frame_canopy_components)
+                            if isinstance(
+                                frame_canopy_components, list,
+                            ) else 0
+                        )
+                        # Auto-flags. Multiple flags can apply.
+                        _flags: list = []
+                        if _frac_m > 0.60:
+                            _flags.append("BALLOON")
+                        if _frac_m < 0.05:
+                            _flags.append("TINY")
+                        if _ht_pct_m < 0.5 and (
+                                _trunks_assoc + _trunks_kept == 0):
+                            _flags.append("NO_HT")
+                        if _trees_n > 5:
+                            _flags.append("OVER_FRAG")
+                        if (_rs_total > 100
+                                and _trunks_assoc == 0
+                                and _trunks_kept == 0):
+                            _flags.append("LOW_TRUNK_RECALL")
+                        if (_canopy_pre_subtract is not None
+                                and _canopy_pre_subtract.size > 0):
+                            _pre_sum = float(
+                                _canopy_pre_subtract.sum()
+                            )
+                            if _pre_sum > 0:
+                                _sub_frac = (
+                                    float(_sub_total_m) / _pre_sum
+                                )
+                                if _sub_frac > 0.50:
+                                    _flags.append("HEAVY_SUBTRACT")
+                        canopy_frame_metrics_rows.append({
+                            "day": day,
+                            "category": category,
+                            "session": session,
+                            "image": str(img_path),
+                            "canopy_frac": round(_frac_m, 4),
+                            "ht_frac": round(_ht_pct_m / 100.0, 4),
+                            "trees": _trees_n,
+                            "trunks_assoc": _trunks_assoc,
+                            "trunks_kept": _trunks_kept,
+                            "trunks_ghost": _trunks_ghost,
+                            "trunks_rs_total": _rs_total,
+                            "sub_cut_total": _sub_total_m,
+                            "cut_hsv_g": _cnt_hsv,
+                            "cut_dpl": _cnt_dpl,
+                            "cut_ivd": _cnt_ivd,
+                            "cut_ccgr": _cnt_ccgr,
+                            "cut_locg": _cnt_locg,
+                            "cut_tvr": _cnt_tvr,
+                            "cut_tbb": _cnt_tbb,
+                            "cut_hf": _cnt_hf,
+                            "flags": ",".join(_flags),
+                        })
+                    except Exception as _met_err:
+                        print(
+                            f"[warn] canopy frame metrics row "
+                            f"failed ({_met_err!r})",
                             file=sys.stderr,
                         )
 
@@ -11677,6 +12267,31 @@ def main():
             for r in tree_per_frame_rows:
                 pw_.writerow(r)
         print(f"[done] per-frame tree appearances -> {tpf_path}")
+
+    # Per-frame canopy diagnostic metrics. One row per processed
+    # frame with all the numbers you'd otherwise have to read off
+    # individual canopy_overlay JPGs, plus auto-flags so you can
+    # `grep BALLOON canopy_frame_metrics.csv` to find problem
+    # frames quickly.
+    if canopy_frame_metrics_rows:
+        cfm_path = out_dir / "canopy_frame_metrics.csv"
+        cfm_fields = [
+            "day", "category", "session", "image",
+            "canopy_frac", "ht_frac", "trees",
+            "trunks_assoc", "trunks_kept", "trunks_ghost",
+            "trunks_rs_total",
+            "sub_cut_total",
+            "cut_hsv_g", "cut_dpl", "cut_ivd",
+            "cut_ccgr", "cut_locg", "cut_tvr",
+            "cut_tbb", "cut_hf",
+            "flags",
+        ]
+        with open(cfm_path, "w", newline="", encoding="utf-8") as cf_:
+            cw_ = csv.DictWriter(cf_, fieldnames=cfm_fields)
+            cw_.writeheader()
+            for r in canopy_frame_metrics_rows:
+                cw_.writerow(r)
+        print(f"[done] per-frame canopy metrics -> {cfm_path}")
 
     dt = time.time() - start
     print(f"[done] {total_imgs} images × {len(prompts)} prompts in {dt:.1f}s -> {csv_path}")
