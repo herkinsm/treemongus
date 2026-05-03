@@ -79,6 +79,23 @@ echo "[batch] Using python: $PY"
 #      back -- which would resolve the balloon at its source
 #      (crop-below-trunk would kill the entire grass region).
 # HSV grass widening + multi-prompts from round 1 retained.
+#
+# ROUND 3: "tree trunk" prompt working (A18/K7 in sample frame)
+# but bboxes over-extended -- many trunks span the full vertical
+# column from foliage to ground, defeating crop-below-trunk and
+# letting canopy-extend-via-trunks pull 80-px-wide ground bands
+# into the canopy. Trees=38/46 from over-fragmented partition.
+# Three round-3 changes:
+#   1. --canopy-extend-via-trunks REMOVED (and its sub-params:
+#      --canopy-extend-trunk-band-radius-px 80, and
+#      --canopy-extend-below-trunk-top-px 30). Was useful when
+#      trunks were sparse and well-bounded; now actively
+#      harmful with over-extended trunk bboxes.
+#   2. --canopy-trunk-min-score 0.10 -> 0.20. Drop the noisy
+#      0.10-0.19 trunks; keep confident detections (we saw
+#      0.54 / 0.74 on real trunks in the overlays).
+#   3. --canopy-track-min-cc-area 500 -> 2000. Drop tiny
+#      partition fragments. Cuts the trees=38/46 count down.
 "$PY" analyze_days.py \
   --root "/fs/scratch/PAS0228/2023 day 4" \
   --out "$HOME/sam3_yolo_test" \
@@ -126,9 +143,6 @@ echo "[batch] Using python: $PY"
   --canopy-filter-min-area-px 400 \
   --canopy-filter-max-top-row 300 \
   --canopy-add-trunk-masks --canopy-trunk-vertical-extension-px 100 \
-  --canopy-extend-via-trunks \
-  --canopy-extend-trunk-band-radius-px 80 \
-  --canopy-extend-below-trunk-top-px 30 \
   --canopy-crop-below-trunk --canopy-crop-below-trunk-buffer-px 30 \
   --canopy-exclude-painted-stakes \
   --canopy-stake-hue-min 30 --canopy-stake-hue-max 90 \
@@ -170,8 +184,8 @@ echo "[batch] Using python: $PY"
   --flower-edge-margin-sides-px 0 \
   --flower-require-tree-in-frame --flower-foreground-canopy-max-depth-mm 2500 \
   --flower-max-behind-foreground-mm 1000 \
-  --track-canopy --canopy-track-iou 0.3 --canopy-track-max-age 5 --canopy-track-min-cc-area 500 \
-  --canopy-track-method trunk --canopy-trunk-min-score 0.10 --canopy-trunk-prompt "tree trunk" \
+  --track-canopy --canopy-track-iou 0.3 --canopy-track-max-age 5 --canopy-track-min-cc-area 2000 \
+  --canopy-track-method trunk --canopy-trunk-min-score 0.20 --canopy-trunk-prompt "tree trunk" \
   --canopy-trunk-reject-green-stakes --canopy-trunk-max-green-pct 0.35 \
   --canopy-trunk-green-threshold 15 --canopy-trunk-min-brown-pct 0.20 \
   --canopy-trunk-max-depth-mm 3000 --canopy-trunk-depth-min-pixels 5 \
