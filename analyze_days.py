@@ -3619,6 +3619,8 @@ def crop_canopy_at_top_vs_row_depth_jump(
     top_frac: float = 0.25,
     min_pixels_per_row: int = 10,
     trunk_boxes: list | None = None,
+    high_trust_mask: np.ndarray | None = None,
+    high_trust_min_overlap_frac: float = 0.20,
 ) -> np.ndarray:
     """For each CC, compare per-row median depth to the CC's
     TOP-rows median. Find the first row going down where the
@@ -3689,6 +3691,18 @@ def crop_canopy_at_top_vs_row_depth_jump(
                         break
             if _skip_cc:
                 continue
+        # HIGH-TRUST-SAM SKIP: if a high-confidence SAM tree
+        # mask substantially overlaps this CC (>= overlap_frac
+        # of the CC's pixels), skip the crop. SAM segmenting
+        # the full tree at high confidence is itself an anchor
+        # -- we don't need a separate trunk detection to trust
+        # the CC is a complete tree.
+        if high_trust_mask is not None:
+            _cc_area = float(cc_pix.sum())
+            if _cc_area > 0:
+                _ov = float((cc_pix & high_trust_mask).sum())
+                if (_ov / _cc_area) >= float(high_trust_min_overlap_frac):
+                    continue
         # Compute per-row median depth WITHIN this CC.
         medians = np.full(h_cc, np.nan, dtype=np.float64)
         for dy in range(h_cc):
@@ -3729,6 +3743,8 @@ def remove_ground_by_local_gradient(
     min_y: int = 200,
     require_in_cc_bottom_frac: float = 0.5,
     trunk_boxes: list | None = None,
+    high_trust_mask: np.ndarray | None = None,
+    high_trust_min_overlap_frac: float = 0.20,
 ) -> np.ndarray:
     """Per-pixel ground removal by local vertical depth gradient.
 
@@ -3804,6 +3820,17 @@ def remove_ground_by_local_gradient(
                             break
                 if _skip:
                     continue
+            # HIGH-TRUST-SAM SKIP
+            if high_trust_mask is not None:
+                _cc_area = float(cc_pix.sum())
+                if _cc_area > 0:
+                    _ov = float(
+                        (cc_pix & high_trust_mask).sum()
+                    )
+                    if (_ov / _cc_area) >= float(
+                        high_trust_min_overlap_frac
+                    ):
+                        continue
             cut_y = y0 + int(round(h_cc * (1.0 - require_in_cc_bottom_frac)))
             in_cc_bottom |= cc_pix & (np.arange(H)[:, None] >= cut_y)
     elif require_in_cc_bottom_frac <= 0:
@@ -3899,6 +3926,8 @@ def crop_canopy_ground_gradient(
     max_corr: float = 0.70,
     min_pixels: int = 100,
     trunk_boxes: list | None = None,
+    high_trust_mask: np.ndarray | None = None,
+    high_trust_min_overlap_frac: float = 0.20,
 ) -> np.ndarray:
     """Crop the bottom of any canopy CC whose lower portion has
     a ground-like depth-row correlation.
@@ -3964,6 +3993,13 @@ def crop_canopy_ground_gradient(
                         break
             if _skip_cc:
                 continue
+        # HIGH-TRUST-SAM SKIP
+        if high_trust_mask is not None:
+            _cc_area = float(cc_pix.sum())
+            if _cc_area > 0:
+                _ov = float((cc_pix & high_trust_mask).sum())
+                if (_ov / _cc_area) >= float(high_trust_min_overlap_frac):
+                    continue
         bottom_h = max(1, int(round(h_cc * bottom_frac)))
         bottom_y_start = y + h_cc - bottom_h
         bottom_y_end = y + h_cc
@@ -7176,6 +7212,48 @@ def main():
                                         float(x) for x in _bb_g
                                     ])
 
+                    # Build a "high-trust SAM mask" = union of SAM
+                    # tree-prompt masks with score >= the high-
+                    # trust threshold. Ground filters skip CCs that
+                    # substantially overlap this mask. SAM
+                    # confidently segmenting the full tree is itself
+                    # an anchor; we don't need a separate trunk
+                    # detection (which often fails for occluded
+                    # posts) to trust the CC.
+                    _high_trust_mask: np.ndarray | None = None
+                    if (args.high_sam_trust_threshold > 0
+                            and isinstance(infer, dict)
+                            and canopy_mask_img is not None):
+                        try:
+                            _hm = np.zeros(
+                                canopy_mask_img.shape, dtype=bool,
+                            )
+                            for _p_ht in _canopy_sam_prompt_set:
+                                if _p_ht not in infer:
+                                    continue
+                                _pi_ht = infer[_p_ht]
+                                _ms_ht = _pi_ht.get("masks")
+                                _ss_ht = _pi_ht.get("scores")
+                                if (_ms_ht is None
+                                        or _ss_ht is None
+                                        or len(_ms_ht) == 0):
+                                    continue
+                                for _mm_ht, _sc_ht in zip(
+                                    _ms_ht, _ss_ht,
+                                ):
+                                    if (float(_sc_ht)
+                                            < args.high_sam_trust_threshold):
+                                        continue
+                                    _b_ht = np.asarray(_mm_ht).astype(bool)
+                                    if _b_ht.ndim == 3:
+                                        _b_ht = _b_ht.any(axis=0)
+                                    if _b_ht.shape == _hm.shape:
+                                        _hm = _hm | _b_ht
+                            if _hm.any():
+                                _high_trust_mask = _hm
+                        except Exception:
+                            _high_trust_mask = None
+
                     # PER-CC GROUND-GRADIENT CROP. For each CC,
                     # examine the bottom fraction of rows. If
                     # depth correlates strongly with row in that
@@ -7199,6 +7277,7 @@ def main():
                                         args.canopy_ground_gradient_max_corr
                                     ),
                                     trunk_boxes=_aware_trunks_pre,
+                                    high_trust_mask=_high_trust_mask,
                                 )
                             )
                         except Exception as _gg_err:
@@ -7237,6 +7316,7 @@ def main():
                                         args.canopy_grad_cc_bottom_frac
                                     ),
                                     trunk_boxes=_aware_trunks_pre,
+                                    high_trust_mask=_high_trust_mask,
                                 )
                             )
                         except Exception as _gr_err:
@@ -7323,6 +7403,7 @@ def main():
                                         args.canopy_row_jump_min_pixels_per_row
                                     ),
                                     trunk_boxes=_aware_trunks,
+                                    high_trust_mask=_high_trust_mask,
                                 )
                             )
                         except Exception as _tj_err:
@@ -7703,6 +7784,7 @@ def main():
                                         args.canopy_row_jump_min_pixels_per_row
                                     ),
                                     trunk_boxes=_aware_trunks,
+                                    high_trust_mask=_high_trust_mask,
                                 )
                             )
                         except Exception:
