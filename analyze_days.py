@@ -3517,6 +3517,7 @@ def crop_canopy_at_top_vs_row_depth_jump(
     min_jump_mm: float = 500.0,
     top_frac: float = 0.25,
     min_pixels_per_row: int = 10,
+    trunk_boxes: list | None = None,
 ) -> np.ndarray:
     """For each CC, compare per-row median depth to the CC's
     TOP-rows median. Find the first row going down where the
@@ -3566,6 +3567,27 @@ def crop_canopy_at_top_vs_row_depth_jump(
         if h_cc < 20:
             continue
         cc_pix = (labels == cc_id)
+        # TRUNK-AWARE SKIP: if a trunk bbox overlaps this CC,
+        # the CC clearly is a tree extending down to the trunk
+        # base. The crop-below-trunk logic later will handle
+        # the trunk-ground boundary precisely. Skip the top-vs-
+        # row jump crop for this CC -- it tends to false-trigger
+        # on close-camera trees with strong perspective (lower
+        # branches genuinely deeper than upper ones).
+        if trunk_boxes:
+            _skip_cc = False
+            for _tb in trunk_boxes:
+                _tx1 = max(0, int(round(float(_tb[0]))))
+                _ty1 = max(0, int(round(float(_tb[1]))))
+                _tx2 = min(W - 1, int(round(float(_tb[2]))))
+                _ty2 = min(H - 1, int(round(float(_tb[3]))))
+                if _tx2 >= _tx1 and _ty2 >= _ty1:
+                    if cc_pix[_ty1:_ty2 + 1,
+                              _tx1:_tx2 + 1].any():
+                        _skip_cc = True
+                        break
+            if _skip_cc:
+                continue
         # Compute per-row median depth WITHIN this CC.
         medians = np.full(h_cc, np.nan, dtype=np.float64)
         for dy in range(h_cc):
@@ -7056,6 +7078,33 @@ def main():
                             and depth_mm is not None
                             and canopy_mask_img.any()):
                         try:
+                            # Extract current-frame trunk bboxes
+                            # so the top-vs-row jump can SKIP CCs
+                            # with detected trunks (those CCs are
+                            # tree extending down to trunk base;
+                            # crop-below-trunk handles the actual
+                            # tree-ground boundary).
+                            _aware_trunks: list = []
+                            if (isinstance(infer, dict)
+                                    and args.canopy_trunk_prompt in infer):
+                                _ti_aw = infer[args.canopy_trunk_prompt]
+                                _tb_aw = _ti_aw.get("boxes")
+                                _ts_aw = _ti_aw.get("scores")
+                                if (_tb_aw is not None
+                                        and len(_tb_aw)):
+                                    _ssl_aw = (
+                                        _ts_aw
+                                        if _ts_aw is not None
+                                        else [1.0] * len(_tb_aw)
+                                    )
+                                    for _bb_aw, _ss_aw in zip(
+                                        _tb_aw, _ssl_aw,
+                                    ):
+                                        if (float(_ss_aw)
+                                                >= args.canopy_trunk_min_score):
+                                            _aware_trunks.append([
+                                                float(x) for x in _bb_aw
+                                            ])
                             canopy_mask_img = (
                                 crop_canopy_at_top_vs_row_depth_jump(
                                     canopy_mask_img,
@@ -7069,6 +7118,7 @@ def main():
                                     min_pixels_per_row=(
                                         args.canopy_row_jump_min_pixels_per_row
                                     ),
+                                    trunk_boxes=_aware_trunks,
                                 )
                             )
                         except Exception as _tj_err:
@@ -7382,6 +7432,33 @@ def main():
                     # Top-vs-row depth jump (Plan C Strategy 3)
                     if args.canopy_crop_top_vs_row_depth_jump:
                         try:
+                            # Extract current-frame trunk bboxes
+                            # so the top-vs-row jump can SKIP CCs
+                            # with detected trunks (those CCs are
+                            # tree extending down to trunk base;
+                            # crop-below-trunk handles the actual
+                            # tree-ground boundary).
+                            _aware_trunks: list = []
+                            if (isinstance(infer, dict)
+                                    and args.canopy_trunk_prompt in infer):
+                                _ti_aw = infer[args.canopy_trunk_prompt]
+                                _tb_aw = _ti_aw.get("boxes")
+                                _ts_aw = _ti_aw.get("scores")
+                                if (_tb_aw is not None
+                                        and len(_tb_aw)):
+                                    _ssl_aw = (
+                                        _ts_aw
+                                        if _ts_aw is not None
+                                        else [1.0] * len(_tb_aw)
+                                    )
+                                    for _bb_aw, _ss_aw in zip(
+                                        _tb_aw, _ssl_aw,
+                                    ):
+                                        if (float(_ss_aw)
+                                                >= args.canopy_trunk_min_score):
+                                            _aware_trunks.append([
+                                                float(x) for x in _bb_aw
+                                            ])
                             canopy_mask_img = (
                                 crop_canopy_at_top_vs_row_depth_jump(
                                     canopy_mask_img,
@@ -7395,6 +7472,7 @@ def main():
                                     min_pixels_per_row=(
                                         args.canopy_row_jump_min_pixels_per_row
                                     ),
+                                    trunk_boxes=_aware_trunks,
                                 )
                             )
                         except Exception:
