@@ -56,21 +56,28 @@ echo "[batch] Using python: $PY"
 "$PY" -c "import sam3; print('[batch] sam3 OK')" \
     || { echo "[batch] sam3 import failed -- aborting"; exit 1; }
 
-# TEST RUN: target the canopy "balloon" caused by build_tree_mask
-# pulling dry/yellow-tan grass into foreground depth. SAM 3 scores
-# only ~0.10 on real apple trees here (previous AT 0.10 overlay)
-# so it isn't shielding pixels via high_trust_mask -- the canopy
-# is built almost entirely by the depth heuristic, and SUBTRACT
-# phase has to do all the cleanup. Three SUBTRACT-phase widenings
-# below; multi-prompts restored to the original 4 (their false
-# positives on barns/horizons were already being filtered, so
-# narrowing them gave no benefit).
-#   1. HSV grass: hue 25-90 (was 35-65) catches yellow-tan dry
-#      grass, sat-min 30 (was 60) catches desaturated grass.
-#   2. grass-min-y 200 (was 300) extends the filter up to the
-#      typical horizon row.
-#   3. max-bottom-row 400 (was 460) tightens the hard floor;
-#      below row 400 is almost always trunk or ground.
+# TEST RUN: round 2 of canopy-balloon fixes. Round 1 (HSV grass
+# widening + max-bottom-row 460->400) cut canopy_frac from 37.4%
+# to 30.5% on the worst frame but balloon persists -- grass
+# between rows 200-400 still bleeds into canopy. The diagnostic
+# overlay shows AT 0.18 (apple tree SAM mask) consistently
+# tracing the real tree foliage but JUST under the 0.20 high-
+# trust threshold, so per-pixel restoration never activates and
+# real tree pixels are unprotected. Three additional changes:
+#   1. high-sam-trust-threshold 0.20 -> 0.15. AT 0.18 now lands
+#      in high_trust_mask -> real-tree pixels get protected
+#      from the more aggressive cuts below.
+#   2. max-bottom-row 400 -> 350. More aggressive hard floor.
+#      Tree pixels between rows 350 and the floor survive via
+#      (1)'s protection; grass below 350 is cut.
+#   3. canopy-trunk-prompt "apple tree trunk" -> "tree trunk".
+#      Original prompt is producing 17-43 score-rejected boxes
+#      per frame at 0.01-0.07. Pure noise. If the simpler
+#      prompt scores higher on real trunks, we get partition,
+#      crop-below-trunk, and trunk-aware ground-filter skip
+#      back -- which would resolve the balloon at its source
+#      (crop-below-trunk would kill the entire grass region).
+# HSV grass widening + multi-prompts from round 1 retained.
 "$PY" analyze_days.py \
   --root "/fs/scratch/PAS0228/2023 day 4" \
   --out "$HOME/sam3_yolo_test" \
@@ -94,7 +101,7 @@ echo "[batch] Using python: $PY"
   --flower-anther-hole-min-area-px 2 --flower-anther-hole-max-area-px 60 \
   --flower-anther-min-area-px 100 \
   --depth-min-mm 600 --depth-max-mm 3000 --depth-near-frac 0.40 \
-  --high-sam-trust-threshold 0.20 \
+  --high-sam-trust-threshold 0.15 \
   --mask-min-depth-spread-mm 0 --mask-max-depth-row-corr 1.0 \
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
   --use-build-tree-mask --tree-mask-min-overlap 0.10 --tree-mask-dilate-px 8 \
@@ -128,7 +135,7 @@ echo "[batch] Using python: $PY"
   --canopy-stake-min-aspect-ratio 4.0 --canopy-stake-min-area-px 50 \
   --canopy-fill-small-holes --canopy-max-hole-area-px 1500 \
   --canopy-max-hole-aspect-ratio 3.0 \
-  --canopy-max-bottom-row 400 \
+  --canopy-max-bottom-row 350 \
   --canopy-post-fill-bg-depth-mm 3000 \
   --canopy-crop-ground-gradient \
   --canopy-ground-gradient-bottom-frac 0.30 \
@@ -163,7 +170,7 @@ echo "[batch] Using python: $PY"
   --flower-require-tree-in-frame --flower-foreground-canopy-max-depth-mm 2500 \
   --flower-max-behind-foreground-mm 1000 \
   --track-canopy --canopy-track-iou 0.3 --canopy-track-max-age 5 --canopy-track-min-cc-area 500 \
-  --canopy-track-method trunk --canopy-trunk-min-score 0.10 --canopy-trunk-prompt "apple tree trunk" \
+  --canopy-track-method trunk --canopy-trunk-min-score 0.10 --canopy-trunk-prompt "tree trunk" \
   --canopy-trunk-reject-green-stakes --canopy-trunk-max-green-pct 0.35 \
   --canopy-trunk-green-threshold 15 --canopy-trunk-min-brown-pct 0.20 \
   --canopy-trunk-max-depth-mm 3000 --canopy-trunk-depth-min-pixels 5 \
