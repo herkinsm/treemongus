@@ -8023,6 +8023,10 @@ def main():
                 # cc-method or when track_canopy is off.
                 _ov_raw_trunk_boxes: list = []
                 _ov_raw_trunk_scores: list = []
+                # Parallel to _ov_raw_trunk_boxes. None = currently
+                # kept; 'score'/'stake'/'depth' = the filter that
+                # dropped this raw box.
+                _ov_raw_trunk_reasons: list = []
                 _ov_fresh_trunk_boxes: list = []
                 _ov_fresh_trunk_scores: list = []
                 _ov_active_trunk_boxes: list = []
@@ -8067,9 +8071,17 @@ def main():
                                 _ov_raw_trunk_scores = [
                                     1.0
                                 ] * len(_trunk_boxes_all)
+                            _ov_raw_trunk_reasons = [
+                                None
+                            ] * len(_trunk_boxes_all)
                         _kept_trunk_boxes: list = []
                         _kept_trunk_scores: list = []
                         _kept_trunk_masks: list = []
+                        # Indices into _ov_raw_trunk_boxes that are
+                        # still in the kept set. Updated after each
+                        # filter so we know which raw idx survived
+                        # to attribute the rejection reason.
+                        _kept_raw_idx: list = []
                         if (_trunk_boxes_all is not None
                                 and len(_trunk_boxes_all)):
                             _scores = (
@@ -8090,6 +8102,9 @@ def main():
                                         _kept_trunk_masks.append(
                                             _trunk_masks_all[ti]
                                         )
+                                    _kept_raw_idx.append(ti)
+                                else:
+                                    _ov_raw_trunk_reasons[ti] = 'score'
                             # Filter out painted-green support stakes
                             # before they get used as canopy anchors.
                             # Color stats run on the SAM mask (just
@@ -8106,6 +8121,15 @@ def main():
                                             == len(_kept_trunk_boxes))
                                     else None
                                 )
+                                # Capture box-object ids pre-filter so
+                                # we can identify which were dropped.
+                                # filter_painted_stake_trunks does
+                                # kept_boxes.append(box) so survivor
+                                # ids are preserved.
+                                _pre_stake_pairs = list(zip(
+                                    _kept_raw_idx,
+                                    [id(b) for b in _kept_trunk_boxes],
+                                ))
                                 _kept_trunk_boxes, _kept_trunk_scores = (
                                     filter_painted_stake_trunks(
                                         _kept_trunk_boxes,
@@ -8117,6 +8141,18 @@ def main():
                                         min_brown_pct=args.canopy_trunk_min_brown_pct,
                                     )
                                 )
+                                _post_stake_ids = {
+                                    id(b) for b in _kept_trunk_boxes
+                                }
+                                _new_kept_raw_idx = []
+                                for _ri, _bid in _pre_stake_pairs:
+                                    if _bid in _post_stake_ids:
+                                        _new_kept_raw_idx.append(_ri)
+                                    else:
+                                        _ov_raw_trunk_reasons[_ri] = (
+                                            'stake'
+                                        )
+                                _kept_raw_idx = _new_kept_raw_idx
                                 # ALSO drop the matching masks so the
                                 # depth-filter sees the right ones.
                                 if _masks_for_filter is not None:
@@ -8148,6 +8184,10 @@ def main():
                                             == len(_kept_trunk_boxes))
                                     else None
                                 )
+                                _pre_depth_pairs = list(zip(
+                                    _kept_raw_idx,
+                                    [id(b) for b in _kept_trunk_boxes],
+                                ))
                                 _kept_trunk_boxes, _kept_trunk_scores = (
                                     filter_far_trunks(
                                         _kept_trunk_boxes,
@@ -8158,6 +8198,18 @@ def main():
                                         min_valid_pixels=args.canopy_trunk_depth_min_pixels,
                                     )
                                 )
+                                _post_depth_ids = {
+                                    id(b) for b in _kept_trunk_boxes
+                                }
+                                _new_kept_raw_idx = []
+                                for _ri, _bid in _pre_depth_pairs:
+                                    if _bid in _post_depth_ids:
+                                        _new_kept_raw_idx.append(_ri)
+                                    else:
+                                        _ov_raw_trunk_reasons[_ri] = (
+                                            'depth'
+                                        )
+                                _kept_raw_idx = _new_kept_raw_idx
                         # Snapshot the FRESH (post-filter, pre-memory)
                         # trunk set for the overlay. Anything in
                         # _ov_raw_trunk_boxes but not here was
@@ -8522,26 +8574,58 @@ def main():
                         }
                         _ct_assoc = 0
                         _ct_kept = 0
-                        _ct_rej = 0
+                        _ct_score = 0
+                        _ct_stake = 0
+                        _ct_depth = 0
                         _ct_ghost = 0
+                        # Reason → (color, letter). Distinct hues so
+                        # you can tell at a glance which filter
+                        # killed each rejected box.
+                        _reason_color = {
+                            'score': (220, 60, 60),
+                            'stake': (255, 0, 255),
+                            'depth': (160, 80, 255),
+                        }
+                        _reason_letter = {
+                            'score': 'Rs',
+                            'stake': 'Rg',
+                            'depth': 'Rd',
+                        }
                         # Draw rejected raw boxes first (thin, behind).
-                        for _rb, _rs in zip(
+                        # Use the per-reason list when populated; fall
+                        # back to fresh-set membership otherwise (e.g.
+                        # if the reason wasn't tracked for some path).
+                        for _ri, (_rb, _rs) in enumerate(zip(
                             _ov_raw_trunk_boxes, _ov_raw_trunk_scores,
-                        ):
-                            if _btup(_rb) in _fresh_set:
+                        )):
+                            _reason = (
+                                _ov_raw_trunk_reasons[_ri]
+                                if _ri < len(_ov_raw_trunk_reasons)
+                                else None
+                            )
+                            if _reason is None:
+                                # Fallback: treat as kept (drawn below).
                                 continue
+                            color = _reason_color.get(
+                                _reason, (255, 0, 255),
+                            )
+                            letter = _reason_letter.get(_reason, 'R')
                             x1, y1, x2, y2 = _btup(_rb)
                             _cv2_co.rectangle(
-                                rgb_co, (x1, y1), (x2, y2),
-                                (255, 0, 255), 1,
+                                rgb_co, (x1, y1), (x2, y2), color, 1,
                             )
                             _cv2_co.putText(
-                                rgb_co, f"R {_rs:.2f}",
+                                rgb_co, f"{letter} {_rs:.2f}",
                                 (x1, max(0, y1 - 4)),
                                 _cv2_co.FONT_HERSHEY_SIMPLEX,
-                                0.4, (255, 0, 255), 1, _cv2_co.LINE_AA,
+                                0.4, color, 1, _cv2_co.LINE_AA,
                             )
-                            _ct_rej += 1
+                            if _reason == 'score':
+                                _ct_score += 1
+                            elif _reason == 'stake':
+                                _ct_stake += 1
+                            elif _reason == 'depth':
+                                _ct_depth += 1
                         # Draw active trunks (kept fresh + ghosts).
                         for _ab, _as_, _ag in zip(
                             _ov_active_trunk_boxes,
@@ -8577,7 +8661,8 @@ def main():
                             f"canopy_frac={_cf*100:.1f}%  "
                             f"trees={len(frame_canopy_components)}  "
                             f"trunks A{_ct_assoc}/K{_ct_kept}/"
-                            f"R{_ct_rej}/G{_ct_ghost}"
+                            f"Rs{_ct_score}/Rg{_ct_stake}/"
+                            f"Rd{_ct_depth}/G{_ct_ghost}"
                         )
                         _cv2_co.putText(
                             rgb_co, hdr, (8, 22),
