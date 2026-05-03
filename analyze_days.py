@@ -5181,6 +5181,25 @@ def main():
                          "many pixels before AND-ing with current "
                          "foreground. Compensates for small camera "
                          "motion between frames. Default 8.")
+    ap.add_argument("--canopy-temporal-merge-trunk-aware",
+                    action="store_true",
+                    help="Trunk-aware temporal merge: a previous-"
+                         "frame canopy pixel is only carried forward "
+                         "if the NEAREST trunk x-column at its "
+                         "position is the same in both frames "
+                         "(within tolerance). Prevents over-merging "
+                         "of adjacent trees in dense orchards where "
+                         "canopies overlap. When trunks aren't "
+                         "available (no detection in either frame), "
+                         "the merge is skipped for that frame.")
+    ap.add_argument("--canopy-temporal-merge-trunk-tolerance-px",
+                    type=int, default=80,
+                    help="Maximum horizontal shift (in px) between "
+                         "the nearest trunk's x-column in previous "
+                         "vs current frame for them to be considered "
+                         "the same tree. Default 80. Tighter = "
+                         "stricter (less over-merging risk; less "
+                         "tolerance for camera motion).")
     ap.add_argument("--canopy-crop-below-trunk", action="store_true",
                     help="For each canopy CC that overlaps a SAM "
                          "trunk bbox, crop the CC at row "
@@ -6236,6 +6255,11 @@ def main():
     # that should be one tree but got split (e.g., trunk creates
     # a gap in the canopy mask).
     current_prev_canopy_mask: np.ndarray | None = None
+    # Per-session previous-frame trunk bboxes. Used by trunk-aware
+    # temporal merge so previous-frame canopy pixels only carry
+    # forward when their column's NEAREST trunk hasn't shifted
+    # significantly between frames (= same tree).
+    current_prev_trunk_boxes: list | None = None
     # Per-(session, tree_id) summary for the new trees CSV.
     tree_summaries: list[dict] = []
     # Per-frame, per-tree row for trees_per_frame CSV.
@@ -6308,6 +6332,7 @@ def main():
                     else None
                 )
                 current_prev_canopy_mask = None
+                current_prev_trunk_boxes = None
                 current_session_key = session_key
 
             t_img = time.time()
@@ -7062,6 +7087,13 @@ def main():
                 # still foreground depth + non-sky in THIS frame.
                 # Bridges same-tree CCs that got split by gaps the
                 # current frame's processing created.
+                #
+                # TRUNK-AWARE variant: when --canopy-temporal-merge-
+                # trunk-aware is on, only carry forward pixels in
+                # columns where the NEAREST trunk hasn't shifted
+                # significantly between frames. Prevents over-
+                # merging of adjacent trees in dense orchards where
+                # canopies overlap.
                 if (args.canopy_temporal_merge
                         and current_prev_canopy_mask is not None
                         and canopy_mask_img is not None
@@ -7118,11 +7150,91 @@ def main():
                             _fg_clean_tm = _fg_tm & ~_sky_tm
                         except Exception:
                             _fg_clean_tm = _fg_tm
+
+                        # Trunk-aware gate. Compute, for each
+                        # column, the x-coordinate of the nearest
+                        # trunk in BOTH frames. If the per-column
+                        # nearest trunk shifted by more than the
+                        # tolerance, that column belongs to a
+                        # different tree now -- skip the carry-
+                        # forward in that column.
+                        _trunk_aware_mask = None
+                        if (args.canopy_temporal_merge_trunk_aware
+                                and current_prev_trunk_boxes
+                                and isinstance(infer, dict)
+                                and args.canopy_trunk_prompt in infer):
+                            _cur_trunk_infer = infer[args.canopy_trunk_prompt]
+                            _cur_trunk_boxes_raw = (
+                                _cur_trunk_infer.get("boxes")
+                            )
+                            _cur_trunk_scores_raw = (
+                                _cur_trunk_infer.get("scores")
+                            )
+                            _cur_trunk_xs: list[float] = []
+                            if (_cur_trunk_boxes_raw is not None
+                                    and len(_cur_trunk_boxes_raw)):
+                                _scores_list = (
+                                    _cur_trunk_scores_raw
+                                    if _cur_trunk_scores_raw is not None
+                                    else [1.0] * len(_cur_trunk_boxes_raw)
+                                )
+                                for _tb, _ts in zip(
+                                    _cur_trunk_boxes_raw, _scores_list,
+                                ):
+                                    if (float(_ts)
+                                            >= args.canopy_trunk_min_score):
+                                        _cur_trunk_xs.append(
+                                            (float(_tb[0]) + float(_tb[2]))
+                                            / 2.0
+                                        )
+                            _prev_trunk_xs: list[float] = []
+                            for _tb in current_prev_trunk_boxes:
+                                _prev_trunk_xs.append(
+                                    (float(_tb[0]) + float(_tb[2])) / 2.0
+                                )
+                            if _cur_trunk_xs and _prev_trunk_xs:
+                                _W = canopy_mask_img.shape[1]
+                                _cols = np.arange(_W, dtype=np.float32)
+                                _cur_arr = np.asarray(
+                                    _cur_trunk_xs, dtype=np.float32,
+                                )
+                                _prev_arr = np.asarray(
+                                    _prev_trunk_xs, dtype=np.float32,
+                                )
+                                # Per-column nearest-trunk x for
+                                # each frame.
+                                _cur_d = np.abs(
+                                    _cols[:, None] - _cur_arr[None, :]
+                                )
+                                _cur_near_x = _cur_arr[
+                                    _cur_d.argmin(axis=1)
+                                ]
+                                _prev_d = np.abs(
+                                    _cols[:, None] - _prev_arr[None, :]
+                                )
+                                _prev_near_x = _prev_arr[
+                                    _prev_d.argmin(axis=1)
+                                ]
+                                _tol = float(
+                                    args.canopy_temporal_merge_trunk_tolerance_px
+                                )
+                                _same_per_col = (
+                                    np.abs(_cur_near_x - _prev_near_x)
+                                    <= _tol
+                                )
+                                _trunk_aware_mask = np.broadcast_to(
+                                    _same_per_col[None, :],
+                                    canopy_mask_img.shape,
+                                )
+
                         # Add previous canopy pixels still in
-                        # foreground.
+                        # foreground, optionally gated by the
+                        # trunk-aware mask.
+                        _to_add = _prev_dil & _fg_clean_tm
+                        if _trunk_aware_mask is not None:
+                            _to_add = _to_add & _trunk_aware_mask
                         canopy_mask_img = (
-                            canopy_mask_img.astype(bool)
-                            | (_prev_dil & _fg_clean_tm)
+                            canopy_mask_img.astype(bool) | _to_add
                         )
                     except Exception as _tm_err:
                         print(
@@ -7344,6 +7456,19 @@ def main():
                                     and len(_kept_trunk_masks)
                                         != len(_kept_trunk_boxes)):
                                 _kept_trunk_masks = []
+
+                        # Save current frame's filtered trunks for
+                        # use by the NEXT frame's trunk-aware
+                        # temporal merge. Saved AFTER all filtering
+                        # (green-stake, depth, memory carry-forward)
+                        # so the per-column nearest-trunk computation
+                        # operates on the same trunks the partition
+                        # used.
+                        if args.canopy_temporal_merge_trunk_aware:
+                            current_prev_trunk_boxes = (
+                                [list(b) for b in _kept_trunk_boxes]
+                                if _kept_trunk_boxes else None
+                            )
 
                         if _kept_trunk_boxes:
                             # Trunk-based canopy refinements. Run

@@ -133,6 +133,8 @@ echo "[batch] Using python: $PY"
   --canopy-row-jump-min-pixels-per-row 10 \
   --canopy-trunk-memory-frames 5 --canopy-trunk-memory-iou 0.3 \
   --canopy-temporal-merge --canopy-temporal-merge-dilate-px 8 \
+  --canopy-temporal-merge-trunk-aware \
+  --canopy-temporal-merge-trunk-tolerance-px 80 \
   --canopy-include-edge-trees --canopy-edge-tree-min-area-px 400 \
   --canopy-edge-tree-min-height-px 80 --canopy-edge-tree-max-top-row 350 \
   --canopy-edge-tree-min-aspect-ratio 0.8 \
