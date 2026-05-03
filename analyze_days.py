@@ -9364,18 +9364,23 @@ def main():
                             _kept_trunk_scores = [
                                 float(s) for _b, s, _m in _active
                             ]
+                            # Keep ALL masks including None entries
+                            # (ghost trunks may lack masks because
+                            # the original detection didn't include
+                            # them). Length stays aligned with
+                            # _kept_trunk_boxes. Downstream consumers
+                            # (crop_canopy_below_trunks, canopy_add_
+                            # trunk_masks, far-depth filter np.stack
+                            # guard) all handle None entries
+                            # gracefully. Previously we filtered out
+                            # Nones and then reset to [] on length
+                            # mismatch, which discarded ALL masks
+                            # whenever ANY ghost lacked a mask --
+                            # a single None ghost wiped out every
+                            # real trunk's mask for the frame.
                             _kept_trunk_masks = [
                                 m for _b, _s, m in _active
-                                if m is not None
                             ]
-                            # Drop masks if count mismatches boxes
-                            # (some ghost entries might lack masks
-                            # because the original detection didn't
-                            # include them).
-                            if (_kept_trunk_masks
-                                    and len(_kept_trunk_masks)
-                                        != len(_kept_trunk_boxes)):
-                                _kept_trunk_masks = []
                         # Heuristic trunk fallback. For canopy CCs
                         # that have no trunk inside (post SAM +
                         # memory carry-forward), walk down from
