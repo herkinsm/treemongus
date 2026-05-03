@@ -56,16 +56,21 @@ echo "[batch] Using python: $PY"
 "$PY" -c "import sam3; print('[batch] sam3 OK')" \
     || { echo "[batch] sam3 import failed -- aborting"; exit 1; }
 
-# TEST RUN: --canopy-sam-multi-prompts narrowed to just "apple tree"
-# (was: "apple tree" "tree branches" "tree canopy" "fruit tree").
-# Per-prompt overlay diagnostics showed TB firing on barns at score
-# 0.47 and TC firing on horizon tree-rows at 0.24-0.37 while none
-# of them scored on the actual foreground apple trees (HT0%
-# repeatedly). Expecting HT% > 0 in canopy_overlays JPGs if
-# "apple tree" alone hits real trees, and a slight drop in
-# canopy_frac as the false-positive masks stop being unioned in.
-# To revert, set --canopy-sam-multi-prompts to:
-#   "apple tree" "tree branches" "tree canopy" "fruit tree"
+# TEST RUN: target the canopy "balloon" caused by build_tree_mask
+# pulling dry/yellow-tan grass into foreground depth. SAM 3 scores
+# only ~0.10 on real apple trees here (previous AT 0.10 overlay)
+# so it isn't shielding pixels via high_trust_mask -- the canopy
+# is built almost entirely by the depth heuristic, and SUBTRACT
+# phase has to do all the cleanup. Three SUBTRACT-phase widenings
+# below; multi-prompts restored to the original 4 (their false
+# positives on barns/horizons were already being filtered, so
+# narrowing them gave no benefit).
+#   1. HSV grass: hue 25-90 (was 35-65) catches yellow-tan dry
+#      grass, sat-min 30 (was 60) catches desaturated grass.
+#   2. grass-min-y 200 (was 300) extends the filter up to the
+#      typical horizon row.
+#   3. max-bottom-row 400 (was 460) tightens the hard floor;
+#      below row 400 is almost always trunk or ground.
 "$PY" analyze_days.py \
   --root "/fs/scratch/PAS0228/2023 day 4" \
   --out "$HOME/sam3_yolo_test" \
@@ -94,7 +99,7 @@ echo "[batch] Using python: $PY"
   --tile-grid 2 2 --tile-overlap 0.2 --tile-nms-iou 0.15 \
   --use-build-tree-mask --tree-mask-min-overlap 0.10 --tree-mask-dilate-px 8 \
   --canopy-sam-prompt "apple tree" --canopy-sam-min-score 0.10 \
-  --canopy-sam-multi-prompts "apple tree" \
+  --canopy-sam-multi-prompts "apple tree" "tree branches" "tree canopy" "fruit tree" \
   --canopy-sam-min-pixels 500 --canopy-sam-min-lower-frac 0.50 \
   --canopy-sam-foreground-min-bottom-row 350 \
   --canopy-sam-min-valid-depth-frac 0.30 \
@@ -123,7 +128,7 @@ echo "[batch] Using python: $PY"
   --canopy-stake-min-aspect-ratio 4.0 --canopy-stake-min-area-px 50 \
   --canopy-fill-small-holes --canopy-max-hole-area-px 1500 \
   --canopy-max-hole-aspect-ratio 3.0 \
-  --canopy-max-bottom-row 460 \
+  --canopy-max-bottom-row 400 \
   --canopy-post-fill-bg-depth-mm 3000 \
   --canopy-crop-ground-gradient \
   --canopy-ground-gradient-bottom-frac 0.30 \
@@ -132,9 +137,9 @@ echo "[batch] Using python: $PY"
   --canopy-grad-window-px 25 --canopy-grad-min-jump-mm 300 \
   --canopy-grad-min-y 200 --canopy-grad-cc-bottom-frac 0.5 \
   --canopy-remove-grass-by-hsv \
-  --canopy-grass-hue-min 35 --canopy-grass-hue-max 65 \
-  --canopy-grass-sat-min 60 --canopy-grass-val-min 80 \
-  --canopy-grass-min-y 300 \
+  --canopy-grass-hue-min 25 --canopy-grass-hue-max 90 \
+  --canopy-grass-sat-min 30 --canopy-grass-val-min 80 \
+  --canopy-grass-min-y 200 \
   --canopy-crop-top-vs-row-depth-jump \
   --canopy-row-jump-min-mm 500 \
   --canopy-row-jump-top-frac 0.25 \
