@@ -5183,6 +5183,17 @@ def main():
                          "draws the per-tree partition labels in "
                          "different colors and the detected trunk "
                          "bboxes.")
+    ap.add_argument("--save-canopy-cuts-overlay", action="store_true",
+                    help="Save a SECOND, SIMPLER per-frame JPG at "
+                         "<out>/canopy_cuts_overlays/<rel_path>.jpg "
+                         "showing only the canopy mask outline + HT "
+                         "shielding tint + per-filter cut regions as "
+                         "translucent fills (HSV-G green, DPL orange, "
+                         "IVD pink). No trunk boxes, no per-prompt "
+                         "SAM contours, no Rs/Rg/Rd labels. Use this "
+                         "when the comprehensive --save-canopy-"
+                         "overlay JPG is too cluttered to see what "
+                         "individual SUBTRACT filters are removing.")
     ap.add_argument("--save-depth-fg-overlay", action="store_true",
                     help="Save a per-frame DIAGNOSTIC JPG showing "
                          "the RAW foreground-depth mask (every pixel "
@@ -6867,6 +6878,7 @@ def main():
     overlays_dir = out_dir / "overlays"
     canopy_masks_dir = out_dir / "canopy_masks"
     canopy_overlays_dir = out_dir / "canopy_overlays"
+    canopy_cuts_overlays_dir = out_dir / "canopy_cuts_overlays"
     depth_overlays_dir = out_dir / "depth_fg_overlays"
     if args.save_masks:
         masks_dir.mkdir(exist_ok=True)
@@ -6876,6 +6888,8 @@ def main():
         canopy_masks_dir.mkdir(exist_ok=True)
     if args.save_canopy_overlay:
         canopy_overlays_dir.mkdir(exist_ok=True)
+    if args.save_canopy_cuts_overlay:
+        canopy_cuts_overlays_dir.mkdir(exist_ok=True)
     if args.save_depth_fg_overlay:
         depth_overlays_dir.mkdir(exist_ok=True)
 
@@ -9550,6 +9564,134 @@ def main():
                         print(
                             f"[warn] could not save canopy overlay "
                             f"for {img_path.name}: {_co_err!r}",
+                            file=sys.stderr,
+                        )
+
+                # SECONDARY canopy overlay focused on filter cuts.
+                # Uncluttered companion to canopy_overlays so you
+                # can see WHAT each SUBTRACT filter removed without
+                # the trunk / per-prompt / Rs-box visual noise.
+                if (args.save_canopy_cuts_overlay
+                        and canopy_mask_img is not None):
+                    try:
+                        import cv2 as _cv2_cu
+                        rel_cu = (
+                            img_path.relative_to(args.root)
+                            .with_suffix(".jpg")
+                        )
+                        cu_path = (
+                            canopy_cuts_overlays_dir / rel_cu
+                        )
+                        cu_path.parent.mkdir(
+                            parents=True, exist_ok=True,
+                        )
+                        rgb_cu = np.asarray(img).copy()
+                        if rgb_cu.ndim == 2:
+                            rgb_cu = _cv2_cu.cvtColor(
+                                rgb_cu, _cv2_cu.COLOR_GRAY2RGB,
+                            )
+                        cm_b_cu = canopy_mask_img.astype(bool)
+                        # Layer 1: HT shielding tint (light blue,
+                        # alpha 0.18) -- shows where SAM is
+                        # protecting pixels.
+                        if (_high_trust_mask is not None
+                                and _high_trust_mask.shape
+                                    == cm_b_cu.shape
+                                and _high_trust_mask.any()):
+                            _ht_tint_cu = np.zeros_like(rgb_cu)
+                            _ht_tint_cu[_high_trust_mask] = (
+                                60, 180, 255,
+                            )
+                            _bl_ht = _cv2_cu.addWeighted(
+                                rgb_cu, 0.82, _ht_tint_cu, 0.18, 0,
+                            )
+                            rgb_cu = np.where(
+                                _high_trust_mask[..., None],
+                                _bl_ht, rgb_cu,
+                            )
+                        # Layer 2: per-filter cuts as translucent
+                        # FILLS so they pop. Alpha 0.45 each so
+                        # overlapping cuts are still distinguishable.
+                        _cut_fills = {
+                            "HSV-G": (90, 230, 90),
+                            "DPL":   (240, 150, 60),
+                            "IVD":   (240, 80, 200),
+                        }
+                        _cut_counts: dict = {}
+                        for _fn, _cm in _filter_cut_masks.items():
+                            _cmb_f = np.asarray(_cm).astype(bool)
+                            if (_cmb_f.shape != cm_b_cu.shape
+                                    or not _cmb_f.any()):
+                                continue
+                            _cut_counts[_fn] = int(_cmb_f.sum())
+                            _col = _cut_fills.get(
+                                _fn, (200, 200, 200),
+                            )
+                            _f_tint = np.zeros_like(rgb_cu)
+                            _f_tint[_cmb_f] = _col
+                            _bl_f = _cv2_cu.addWeighted(
+                                rgb_cu, 0.55, _f_tint, 0.45, 0,
+                            )
+                            rgb_cu = np.where(
+                                _cmb_f[..., None], _bl_f, rgb_cu,
+                            )
+                        # Layer 3: final canopy boundary (thin
+                        # bright yellow contour, 1px).
+                        cm_u8_cu = cm_b_cu.astype(np.uint8) * 255
+                        _cnt_cu, _ = _cv2_cu.findContours(
+                            cm_u8_cu, _cv2_cu.RETR_EXTERNAL,
+                            _cv2_cu.CHAIN_APPROX_SIMPLE,
+                        )
+                        _cv2_cu.drawContours(
+                            rgb_cu, _cnt_cu, -1, (255, 255, 0), 1,
+                        )
+                        # Header: canopy_frac, HT%, per-filter cut
+                        # pixel counts. Compact -- this overlay is
+                        # specifically for filter-cut diagnostics.
+                        _cf_cu = (
+                            float(cm_b_cu.sum())
+                            / float(cm_b_cu.size)
+                        )
+                        _ht_pct_cu = 0.0
+                        if (_high_trust_mask is not None
+                                and _high_trust_mask.shape
+                                    == cm_b_cu.shape):
+                            _ht_pct_cu = (
+                                100.0
+                                * float(_high_trust_mask.sum())
+                                / float(_high_trust_mask.size)
+                            )
+                        _hdr_cu = (
+                            f"canopy_frac={_cf_cu*100:.1f}%  "
+                            f"HT{_ht_pct_cu:.0f}%"
+                        )
+                        for _fn in ("HSV-G", "DPL", "IVD"):
+                            _hdr_cu += (
+                                f"  {_fn}={_cut_counts.get(_fn, 0)}"
+                            )
+                        _cv2_cu.putText(
+                            rgb_cu, _hdr_cu, (8, 22),
+                            _cv2_cu.FONT_HERSHEY_SIMPLEX,
+                            0.55, (0, 0, 0), 4, _cv2_cu.LINE_AA,
+                        )
+                        _cv2_cu.putText(
+                            rgb_cu, _hdr_cu, (8, 22),
+                            _cv2_cu.FONT_HERSHEY_SIMPLEX,
+                            0.55, (255, 255, 255), 1,
+                            _cv2_cu.LINE_AA,
+                        )
+                        _cv2_cu.imwrite(
+                            str(cu_path),
+                            _cv2_cu.cvtColor(
+                                rgb_cu, _cv2_cu.COLOR_RGB2BGR,
+                            ),
+                            [int(_cv2_cu.IMWRITE_JPEG_QUALITY), 88],
+                        )
+                    except Exception as _cu_err:
+                        print(
+                            f"[warn] could not save canopy cuts "
+                            f"overlay for {img_path.name}: "
+                            f"{_cu_err!r}",
                             file=sys.stderr,
                         )
 
