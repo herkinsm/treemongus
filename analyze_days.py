@@ -7244,8 +7244,116 @@ def main():
                             file=sys.stderr,
                         )
 
+                # POST-TEMPORAL-MERGE CLEANUP. Re-run the stateless
+                # ground/grass detectors on the merged canopy so any
+                # GROUND that got added by carry-forward gets
+                # removed before being saved as next frame's
+                # previous-canopy. WITHOUT this, ground accumulates
+                # across frames in a feedback loop: once it leaks
+                # in, every subsequent frame inherits it.
+                if (args.canopy_temporal_merge
+                        and canopy_mask_img is not None
+                        and depth_mm is not None
+                        and canopy_mask_img.any()):
+                    # bg-depth re-exclusion (depth > post-fill cap)
+                    if args.canopy_post_fill_bg_depth_mm > 0:
+                        try:
+                            _bg3 = (
+                                depth_mm.astype(np.float32)
+                                > float(args.canopy_post_fill_bg_depth_mm)
+                            )
+                            canopy_mask_img = (
+                                canopy_mask_img.astype(bool) & ~_bg3
+                            )
+                        except Exception:
+                            pass
+                    # Per-CC ground gradient (Plan B Step 3)
+                    if args.canopy_crop_ground_gradient:
+                        try:
+                            canopy_mask_img = (
+                                crop_canopy_ground_gradient(
+                                    canopy_mask_img,
+                                    depth_mm,
+                                    bottom_frac=(
+                                        args.canopy_ground_gradient_bottom_frac
+                                    ),
+                                    max_corr=(
+                                        args.canopy_ground_gradient_max_corr
+                                    ),
+                                )
+                            )
+                        except Exception:
+                            pass
+                    # Per-pixel local gradient (Plan C Strategy 1)
+                    if args.canopy_remove_ground_by_gradient:
+                        try:
+                            canopy_mask_img = (
+                                remove_ground_by_local_gradient(
+                                    canopy_mask_img,
+                                    depth_mm,
+                                    window_px=(
+                                        args.canopy_grad_window_px
+                                    ),
+                                    min_depth_jump_mm=(
+                                        args.canopy_grad_min_jump_mm
+                                    ),
+                                    min_y=args.canopy_grad_min_y,
+                                    require_in_cc_bottom_frac=(
+                                        args.canopy_grad_cc_bottom_frac
+                                    ),
+                                )
+                            )
+                        except Exception:
+                            pass
+                    # HSV grass removal (Plan C Strategy 2)
+                    if args.canopy_remove_grass_by_hsv:
+                        try:
+                            _rgb_pg = np.asarray(img)
+                            canopy_mask_img = remove_grass_by_hsv(
+                                canopy_mask_img,
+                                _rgb_pg,
+                                hue_min=args.canopy_grass_hue_min,
+                                hue_max=args.canopy_grass_hue_max,
+                                sat_min=args.canopy_grass_sat_min,
+                                val_min=args.canopy_grass_val_min,
+                                min_y=args.canopy_grass_min_y,
+                            )
+                        except Exception:
+                            pass
+                    # Top-vs-row depth jump (Plan C Strategy 3)
+                    if args.canopy_crop_top_vs_row_depth_jump:
+                        try:
+                            canopy_mask_img = (
+                                crop_canopy_at_top_vs_row_depth_jump(
+                                    canopy_mask_img,
+                                    depth_mm,
+                                    min_jump_mm=(
+                                        args.canopy_row_jump_min_mm
+                                    ),
+                                    top_frac=(
+                                        args.canopy_row_jump_top_frac
+                                    ),
+                                    min_pixels_per_row=(
+                                        args.canopy_row_jump_min_pixels_per_row
+                                    ),
+                                )
+                            )
+                        except Exception:
+                            pass
+                    # Hard bottom-row crop
+                    if args.canopy_max_bottom_row > 0:
+                        _crow2 = int(args.canopy_max_bottom_row)
+                        if _crow2 < canopy_mask_img.shape[0]:
+                            canopy_mask_img = (
+                                canopy_mask_img.astype(bool).copy()
+                            )
+                            canopy_mask_img[_crow2 + 1:, :] = False
+
                 # Update previous-frame canopy AT END of frame
-                # processing for use in the NEXT frame.
+                # processing for use in the NEXT frame. We save
+                # the POST-CLEANUP canopy so next frame's merge
+                # only carries forward truly clean tree pixels --
+                # breaks the ground-accumulation feedback loop.
                 if args.canopy_temporal_merge:
                     if canopy_mask_img is not None:
                         current_prev_canopy_mask = (
