@@ -4509,8 +4509,20 @@ def crop_canopy_below_trunks(
                         ys_in = np.where(col_band.any(axis=1))[0]
                         if ys_in.size:
                             mask_y2 = int(ys_in.max())
-                            # Tighter of the two cuts.
-                            cut_y = min(cut_y, mask_y2)
+                            # Sparse-mask guard: only trust
+                            # mask_y2 if it reaches at least the
+                            # lower half of the bbox. SAM
+                            # sometimes segments only the upper
+                            # visible portion of a trunk (lower
+                            # wood occluded by leaves), which
+                            # would produce a mask_y2 way above
+                            # the real trunk-end and over-cut
+                            # canopy below. When the mask
+                            # doesn't reach the lower half, fall
+                            # back to bbox y2 (cut_y unchanged).
+                            bbox_h = max(1, y2 - y1)
+                            if mask_y2 >= y1 + bbox_h // 2:
+                                cut_y = min(cut_y, mask_y2)
             cc_trunk_cuts.append(cut_y)
         if not cc_trunk_cuts:
             continue
