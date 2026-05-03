@@ -135,12 +135,12 @@ echo "[batch] Using python: $PY"
   --canopy-refine \
   --canopy-refine-upward-dilate-px 25 \
   --canopy-refine-outward-dilate-px 8 \
-  --canopy-refine-close-px 13 \
+  --canopy-refine-close-px 9 \
   --canopy-filter-by-tree-shape \
   --canopy-filter-min-aspect-ratio 0.5 \
   --canopy-filter-max-depth-std-mm 2000 \
   --canopy-filter-min-green-frac 0.0 \
-  --canopy-filter-min-area-px 1500 \
+  --canopy-filter-min-area-px 400 \
   --canopy-filter-max-top-row 300 \
   --canopy-add-trunk-masks --canopy-trunk-vertical-extension-px 100 \
   --canopy-crop-below-trunk --canopy-crop-below-trunk-buffer-px 30 \
@@ -195,7 +195,7 @@ echo "[batch] Using python: $PY"
   --flower-edge-margin-sides-px 0 \
   --flower-require-tree-in-frame --flower-foreground-canopy-max-depth-mm 2500 \
   --flower-max-behind-foreground-mm 1000 \
-  --track-canopy --canopy-track-iou 0.3 --canopy-track-max-age 5 --canopy-track-min-cc-area 4000 \
+  --track-canopy --canopy-track-iou 0.3 --canopy-track-max-age 5 --canopy-track-min-cc-area 2000 \
   --canopy-max-trees-per-frame 2 \
   --canopy-track-method trunk --canopy-trunk-min-score 0.10 --canopy-trunk-prompt "tree trunk" \
   --canopy-trunk-reject-green-stakes --canopy-trunk-max-green-pct 0.35 \
