@@ -8018,6 +8018,16 @@ def main():
                 # vs canopy bboxes that flop around).
                 frame_canopy_components: list[dict] = []
                 frame_tree_ids: list[int] = []
+                # Overlay diagnostics for trunk detection. Populated
+                # in the trunk-method branch below. Stay empty for
+                # cc-method or when track_canopy is off.
+                _ov_raw_trunk_boxes: list = []
+                _ov_raw_trunk_scores: list = []
+                _ov_fresh_trunk_boxes: list = []
+                _ov_fresh_trunk_scores: list = []
+                _ov_active_trunk_boxes: list = []
+                _ov_active_trunk_scores: list = []
+                _ov_active_trunk_ages: list = []
                 if (args.track_canopy and canopy_mask_img is not None):
                     if current_canopy_tracker is None:
                         current_canopy_tracker = CanopyTracker(
@@ -8040,6 +8050,23 @@ def main():
                         _trunk_masks_all = (
                             _trunk_infer.get("masks") if _trunk_infer else None
                         )
+                        # Snapshot raw SAM detections for the overlay
+                        # so we can show what was rejected by the
+                        # downstream score/stake/depth filters.
+                        if (_trunk_boxes_all is not None
+                                and len(_trunk_boxes_all)):
+                            _ov_raw_trunk_boxes = [
+                                [float(v) for v in tb]
+                                for tb in _trunk_boxes_all
+                            ]
+                            if _trunk_scores_all is not None:
+                                _ov_raw_trunk_scores = [
+                                    float(s) for s in _trunk_scores_all
+                                ]
+                            else:
+                                _ov_raw_trunk_scores = [
+                                    1.0
+                                ] * len(_trunk_boxes_all)
                         _kept_trunk_boxes: list = []
                         _kept_trunk_scores: list = []
                         _kept_trunk_masks: list = []
@@ -8131,6 +8158,16 @@ def main():
                                         min_valid_pixels=args.canopy_trunk_depth_min_pixels,
                                     )
                                 )
+                        # Snapshot the FRESH (post-filter, pre-memory)
+                        # trunk set for the overlay. Anything in
+                        # _ov_raw_trunk_boxes but not here was
+                        # dropped by score/stake/depth filters.
+                        _ov_fresh_trunk_boxes = [
+                            [float(v) for v in b] for b in _kept_trunk_boxes
+                        ]
+                        _ov_fresh_trunk_scores = [
+                            float(s) for s in _kept_trunk_scores
+                        ]
                         # Carry-forward trunks across frames. If
                         # SAM missed a trunk this frame but saw it
                         # in the last memory_frames frames, the
@@ -8164,6 +8201,27 @@ def main():
                                     and len(_kept_trunk_masks)
                                         != len(_kept_trunk_boxes)):
                                 _kept_trunk_masks = []
+                        # Capture active trunks + ages for the
+                        # overlay. age==0 = fresh this frame; age>0
+                        # = ghost (carried forward from prior frame).
+                        # current_trunk_memory.trunks is in the same
+                        # order as the returned _active set.
+                        _ov_active_trunk_boxes = [
+                            [float(v) for v in b] for b in _kept_trunk_boxes
+                        ]
+                        _ov_active_trunk_scores = [
+                            float(s) for s in _kept_trunk_scores
+                        ]
+                        if (current_trunk_memory is not None
+                                and args.canopy_trunk_memory_frames > 0):
+                            _ov_active_trunk_ages = [
+                                int(t.get("age", 0))
+                                for t in current_trunk_memory.trunks
+                            ][:len(_ov_active_trunk_boxes)]
+                        else:
+                            _ov_active_trunk_ages = [
+                                0
+                            ] * len(_ov_active_trunk_boxes)
 
                         # Save current frame's filtered trunks for
                         # use by the NEXT frame's trunk-aware
@@ -8434,24 +8492,92 @@ def main():
                         _cv2_co.drawContours(
                             rgb_co, contours, -1, (255, 255, 0), 2,
                         )
-                        # Trunk bboxes in cyan.
-                        if frame_canopy_components:
-                            for cc in frame_canopy_components:
-                                tb = cc.get("trunk_box")
-                                if tb is not None:
-                                    x1, y1, x2, y2 = (
-                                        int(v) for v in tb
-                                    )
-                                    _cv2_co.rectangle(
-                                        rgb_co, (x1, y1), (x2, y2),
-                                        (0, 255, 255), 2,
-                                    )
+                        # Trunk-stage diagnostic overlay. Color =
+                        # stage in the trunk-detection pipeline so
+                        # we can see why SAM-detected trunks did or
+                        # didn't end up as Voronoi anchors:
+                        #   magenta thin (1px) "R": raw SAM box that
+                        #     was dropped by score/stake/depth filter
+                        #   yellow (2px) "K": kept after all filters
+                        #     but no canopy pixels assigned to it
+                        #   cyan (2px) "A": associated with a CC
+                        #     (final partition anchor; same as before)
+                        #   orange (2px) "G<age>": ghost (carry-
+                        #     forward from TrunkMemory)
+                        # Scores printed top-left of each box.
+                        def _btup(b):
+                            return (
+                                int(round(float(b[0]))),
+                                int(round(float(b[1]))),
+                                int(round(float(b[2]))),
+                                int(round(float(b[3]))),
+                            )
+                        _fresh_set = {
+                            _btup(b) for b in _ov_fresh_trunk_boxes
+                        }
+                        _cc_trunk_set = {
+                            tuple(int(v) for v in cc["trunk_box"])
+                            for cc in frame_canopy_components
+                            if cc.get("trunk_box") is not None
+                        }
+                        _ct_assoc = 0
+                        _ct_kept = 0
+                        _ct_rej = 0
+                        _ct_ghost = 0
+                        # Draw rejected raw boxes first (thin, behind).
+                        for _rb, _rs in zip(
+                            _ov_raw_trunk_boxes, _ov_raw_trunk_scores,
+                        ):
+                            if _btup(_rb) in _fresh_set:
+                                continue
+                            x1, y1, x2, y2 = _btup(_rb)
+                            _cv2_co.rectangle(
+                                rgb_co, (x1, y1), (x2, y2),
+                                (255, 0, 255), 1,
+                            )
+                            _cv2_co.putText(
+                                rgb_co, f"R {_rs:.2f}",
+                                (x1, max(0, y1 - 4)),
+                                _cv2_co.FONT_HERSHEY_SIMPLEX,
+                                0.4, (255, 0, 255), 1, _cv2_co.LINE_AA,
+                            )
+                            _ct_rej += 1
+                        # Draw active trunks (kept fresh + ghosts).
+                        for _ab, _as_, _ag in zip(
+                            _ov_active_trunk_boxes,
+                            _ov_active_trunk_scores,
+                            _ov_active_trunk_ages,
+                        ):
+                            x1, y1, x2, y2 = _btup(_ab)
+                            if _ag > 0:
+                                color = (255, 165, 0)
+                                lbl = f"G{_ag} {_as_:.2f}"
+                                _ct_ghost += 1
+                            elif (x1, y1, x2, y2) in _cc_trunk_set:
+                                color = (0, 255, 255)
+                                lbl = f"A {_as_:.2f}"
+                                _ct_assoc += 1
+                            else:
+                                color = (255, 255, 0)
+                                lbl = f"K {_as_:.2f}"
+                                _ct_kept += 1
+                            _cv2_co.rectangle(
+                                rgb_co, (x1, y1), (x2, y2), color, 2,
+                            )
+                            _cv2_co.putText(
+                                rgb_co, lbl,
+                                (x1, max(0, y1 - 4)),
+                                _cv2_co.FONT_HERSHEY_SIMPLEX,
+                                0.45, color, 1, _cv2_co.LINE_AA,
+                            )
                         # Header text: # of canopy components,
-                        # canopy fraction, # of trunks.
+                        # canopy fraction, # of trunks by stage.
                         _cf = float(cm_bool.sum()) / float(cm_bool.size)
                         hdr = (
                             f"canopy_frac={_cf*100:.1f}%  "
-                            f"trees={len(frame_canopy_components)}"
+                            f"trees={len(frame_canopy_components)}  "
+                            f"trunks A{_ct_assoc}/K{_ct_kept}/"
+                            f"R{_ct_rej}/G{_ct_ghost}"
                         )
                         _cv2_co.putText(
                             rgb_co, hdr, (8, 22),
